@@ -310,6 +310,189 @@ def build_mixing_max_pressure_table(mixing_data):
     return result.sort_values(["Extruder", "Orifice", "Cycle"]).reset_index(drop=True)
 
 
+
+def build_blending_max_pressure_table(blending_data):
+    """Calculate directional maximum pressure for Pre- and Post-pH blending cycles.
+
+    Pre-pH blending comprises 60 cycles. Post-pH blending begins when the
+    Current Cycle resets after the completed 60th Pre-pH cycle and comprises
+    up to 100 cycles.
+
+    Directional pressure mapping:
+    - Blending to accumulator RIGHT: maximum Loadcell LEFT pressure.
+    - Blending to accumulator LEFT: maximum Loadcell RIGHT pressure.
+    """
+    columns = [
+        "Extruder", "Blending Phase", "Cycle",
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+        "Move Right Start", "Move Right End",
+        "Move Left Start", "Move Left End",
+        "Move Right Source Pages", "Move Left Source Pages",
+    ]
+    if blending_data.empty:
+        return pd.DataFrame(columns=columns)
+
+    work = blending_data.copy()
+    work["Current Cycle"] = pd.to_numeric(work["Current Cycle"], errors="coerce")
+    work["Loadcell Left (bar)"] = pd.to_numeric(work["Loadcell Left (bar)"], errors="coerce")
+    work["Loadcell Right (bar)"] = pd.to_numeric(work["Loadcell Right (bar)"], errors="coerce")
+    work["Normalized Step"] = (
+        work["Step Name"].astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.casefold()
+    )
+    work = work[
+        work["Normalized Step"].str.match(
+            r"^blending to accumulator (?:right|left)$", na=False
+        )
+        & work["Current Cycle"].gt(0)
+    ].sort_values(["Extruder", "Source Page", "Source Line"], kind="stable")
+
+    phase_frames = []
+    for extruder, group in work.groupby("Extruder", sort=True):
+        group = group.copy()
+        phase = "Pre-pH Blending"
+        previous_cycle = None
+        phases = []
+        for cycle in group["Current Cycle"]:
+            if (
+                previous_cycle is not None
+                and previous_cycle >= 60
+                and cycle <= 5
+            ):
+                phase = "Post-pH Blending"
+            phases.append(phase)
+            previous_cycle = cycle
+        group["Blending Phase"] = phases
+        phase_frames.append(group)
+
+    if not phase_frames:
+        return pd.DataFrame(columns=columns)
+    work = pd.concat(phase_frames, ignore_index=True)
+
+    output = []
+    for (extruder, phase, cycle), cycle_data in work.groupby(
+        ["Extruder", "Blending Phase", "Current Cycle"], sort=True
+    ):
+        right_move = cycle_data[
+            cycle_data["Normalized Step"].eq("blending to accumulator right")
+        ]
+        left_move = cycle_data[
+            cycle_data["Normalized Step"].eq("blending to accumulator left")
+        ]
+        output.append({
+            "Extruder": int(extruder),
+            "Blending Phase": phase,
+            "Cycle": int(cycle),
+            "Max Pressure Left - Move Right (bar)": (
+                right_move["Loadcell Left (bar)"].max()
+                if not right_move.empty else pd.NA
+            ),
+            "Max Pressure Right - Move Left (bar)": (
+                left_move["Loadcell Right (bar)"].max()
+                if not left_move.empty else pd.NA
+            ),
+            "Move Right Start": right_move["Date & Time"].min() if not right_move.empty else pd.NaT,
+            "Move Right End": right_move["Date & Time"].max() if not right_move.empty else pd.NaT,
+            "Move Left Start": left_move["Date & Time"].min() if not left_move.empty else pd.NaT,
+            "Move Left End": left_move["Date & Time"].max() if not left_move.empty else pd.NaT,
+            "Move Right Source Pages": (
+                ", ".join(map(str, sorted(right_move["Source Page"].dropna().astype(int).unique())))
+                if not right_move.empty else ""
+            ),
+            "Move Left Source Pages": (
+                ", ".join(map(str, sorted(left_move["Source Page"].dropna().astype(int).unique())))
+                if not left_move.empty else ""
+            ),
+        })
+
+    result = pd.DataFrame(output, columns=columns)
+    pressure_columns = [
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+    ]
+    result[pressure_columns] = result[pressure_columns].apply(pd.to_numeric, errors="coerce")
+    phase_order = pd.CategoricalDtype(
+        ["Pre-pH Blending", "Post-pH Blending"], ordered=True
+    )
+    result["Blending Phase"] = result["Blending Phase"].astype(phase_order)
+    return result.sort_values(
+        ["Extruder", "Blending Phase", "Cycle"]
+    ).reset_index(drop=True)
+
+
+def create_blending_pressure_plot(table, extruder, phase, batch_number):
+    """Create an interactive maximum-pressure plot for one Blending phase."""
+    data = table[
+        table["Extruder"].eq(extruder)
+        & table["Blending Phase"].astype(str).eq(phase)
+    ].sort_values("Cycle").copy()
+
+    figure = go.Figure()
+    series = [
+        (
+            "Max Pressure Left - Move Right (bar)",
+            "Loadcell Left Max - movement to accumulator right",
+            "#9BBB59", "triangle-up",
+            ["Move Right Start", "Move Right End", "Move Right Source Pages"],
+        ),
+        (
+            "Max Pressure Right - Move Left (bar)",
+            "Loadcell Right Max - movement to accumulator left",
+            "#4F81BD", "diamond",
+            ["Move Left Start", "Move Left End", "Move Left Source Pages"],
+        ),
+    ]
+    for column, name, color, symbol, detail_columns in series:
+        values = data.dropna(subset=[column]).copy()
+        if values.empty:
+            continue
+        custom = values[detail_columns].copy()
+        for date_column in detail_columns[:2]:
+            custom[date_column] = pd.to_datetime(
+                custom[date_column], errors="coerce"
+            ).dt.strftime("%d-%m-%Y %H:%M:%S")
+        figure.add_trace(go.Scatter(
+            x=values["Cycle"], y=values[column],
+            mode="lines+markers", name=name,
+            customdata=custom.to_numpy(),
+            line={"color": color, "width": 2},
+            marker={"color": color, "size": 8, "symbol": symbol},
+            hovertemplate=(
+                f"<b>{name}</b><br>"
+                "Phase: " + phase + "<br>"
+                "Cycle: %{x}<br>"
+                "Maximum pressure: %{y:.2f} bar<br>"
+                "Movement start: %{customdata[0]}<br>"
+                "Movement end: %{customdata[1]}<br>"
+                "Source page(s): %{customdata[2]}"
+                "<extra></extra>"
+            ),
+        ))
+
+    expected_cycles = 60 if phase == "Pre-pH Blending" else 100
+    max_pressure = data[[
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+    ]].max().max() if not data.empty else 160
+    y_max = max(160, float(max_pressure) * 1.12) if pd.notna(max_pressure) else 160
+    figure.update_layout(
+        title={
+            "text": f"{batch_number}<br>EXTRUDER - {int(extruder)} | {phase}",
+            "x": 0.5, "xanchor": "center",
+        },
+        xaxis_title="Cycles", yaxis_title="Maximum Pressure (bar)",
+        xaxis={"range": [0, expected_cycles + 2], "showgrid": True},
+        yaxis={"range": [0, y_max], "showgrid": True},
+        hovermode="closest",
+        legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.20},
+        height=620,
+        margin={"l": 70, "r": 30, "t": 100, "b": 120},
+    )
+    return figure
+
 def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
     """Create an interactive maximum-pressure-by-cycle chart."""
     data = table[
@@ -472,7 +655,7 @@ def figure_to_png(fig):
     buffer = io.BytesIO(); fig.savefig(buffer, format="png", dpi=200, bbox_inches="tight"); return buffer.getvalue()
 
 
-def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected, process_ranges, wetting_rise_table, mixing_pressure_table):
+def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected, process_ranges, wetting_rise_table, mixing_pressure_table, blending_pressure_table):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pd.DataFrame([batch]).to_excel(writer, "Batch Details", index=False)
@@ -480,6 +663,7 @@ def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejec
         settings.to_excel(writer, "Recipe Settings", index=False); process_ranges.to_excel(writer, "Process Page Ranges", index=False)
         wetting_rise_table.to_excel(writer, "Wetting Rise Time", index=False)
         mixing_pressure_table.to_excel(writer, "Mixing Max Pressure", index=False)
+        blending_pressure_table.to_excel(writer, "Blending Max Pressure", index=False)
         diagnostics.to_excel(writer, "Datalog Diagnostics", index=False); rejected.to_excel(writer, "Rejected Rows", index=False)
         for stage in STAGES:
             (datalog[datalog["Stage"].eq(stage)] if not datalog.empty else pd.DataFrame()).to_excel(writer, f"{stage.title()} Datalog"[:31], index=False)
@@ -506,6 +690,8 @@ def main():
             wetting_rise_table = build_wetting_rise_time_table(wetting_data)
             mixing_data = datalog[datalog["Stage"].eq("MIXING")].copy() if not datalog.empty else pd.DataFrame()
             mixing_pressure_table = build_mixing_max_pressure_table(mixing_data)
+            blending_data = datalog[datalog["Stage"].eq("BLENDING")].copy() if not datalog.empty else pd.DataFrame()
+            blending_pressure_table = build_blending_max_pressure_table(blending_data)
             status.update(label="Extraction completed", state="complete", expanded=False)
     except Exception as error: st.exception(error); st.stop()
 
@@ -516,7 +702,7 @@ def main():
     st.subheader("Process Overview Times"); st.dataframe(overview, use_container_width=True, hide_index=True)
     st.subheader("Process Summary"); st.dataframe(summaries, use_container_width=True, hide_index=True)
 
-    recipe_tab, datalog_tab, wetting_tab, mixing_tab, diagnostics_tab = st.tabs(["Recipe Settings", "Datalog Explorer", "Wetting Rise-Time Plot", "Mixing Max-Pressure Plots", "Diagnostics"])
+    recipe_tab, datalog_tab, wetting_tab, mixing_tab, blending_tab, diagnostics_tab = st.tabs(["Recipe Settings", "Datalog Explorer", "Wetting Rise-Time Plot", "Mixing Max-Pressure Plots", "Blending Max-Pressure Plots", "Diagnostics"])
     with recipe_tab:
         st.dataframe(settings, use_container_width=True, hide_index=True, height=520)
         st.download_button("Download Recipe Settings CSV", settings.to_csv(index=False).encode(), "recipe_settings.csv", "text/csv")
@@ -683,6 +869,110 @@ def main():
                 "text/html",
             )
 
+    with blending_tab:
+        st.markdown("#### Blending Maximum Pressure by Cycle")
+        st.caption(
+            "Pre-pH Blending contains 60 cycles. Post-pH Blending begins when the "
+            "cycle counter resets after completed cycle 60 and contains up to 100 cycles. "
+            "Movement to accumulator right uses maximum Loadcell Left pressure; movement "
+            "to accumulator left uses maximum Loadcell Right pressure."
+        )
+        if blending_pressure_table.empty:
+            st.warning("No directional Blending pressure-cycle data were generated.")
+        else:
+            blending_extruders = sorted(
+                blending_pressure_table["Extruder"].dropna().astype(int).unique()
+            )
+            selected_blending_extruder = st.selectbox(
+                "Blending extruder", blending_extruders,
+                key="blending_plot_extruder",
+            )
+            available_phases = [
+                phase for phase in ["Pre-pH Blending", "Post-pH Blending"]
+                if phase in set(
+                    blending_pressure_table.loc[
+                        blending_pressure_table["Extruder"].eq(selected_blending_extruder),
+                        "Blending Phase",
+                    ].astype(str)
+                )
+            ]
+            selected_phases = st.multiselect(
+                "Blending phases", available_phases,
+                default=available_phases,
+                key="blending_plot_phases",
+            )
+            blending_view = blending_pressure_table[
+                blending_pressure_table["Extruder"].eq(selected_blending_extruder)
+                & blending_pressure_table["Blending Phase"].astype(str).isin(selected_phases)
+            ].copy()
+            st.dataframe(
+                blending_view, use_container_width=True,
+                hide_index=True, height=380,
+            )
+
+            batch_number_for_blending = batch.get("Batch no.") or "Batch"
+            for phase in selected_phases:
+                blending_figure = create_blending_pressure_plot(
+                    blending_pressure_table,
+                    selected_blending_extruder,
+                    phase,
+                    batch_number_for_blending,
+                )
+                st.plotly_chart(
+                    blending_figure,
+                    use_container_width=True,
+                    config={
+                        "displaylogo": False,
+                        "scrollZoom": True,
+                        "toImageButtonOptions": {
+                            "format": "png",
+                            "filename": (
+                                f"{batch_number_for_blending}_extruder_"
+                                f"{selected_blending_extruder}_{phase.replace(' ', '_')}_max_pressure"
+                            ),
+                            "height": 620, "width": 1200, "scale": 2,
+                        },
+                    },
+                    key=f"blending_chart_{selected_blending_extruder}_{phase}",
+                )
+
+            combined_blending_figure = go.Figure()
+            for phase in selected_phases:
+                source_figure = create_blending_pressure_plot(
+                    blending_pressure_table,
+                    selected_blending_extruder,
+                    phase,
+                    batch_number_for_blending,
+                )
+                for trace in source_figure.data:
+                    trace.name = f"{phase} | {trace.name}"
+                    combined_blending_figure.add_trace(trace)
+            combined_blending_figure.update_layout(
+                title=(
+                    f"{batch_number_for_blending} | Extruder "
+                    f"{selected_blending_extruder} | Blending Max Pressure"
+                ),
+                xaxis_title="Cycles", yaxis_title="Maximum Pressure (bar)",
+                hovermode="closest", height=700,
+            )
+            blending_html = pio.to_html(
+                combined_blending_figure,
+                include_plotlyjs="cdn", full_html=True,
+            ).encode("utf-8")
+            b1, b2 = st.columns(2)
+            b1.download_button(
+                "Download Blending Max-Pressure Table CSV",
+                blending_view.to_csv(index=False).encode("utf-8"),
+                f"{batch_number_for_blending}_extruder_{selected_blending_extruder}_blending_max_pressure.csv",
+                "text/csv",
+            )
+            b2.download_button(
+                "Download Interactive Blending Plot HTML",
+                blending_html,
+                f"{batch_number_for_blending}_extruder_{selected_blending_extruder}_blending_max_pressure.html",
+                "text/html",
+            )
+
     with diagnostics_tab:
         st.markdown("#### Assigned process page ranges"); st.dataframe(process_ranges, use_container_width=True, hide_index=True)
         st.markdown("#### Page-level diagnostics"); st.dataframe(diagnostics, use_container_width=True, hide_index=True, height=400)
@@ -690,7 +980,7 @@ def main():
         if rejected_rows.empty: st.success("No timestamp rows were rejected.")
         else: st.dataframe(rejected_rows, use_container_width=True, hide_index=True, height=400)
 
-    excel = make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected_rows, process_ranges, wetting_rise_table, mixing_pressure_table)
+    excel = make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected_rows, process_ranges, wetting_rise_table, mixing_pressure_table, blending_pressure_table)
     batch_number = batch.get("Batch no.") or "batch"
     st.download_button("⬇️ Download Complete Excel Extraction", excel, f"{batch_number}_complete_process_extraction.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
