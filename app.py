@@ -37,7 +37,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.12-wetting-rise-time-v1"
+    parser_version = "2026.10.12-mixing-3.8mm-typo-v2"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -128,6 +128,13 @@ def parse_recipe_settings(pages, summaries):
     return pd.DataFrame(rows).drop_duplicates(["Stage", "Extruder", "Machine", "Parameter", "Source Page"]).reset_index(drop=True) if rows else pd.DataFrame(columns=columns)
 
 
+def normalize_mixing_step_name(step_name):
+    """Correct report typo 3,8 mm/3,8mm to 3.8mm in Mixing Step Name."""
+    text = re.sub(r"(?i)3\s*,\s*8\s*mm", "3.8mm", str(step_name))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def parse_datalogs(pages, summaries):
     extracted_frames, diagnostic_rows, rejected_rows, process_ranges = [], [], [], []
     timestamp_start = re.compile(rf"^\s*({DATE})\s+({TIME})\s+")
@@ -161,7 +168,12 @@ def parse_datalogs(pages, summaries):
                     else:
                         try: values.append(float(value))
                         except ValueError: values.append(value)
-                record = {"Stage": stage, "Machine": machine, "Extruder": extruder, "Date & Time": parse_dt(f"{match.group(1)} {match.group(2)}"), "Step Name": match.group(3).strip(), "Source Page": page_number, "Source Line": line_number}
+                raw_step_name = match.group(3).strip()
+                corrected_step_name = (
+                    normalize_mixing_step_name(raw_step_name)
+                    if stage == "MIXING" else raw_step_name
+                )
+                record = {"Stage": stage, "Machine": machine, "Extruder": extruder, "Date & Time": parse_dt(f"{match.group(1)} {match.group(2)}"), "Step Name": corrected_step_name, "Source Page": page_number, "Source Line": line_number}
                 record.update(dict(zip(DATALOG_COLUMNS[stage], values))); records.append(record)
                 normalized = re.sub(r"\s+", " ", record["Step Name"]).strip().casefold()
                 if stage == "BLENDING" and normalized in {"blending is done", "blending is completed", "blending completed"}:
@@ -229,6 +241,7 @@ def build_mixing_max_pressure_table(mixing_data):
     work["Current Cycle"] = pd.to_numeric(work["Current Cycle"], errors="coerce")
     work["Loadcell Left (bar)"] = pd.to_numeric(work["Loadcell Left (bar)"], errors="coerce")
     work["Loadcell Right (bar)"] = pd.to_numeric(work["Loadcell Right (bar)"], errors="coerce")
+    work["Step Name"] = work["Step Name"].map(normalize_mixing_step_name)
     work["Normalized Step"] = (
         work["Step Name"].astype(str)
         .str.replace(r"\s+", " ", regex=True)
@@ -237,9 +250,9 @@ def build_mixing_max_pressure_table(mixing_data):
     )
 
     patterns = {
-        "5 mm": r"extrusion\s+5\s*mm\s+to\s+accumulator\s+(right|left)",
-        "3.8 mm": r"extrusion\s+3\.8\s*mm\s+to\s+accumulator\s+(right|left)",
-        "2 mm": r"extrusion\s+2\s*mm\s+to\s+accumulator\s+(right|left)",
+        "5 mm": r"extrusion\s*:?\s*5\s*mm\s+to\s+accumulator\s+(?:right|left)",
+        "3.8 mm": r"extrusion\s*:?\s*3[\.,]8\s*mm\s+to\s+accumulator\s+(?:right|left)",
+        "2 mm": r"extrusion\s*:?\s*2\s*mm\s+to\s+accumulator\s+(?:right|left)",
     }
     output = []
 
