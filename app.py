@@ -55,6 +55,9 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
+    # Incremented when extraction logic changes; also invalidates Streamlit cache.
+    parser_version = "2026.10.12-blending-row-alignment-v2"
+    _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
     for page in reader.pages:
@@ -311,6 +314,7 @@ def parse_datalogs(pages, summaries):
                     "Date & Time": parse_dt(f"{match.group(1)} {match.group(2)}"),
                     "Step Name": match.group(3).strip(),
                     "Source Page": page_number,
+                    "Source Line": line_number,
                 }
                 record.update(dict(zip(DATALOG_COLUMNS[stage], converted)))
                 records.append(record)
@@ -373,14 +377,37 @@ def parse_datalogs(pages, summaries):
     datalog = (
         pd.concat(extracted_frames, ignore_index=True)
         .drop_duplicates()
-        .sort_values(["Stage", "Extruder", "Date & Time", "Source Page"])
+        .sort_values(["Stage", "Extruder", "Source Page", "Source Line"], kind="stable")
         .reset_index(drop=True)
         if extracted_frames else pd.DataFrame()
     )
     if not datalog.empty:
-        preferred = ["Stage", "Machine", "Extruder", "Date & Time", "Step Name", "Source Page"]
+        preferred = [
+            "Stage", "Machine", "Extruder", "Date & Time", "Step Name",
+            "Source Page", "Source Line",
+        ]
         remaining = [column for column in datalog.columns if column not in preferred]
         datalog = datalog[[column for column in preferred if column in datalog.columns] + remaining]
+
+        # Audit Blending alignment. Every value remains attached to the same
+        # physical PDF line identified by Source Page + Source Line.
+        blending_mask = datalog["Stage"].eq("BLENDING")
+        if blending_mask.any():
+            duplicate_source = datalog.loc[blending_mask].duplicated(
+                subset=["Source Page", "Source Line"], keep=False
+            )
+            if duplicate_source.any():
+                duplicate_rows = datalog.loc[blending_mask].loc[duplicate_source]
+                for _, duplicate in duplicate_rows.iterrows():
+                    rejected_rows.append({
+                        "Stage": "BLENDING",
+                        "Machine": duplicate.get("Machine"),
+                        "Extruder": duplicate.get("Extruder"),
+                        "Source Page": duplicate.get("Source Page"),
+                        "Line Number": duplicate.get("Source Line"),
+                        "Reason": "Duplicate physical source line detected",
+                        "Raw Line": "",
+                    })
 
     return (
         datalog,
@@ -474,7 +501,19 @@ def main():
             view = stage_data[stage_data["Extruder"].eq(extruder)] if extruder is not None else stage_data
             steps = sorted(view["Step Name"].dropna().unique())
             chosen_steps = st.multiselect("Step Name", steps, default=steps)
-            view = view[view["Step Name"].isin(chosen_steps)]
+            view = view[view["Step Name"].isin(chosen_steps)].copy()
+
+            # Display only the columns belonging to the selected stage. This avoids
+            # blank columns inherited from other stages and preserves exact row alignment.
+            stage_columns = [
+                "Stage", "Machine", "Extruder", "Date & Time", "Step Name", "Source Page"
+            ] + DATALOG_COLUMNS[stage]
+            stage_columns = [column for column in stage_columns if column in view.columns]
+            view = (view[stage_columns]
+                    .sort_values(["Date & Time", "Source Page"], kind="stable")
+                    .reset_index(drop=True))
+            view.insert(0, "Record No.", range(1, len(view) + 1))
+
             pages_found = sorted(int(value) for value in view["Source Page"].dropna().unique())
             st.write(f"Rows: **{len(view):,}** | PDF pages: **{pages_found[0] if pages_found else '-'} to {pages_found[-1] if pages_found else '-'}**")
             st.dataframe(view, use_container_width=True, hide_index=True, height=560)
