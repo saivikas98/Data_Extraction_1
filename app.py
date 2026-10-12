@@ -2,10 +2,25 @@ import io
 import re
 from datetime import datetime
 
-from pypdf import PdfReader
+import importlib
+import subprocess
+import sys
 
-import pandas as pd
-import streamlit as st
+
+def ensure_package(import_name, pip_name):
+    try:
+        return importlib.import_module(import_name)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+        importlib.invalidate_caches()
+        return importlib.import_module(import_name)
+
+
+st = ensure_package("streamlit", "streamlit>=1.38,<2")
+pd = ensure_package("pandas", "pandas>=2.2,<3")
+ensure_package("openpyxl", "openpyxl>=3.1,<4")
+_pypdf = ensure_package("pypdf", "pypdf>=5,<7")
+PdfReader = _pypdf.PdfReader
 
 st.set_page_config(page_title="Batch Process Report Extractor", page_icon="🧪", layout="wide")
 
