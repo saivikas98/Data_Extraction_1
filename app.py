@@ -1,6 +1,7 @@
 import io
 import re
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
@@ -10,32 +11,11 @@ st.set_page_config(page_title="Batch Process Data Extractor", page_icon="🧪", 
 STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
-
 DATALOG_COLUMNS = {
-    "WETTING": [
-        "Vacuum Left (mbar)", "Vacuum Right (mbar)",
-        "Loadcell Left (bar)", "Loadcell Right (bar)",
-        "Servo Position Left (mm)", "Servo Position Right (mm)",
-        "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)",
-    ],
-    "PREMIXING": [
-        "Current Cycle", "Loadcell Left (bar)", "Loadcell Right (bar)",
-        "Servo Position Left (mm)", "Servo Position Right (mm)",
-        "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)",
-    ],
-    "MIXING": [
-        "Current Cycle", "Orifice 3.8 Status", "Orifice 2 Status",
-        "Orifice 1.5 Status", "Loadcell Left (bar)", "Loadcell Right (bar)",
-        "Servo Position Left (mm)", "Servo Position Right (mm)",
-        "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)",
-    ],
-    "BLENDING": [
-        "Current Cycle", "Vacuum Left (mbar)", "Vacuum Right (mbar)",
-        "Loadcell Left (bar)", "Loadcell Right (bar)",
-        "Servo Position Left (mm)", "Servo Position Right (mm)",
-        "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)",
-        "Measured pH", "Added Water (mL)",
-    ],
+    "WETTING": ["Vacuum Left (mbar)", "Vacuum Right (mbar)", "Loadcell Left (bar)", "Loadcell Right (bar)", "Servo Position Left (mm)", "Servo Position Right (mm)", "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)"],
+    "PREMIXING": ["Current Cycle", "Loadcell Left (bar)", "Loadcell Right (bar)", "Servo Position Left (mm)", "Servo Position Right (mm)", "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)"],
+    "MIXING": ["Current Cycle", "Orifice 3.8 Status", "Orifice 2 Status", "Orifice 1.5 Status", "Loadcell Left (bar)", "Loadcell Right (bar)", "Servo Position Left (mm)", "Servo Position Right (mm)", "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)"],
+    "BLENDING": ["Current Cycle", "Vacuum Left (mbar)", "Vacuum Right (mbar)", "Loadcell Left (bar)", "Loadcell Right (bar)", "Servo Position Left (mm)", "Servo Position Right (mm)", "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)", "Measured pH", "Added Water (mL)"],
 }
 
 
@@ -55,8 +35,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    # Incremented when extraction logic changes; also invalidates Streamlit cache.
-    parser_version = "2026.10.12-blending-row-alignment-v2"
+    parser_version = "2026.10.12-wetting-rise-time-v1"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -88,482 +67,244 @@ def extruder_number(machine):
 
 def parse_batch_details(pages):
     text = "\n".join(pages[:5])
-    labels = [
-        "Product name", "Batch no.", "Batch started by", "Batch ended by",
-        "Batch start date & time", "Batch end date & time", "Duration (D.HH:MM:SS)",
-    ]
+    labels = ["Product name", "Batch no.", "Batch started by", "Batch ended by", "Batch start date & time", "Batch end date & time", "Duration (D.HH:MM:SS)"]
     return {label: value_after_label(text, label) for label in labels}
 
 
 def parse_process_overview(pages):
     rows, active, empty_pages = [], False, 0
-    pattern = re.compile(
-        rf"^\s*(.*?)\s{{2,}}(.*?)\s{{2,}}({DATE}\s+{TIME})\s+"
-        rf"({DATE}\s+{TIME})\s+(\d+)\s+(\d+)\s*$"
-    )
+    pattern = re.compile(rf"^\s*(.*?)\s{{2,}}(.*?)\s{{2,}}({DATE}\s+{TIME})\s+({DATE}\s+{TIME})\s+(\d+)\s+(\d+)\s*$")
     for page_number, text in enumerate(pages, 1):
-        if "PROCESS OVERVIEW" in text.upper():
-            active = True
-        if not active:
-            continue
+        if "PROCESS OVERVIEW" in text.upper(): active = True
+        if not active: continue
         before = len(rows)
         for line in text.splitlines():
             match = pattern.match(line)
-            if not match:
-                continue
+            if not match: continue
             start, end = parse_dt(match.group(3)), parse_dt(match.group(4))
-            rows.append({
-                "Process Name": match.group(1).strip(),
-                "Machine Name": match.group(2).strip(),
-                "Process Start": start, "Process End": end,
-                "Duration": duration_text(start, end),
-                "Index": int(match.group(5)), "Total": int(match.group(6)),
-                "Source Page": page_number,
-            })
+            rows.append({"Process Name": match.group(1).strip(), "Machine Name": match.group(2).strip(), "Process Start": start, "Process End": end, "Duration": duration_text(start, end), "Index": int(match.group(5)), "Total": int(match.group(6)), "Source Page": page_number})
         empty_pages = empty_pages + 1 if len(rows) == before else 0
-        if rows and empty_pages >= 2:
-            break
+        if rows and empty_pages >= 2: break
     return pd.DataFrame(rows)
 
 
 def parse_process_summaries(pages):
-    labels = [
-        "Recipe name", "Machine", "Process start", "Process end",
-        "Duration (D.HH:MM:SS)", "Process started by", "Process ended by",
-        "API accumulator ID Left", "API accumulator ID Right",
-        "Water accumulator ID Left", "Water accumulatorID Right", "Ph accumulator ID",
-    ]
+    labels = ["Recipe name", "Machine", "Process start", "Process end", "Duration (D.HH:MM:SS)", "Process started by", "Process ended by", "API accumulator ID Left", "API accumulator ID Right", "Water accumulator ID Left", "Water accumulatorID Right", "Ph accumulator ID"]
     rows = []
     for page_number, text in enumerate(pages, 1):
         stage = identify_stage(text, "PROCESS")
-        if not stage or "BATCH CYCLE REPORT" not in text.upper():
-            continue
+        if not stage or "BATCH CYCLE REPORT" not in text.upper(): continue
         row = {"Stage": stage, "Source Page": page_number}
         row.update({label: value_after_label(text, label) for label in labels})
         if row.get("Machine") and row.get("Process start"):
-            row["Extruder"] = extruder_number(row["Machine"])
-            rows.append(row)
+            row["Extruder"] = extruder_number(row["Machine"]); rows.append(row)
     frame = pd.DataFrame(rows)
-    if frame.empty:
-        return frame
+    if frame.empty: return frame
     frame["Process start"] = frame["Process start"].map(parse_dt)
     frame["Process end"] = frame["Process end"].map(parse_dt)
-    return (frame.drop_duplicates(["Stage", "Machine", "Process start", "Process end"])
-            .sort_values("Source Page").reset_index(drop=True))
+    return frame.drop_duplicates(["Stage", "Machine", "Process start", "Process end"]).sort_values("Source Page").reset_index(drop=True)
 
 
 def parse_recipe_settings(pages, summaries):
     rows = []
-    pattern = re.compile(
-        r"^\s*(.*?)\s{2,}(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+"
-        r"(-?\d+(?:\.\d+)?)\s+(\S+)\s*$"
-    )
+    pattern = re.compile(r"^\s*(.*?)\s{2,}(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(\S+)\s*$")
     for _, summary in summaries.iterrows():
-        stage = summary["Stage"]
-        first = int(summary["Source Page"]) - 1
-        active = False
+        stage, first, active = summary["Stage"], int(summary["Source Page"]) - 1, False
         for page_index in range(first, min(first + 5, len(pages))):
             text = pages[page_index]
-            if re.search(rf"(?mi)^\s*{stage}\s+RECIPE SETTINGS\s*$", text):
-                active = True
-            if not active:
-                continue
+            if re.search(rf"(?mi)^\s*{stage}\s+RECIPE SETTINGS\s*$", text): active = True
+            if not active: continue
             for line in text.splitlines():
-                if "RECIPE SETTINGS" in line.upper():
-                    continue
+                if "RECIPE SETTINGS" in line.upper(): continue
                 match = pattern.match(line)
-                if not match:
-                    continue
+                if not match: continue
                 parameter = match.group(1).strip()
-                if not parameter or parameter.lower() == "name":
-                    continue
-                rows.append({
-                    "Stage": stage, "Extruder": summary["Extruder"],
-                    "Machine": summary["Machine"], "Parameter": parameter,
-                    "Minimum": float(match.group(2)), "Set Value": float(match.group(3)),
-                    "Maximum": float(match.group(4)), "Unit": match.group(5),
-                    "Source Page": page_index + 1,
-                })
-            if re.search(rf"(?mi)^\s*{stage}\s+DATALOG\s*$", text):
-                break
-    columns = ["Stage", "Extruder", "Machine", "Parameter", "Minimum",
-               "Set Value", "Maximum", "Unit", "Source Page"]
-    if not rows:
-        return pd.DataFrame(columns=columns)
-    return (pd.DataFrame(rows).drop_duplicates(
-        ["Stage", "Extruder", "Machine", "Parameter", "Source Page"]
-    ).reset_index(drop=True))
-
-
-def summary_for_datalog_page(stage, page_number, summaries):
-    """Assign by report block/page order, not time.
-
-    Multiple extruders run concurrently, so timestamp matching can assign a page
-    to the wrong extruder. A datalog belongs to the latest preceding summary page
-    for the same stage.
-    """
-    if summaries.empty:
-        return None
-    candidates = summaries[
-        summaries["Stage"].eq(stage)
-        & (summaries["Source Page"] < page_number)
-    ].sort_values("Source Page")
-    return candidates.iloc[-1] if not candidates.empty else None
+                if not parameter or parameter.lower() == "name": continue
+                rows.append({"Stage": stage, "Extruder": summary["Extruder"], "Machine": summary["Machine"], "Parameter": parameter, "Minimum": float(match.group(2)), "Set Value": float(match.group(3)), "Maximum": float(match.group(4)), "Unit": match.group(5), "Source Page": page_index + 1})
+            if re.search(rf"(?mi)^\s*{stage}\s+DATALOG\s*$", text): break
+    columns = ["Stage", "Extruder", "Machine", "Parameter", "Minimum", "Set Value", "Maximum", "Unit", "Source Page"]
+    return pd.DataFrame(rows).drop_duplicates(["Stage", "Extruder", "Machine", "Parameter", "Source Page"]).reset_index(drop=True) if rows else pd.DataFrame(columns=columns)
 
 
 def parse_datalogs(pages, summaries):
-    """Extract each process block from its own contiguous datalog pages.
-
-    The parser starts at the relevant process-summary page, waits until it finds
-    that stage's first DATALOG page, and then continues until the first page that
-    no longer carries the same datalog heading. This prevents data from the next
-    extruder or a later report section from being joined to the selected run.
-    """
-    extracted_frames = []
-    diagnostic_rows = []
-    rejected_rows = []
-    process_ranges = []
+    extracted_frames, diagnostic_rows, rejected_rows, process_ranges = [], [], [], []
     timestamp_start = re.compile(rf"^\s*({DATE})\s+({TIME})\s+")
-
-    ordered = summaries.sort_values("Source Page").reset_index(drop=True)
-
-    for _, summary in ordered.iterrows():
-        stage = summary["Stage"]
-        machine = summary["Machine"]
-        extruder = summary["Extruder"]
-        summary_page = int(summary["Source Page"])
-        expected_fields = len(DATALOG_COLUMNS[stage])
-        row_pattern = re.compile(
-            rf"^\s*({DATE})\s+({TIME})\s+(.+?)\s+"
-            rf"((?:\S+\s+){{{expected_fields - 1}}}\S+)\s*$"
-        )
-
-        started = False
-        first_datalog_page = None
-        last_datalog_page = None
-        run_frames = []
-        terminal_step_found = False
-        terminal_step_name = None
-
+    for _, summary in summaries.sort_values("Source Page").reset_index(drop=True).iterrows():
+        stage, machine, extruder = summary["Stage"], summary["Machine"], summary["Extruder"]
+        summary_page, expected = int(summary["Source Page"]), len(DATALOG_COLUMNS[stage])
+        row_pattern = re.compile(rf"^\s*({DATE})\s+({TIME})\s+(.+?)\s+((?:\S+\s+){{{expected - 1}}}\S+)\s*$")
+        started = False; first_page = None; last_page = None; run_frames = []
+        terminal_found = False; terminal_name = None
         for page_number in range(summary_page, len(pages) + 1):
             text = pages[page_number - 1]
-            heading_found = bool(
-                re.search(rf"(?mi)^\s*{stage}\s+DATALOG\s*$", text)
-            )
-
+            heading = bool(re.search(rf"(?mi)^\s*{stage}\s+DATALOG\s*$", text))
             if not started:
-                if not heading_found:
-                    # Recipe settings may occupy a few pages after the summary.
-                    # Stop if a different target process summary is reached.
-                    different_summary = identify_stage(text, "PROCESS")
-                    if page_number > summary_page and different_summary:
-                        break
+                if not heading:
+                    if page_number > summary_page and identify_stage(text, "PROCESS"): break
                     continue
-                started = True
-                first_datalog_page = page_number
-
-            elif not heading_found:
-                # The contiguous datalog block for this run has ended.
-                break
-
-            last_datalog_page = page_number
-            records = []
-            candidate_count = 0
-            rejected_count = 0
-
+                started = True; first_page = page_number
+            elif not heading: break
+            last_page = page_number; records = []; candidates = 0; rejected = 0
             for line_number, line in enumerate(text.splitlines(), 1):
-                if not timestamp_start.match(line):
-                    continue
-                candidate_count += 1
-                match = row_pattern.match(line)
+                if not timestamp_start.match(line): continue
+                candidates += 1; match = row_pattern.match(line)
                 if not match:
-                    rejected_count += 1
-                    rejected_rows.append({
-                        "Stage": stage, "Machine": machine, "Extruder": extruder,
-                        "Source Page": page_number, "Line Number": line_number,
-                        "Reason": f"Could not isolate {expected_fields} trailing fields",
-                        "Raw Line": line.strip(),
-                    })
-                    continue
-
-                raw_values = match.group(4).split()
-                if len(raw_values) != expected_fields:
-                    rejected_count += 1
-                    rejected_rows.append({
-                        "Stage": stage, "Machine": machine, "Extruder": extruder,
-                        "Source Page": page_number, "Line Number": line_number,
-                        "Reason": f"Expected {expected_fields} fields; found {len(raw_values)}",
-                        "Raw Line": line.strip(),
-                    })
-                    continue
-
-                converted = []
-                for value in raw_values:
-                    if value.upper() == "NA":
-                        converted.append(None)
+                    rejected += 1; rejected_rows.append({"Stage": stage, "Machine": machine, "Extruder": extruder, "Source Page": page_number, "Line Number": line_number, "Reason": f"Could not isolate {expected} trailing fields", "Raw Line": line.strip()}); continue
+                raw = match.group(4).split()
+                if len(raw) != expected:
+                    rejected += 1; continue
+                values = []
+                for value in raw:
+                    if value.upper() == "NA": values.append(None)
                     else:
-                        try:
-                            converted.append(float(value))
-                        except ValueError:
-                            converted.append(value)
-
-                record = {
-                    "Stage": stage,
-                    "Machine": machine,
-                    "Extruder": extruder,
-                    "Date & Time": parse_dt(f"{match.group(1)} {match.group(2)}"),
-                    "Step Name": match.group(3).strip(),
-                    "Source Page": page_number,
-                    "Source Line": line_number,
-                }
-                record.update(dict(zip(DATALOG_COLUMNS[stage], converted)))
-                records.append(record)
-
-                # Blending is complete when the report records "Blending is done".
-                # Include the terminal row, then stop the blending block at this page.
-                normalized_step = re.sub(r"\s+", " ", record["Step Name"]).strip().casefold()
-                if stage == "BLENDING" and normalized_step in {
-                    "blending is done",
-                    "blending is completed",
-                    "blending completed",
-                }:
-                    terminal_step_found = True
-                    terminal_step_name = record["Step Name"]
-                    break
-
-            diagnostic_rows.append({
-                "Stage": stage, "Machine": machine, "Extruder": extruder,
-                "Summary Page": summary_page, "Source Page": page_number,
-                "Expected Fields": expected_fields,
-                "Candidate Timestamp Rows": candidate_count,
-                "Extracted Rows": len(records),
-                "Rejected/Missing Rows": rejected_count,
-                "Extraction Rate (%)": (
-                    round(100 * len(records) / candidate_count, 2)
-                    if candidate_count else 100.0
-                ),
-                "Status": "OK" if rejected_count == 0 else "REVIEW",
-            })
-            if records:
-                run_frames.append(pd.DataFrame(records))
-
-            if terminal_step_found:
-                break
-
-        process_ranges.append({
-            "Stage": stage, "Machine": machine, "Extruder": extruder,
-            "Summary Page": summary_page,
-            "First Datalog Page": first_datalog_page,
-            "Last Datalog Page": last_datalog_page,
-            "Datalog Pages": (
-                last_datalog_page - first_datalog_page + 1
-                if first_datalog_page is not None and last_datalog_page is not None
-                else 0
-            ),
-            "Terminal Step Found": terminal_step_found,
-            "Terminal Step Name": terminal_step_name,
-            "Status": (
-                "OK"
-                if first_datalog_page is not None
-                and (stage != "BLENDING" or terminal_step_found)
-                else "DATALOG NOT FOUND"
-                if first_datalog_page is None
-                else "TERMINAL STEP NOT FOUND"
-            ),
-        })
-        if run_frames:
-            extracted_frames.append(pd.concat(run_frames, ignore_index=True))
-
-    datalog = (
-        pd.concat(extracted_frames, ignore_index=True)
-        .drop_duplicates()
-        .sort_values(["Stage", "Extruder", "Source Page", "Source Line"], kind="stable")
-        .reset_index(drop=True)
-        if extracted_frames else pd.DataFrame()
-    )
+                        try: values.append(float(value))
+                        except ValueError: values.append(value)
+                record = {"Stage": stage, "Machine": machine, "Extruder": extruder, "Date & Time": parse_dt(f"{match.group(1)} {match.group(2)}"), "Step Name": match.group(3).strip(), "Source Page": page_number, "Source Line": line_number}
+                record.update(dict(zip(DATALOG_COLUMNS[stage], values))); records.append(record)
+                normalized = re.sub(r"\s+", " ", record["Step Name"]).strip().casefold()
+                if stage == "BLENDING" and normalized in {"blending is done", "blending is completed", "blending completed"}:
+                    terminal_found = True; terminal_name = record["Step Name"]; break
+            diagnostic_rows.append({"Stage": stage, "Machine": machine, "Extruder": extruder, "Summary Page": summary_page, "Source Page": page_number, "Expected Fields": expected, "Candidate Timestamp Rows": candidates, "Extracted Rows": len(records), "Rejected/Missing Rows": rejected, "Extraction Rate (%)": round(100 * len(records) / candidates, 2) if candidates else 100.0, "Status": "OK" if rejected == 0 else "REVIEW"})
+            if records: run_frames.append(pd.DataFrame(records))
+            if terminal_found: break
+        process_ranges.append({"Stage": stage, "Machine": machine, "Extruder": extruder, "Summary Page": summary_page, "First Datalog Page": first_page, "Last Datalog Page": last_page, "Datalog Pages": last_page - first_page + 1 if first_page and last_page else 0, "Terminal Step Found": terminal_found, "Terminal Step Name": terminal_name, "Status": "OK" if first_page and (stage != "BLENDING" or terminal_found) else "DATALOG NOT FOUND" if not first_page else "TERMINAL STEP NOT FOUND"})
+        if run_frames: extracted_frames.append(pd.concat(run_frames, ignore_index=True))
+    datalog = pd.concat(extracted_frames, ignore_index=True).drop_duplicates().sort_values(["Stage", "Extruder", "Source Page", "Source Line"], kind="stable").reset_index(drop=True) if extracted_frames else pd.DataFrame()
     if not datalog.empty:
-        preferred = [
-            "Stage", "Machine", "Extruder", "Date & Time", "Step Name",
-            "Source Page", "Source Line",
-        ]
-        remaining = [column for column in datalog.columns if column not in preferred]
-        datalog = datalog[[column for column in preferred if column in datalog.columns] + remaining]
-
-        # Audit Blending alignment. Every value remains attached to the same
-        # physical PDF line identified by Source Page + Source Line.
-        blending_mask = datalog["Stage"].eq("BLENDING")
-        if blending_mask.any():
-            duplicate_source = datalog.loc[blending_mask].duplicated(
-                subset=["Source Page", "Source Line"], keep=False
-            )
-            if duplicate_source.any():
-                duplicate_rows = datalog.loc[blending_mask].loc[duplicate_source]
-                for _, duplicate in duplicate_rows.iterrows():
-                    rejected_rows.append({
-                        "Stage": "BLENDING",
-                        "Machine": duplicate.get("Machine"),
-                        "Extruder": duplicate.get("Extruder"),
-                        "Source Page": duplicate.get("Source Page"),
-                        "Line Number": duplicate.get("Source Line"),
-                        "Reason": "Duplicate physical source line detected",
-                        "Raw Line": "",
-                    })
-
-    return (
-        datalog,
-        pd.DataFrame(diagnostic_rows),
-        pd.DataFrame(rejected_rows),
-        pd.DataFrame(process_ranges),
-    )
+        preferred = ["Stage", "Machine", "Extruder", "Date & Time", "Step Name", "Source Page", "Source Line"]
+        datalog = datalog[preferred + [c for c in datalog.columns if c not in preferred]]
+    return datalog, pd.DataFrame(diagnostic_rows), pd.DataFrame(rejected_rows), pd.DataFrame(process_ranges)
 
 
-def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected, process_ranges):
+def build_wetting_rise_time_table(wetting_data):
+    columns = ["Extruder", "Date & Time", "Step Name", "Time taken to reach vacuum rise (min)", "Rise time (Sec)", "Vacuum Timer Start", "Source Page"]
+    if wetting_data.empty: return pd.DataFrame(columns=columns)
+    work = wetting_data.copy()
+    work["Normalized Step"] = work["Step Name"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip().str.casefold()
+    work = work[work["Normalized Step"].isin({"start timeout timer", "vacuum timers", "stop vacuum timer", "revacuum"})]
+    work = work.sort_values(["Extruder", "Source Page", "Source Line"], kind="stable").drop_duplicates(["Extruder", "Date & Time", "Normalized Step"])
+    output = []
+    for extruder, group in work.groupby("Extruder", sort=True):
+        starts = group[group["Normalized Step"].eq("start timeout timer")]
+        if starts.empty: continue
+        time_zero = starts.iloc[0]["Date & Time"]; last_timer = None
+        for _, row in group.iterrows():
+            event_time, step = row["Date & Time"], row["Normalized Step"]
+            if pd.isna(event_time) or event_time < time_zero: continue
+            rise, paired_start = pd.NA, pd.NaT
+            if step == "vacuum timers": last_timer = event_time
+            elif step == "stop vacuum timer" and last_timer is not None and last_timer <= event_time:
+                rise = (event_time - last_timer).total_seconds(); paired_start = last_timer
+            output.append({"Extruder": int(extruder), "Date & Time": event_time, "Step Name": row["Step Name"], "Time taken to reach vacuum rise (min)": (event_time - time_zero).total_seconds() / 60, "Rise time (Sec)": rise, "Vacuum Timer Start": paired_start, "Source Page": row["Source Page"]})
+    result = pd.DataFrame(output, columns=columns)
+    if not result.empty: result["Rise time (Sec)"] = pd.to_numeric(result["Rise time (Sec)"], errors="coerce")
+    return result
+
+
+def create_wetting_rise_time_plot(table, batch_number, limit):
+    plot_data = table[table["Step Name"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip().str.casefold().eq("stop vacuum timer")].dropna(subset=["Rise time (Sec)"])
+    fig, ax = plt.subplots(figsize=(12, 7.2))
+    ax.axhline(limit, color="#C0504D", lw=3, label="RISE TIME LIMIT")
+    styles = {1: ("^", "#9BBB59", "EXTRUDER - 01"), 2: ("x", "#35A9D6", "EXTRUDER - 02"), 3: ("o", "#4F81BD", "EXTRUDER - 03")}
+    for ext in sorted(plot_data["Extruder"].unique()):
+        data = plot_data[plot_data["Extruder"].eq(ext)]
+        marker, color, label = styles.get(int(ext), ("o", None, f"EXTRUDER - {int(ext):02d}"))
+        ax.scatter(data["Time taken to reach vacuum rise (min)"], data["Rise time (Sec)"], marker=marker, color=color, s=55, linewidths=1.2, label=label, zorder=3)
+    x_max = max(10, float(plot_data["Time taken to reach vacuum rise (min)"].max()) * 1.08 if not plot_data.empty else 10)
+    ax.set_xlim(0, x_max); ax.set_ylim(0, max(700, limit * 1.15))
+    ax.set_title(str(batch_number), fontsize=20, fontweight="bold", pad=18)
+    ax.set_xlabel("Time taken to reach vacuum rise (min)", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Rise time (Sec)", fontsize=13, fontweight="bold")
+    ax.grid(True, color="#D9D9D9"); ax.set_axisbelow(True); ax.legend(loc="center right", frameon=False, fontsize=12)
+    fig.tight_layout(); return fig
+
+
+def figure_to_png(fig):
+    buffer = io.BytesIO(); fig.savefig(buffer, format="png", dpi=200, bbox_inches="tight"); return buffer.getvalue()
+
+
+def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected, process_ranges, wetting_rise_table):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pd.DataFrame([batch]).to_excel(writer, "Batch Details", index=False)
-        overview.to_excel(writer, "Process Overview", index=False)
-        summaries.to_excel(writer, "Process Summary", index=False)
-        settings.to_excel(writer, "Recipe Settings", index=False)
-        process_ranges.to_excel(writer, "Process Page Ranges", index=False)
-        diagnostics.to_excel(writer, "Datalog Diagnostics", index=False)
-        rejected.to_excel(writer, "Rejected Rows", index=False)
+        overview.to_excel(writer, "Process Overview", index=False); summaries.to_excel(writer, "Process Summary", index=False)
+        settings.to_excel(writer, "Recipe Settings", index=False); process_ranges.to_excel(writer, "Process Page Ranges", index=False)
+        wetting_rise_table.to_excel(writer, "Wetting Rise Time", index=False)
+        diagnostics.to_excel(writer, "Datalog Diagnostics", index=False); rejected.to_excel(writer, "Rejected Rows", index=False)
         for stage in STAGES:
-            part = datalog[datalog["Stage"].eq(stage)] if not datalog.empty else pd.DataFrame()
-            part.to_excel(writer, f"{stage.title()} Datalog"[:31], index=False)
-        for worksheet in writer.book.worksheets:
-            worksheet.freeze_panes = "A2"
-            worksheet.sheet_view.showGridLines = False
-            worksheet.auto_filter.ref = worksheet.dimensions
-            for cell in worksheet[1]:
-                cell.font = cell.font.copy(bold=True, color="FFFFFF")
-                cell.fill = cell.fill.copy(fill_type="solid", fgColor="1F4E78")
-            for column in worksheet.columns:
-                letter = column[0].column_letter
-                worksheet.column_dimensions[letter].width = min(
-                    max(len(str(cell.value or "")) for cell in column) + 2, 40
-                )
+            (datalog[datalog["Stage"].eq(stage)] if not datalog.empty else pd.DataFrame()).to_excel(writer, f"{stage.title()} Datalog"[:31], index=False)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"; ws.sheet_view.showGridLines = False; ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                cell.font = cell.font.copy(bold=True, color="FFFFFF"); cell.fill = cell.fill.copy(fill_type="solid", fgColor="1F4E78")
+            for column in ws.columns:
+                ws.column_dimensions[column[0].column_letter].width = min(max(len(str(cell.value or "")) for cell in column) + 2, 40)
     return output.getvalue()
 
 
 def main():
     st.title("🧪 Complete Batch Process Report Extractor")
-    st.caption("Extracts Process Overview, recipe settings, and complete Wetting, Premixing, Mixing and Blending datalogs.")
+    st.caption("Extracts Process Overview, recipe settings, complete datalogs, diagnostics, and Wetting rise-time analysis.")
     uploaded = st.file_uploader("Upload Batch Cycle Report PDF", type=["pdf"])
-    if uploaded is None:
-        st.info("Upload a batch-report PDF to begin.")
-        st.stop()
-
+    if uploaded is None: st.info("Upload a batch-report PDF to begin."); st.stop()
     try:
         with st.status("Scanning the complete document...", expanded=True) as status:
-            pages = extract_pages(uploaded.getvalue())
-            st.write(f"Pages scanned: {len(pages):,}")
-            batch = parse_batch_details(pages)
-            overview = parse_process_overview(pages)
-            summaries = parse_process_summaries(pages)
-            settings = parse_recipe_settings(pages, summaries)
+            pages = extract_pages(uploaded.getvalue()); batch = parse_batch_details(pages); overview = parse_process_overview(pages)
+            summaries = parse_process_summaries(pages); settings = parse_recipe_settings(pages, summaries)
             datalog, diagnostics, rejected_rows, process_ranges = parse_datalogs(pages, summaries)
+            wetting_data = datalog[datalog["Stage"].eq("WETTING")].copy() if not datalog.empty else pd.DataFrame()
+            wetting_rise_table = build_wetting_rise_time_table(wetting_data)
             status.update(label="Extraction completed", state="complete", expanded=False)
-    except Exception as error:
-        st.exception(error)
-        st.stop()
+    except Exception as error: st.exception(error); st.stop()
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("PDF pages", f"{len(pages):,}")
-    c2.metric("Overview operations", f"{len(overview):,}")
-    c3.metric("Target process runs", f"{len(summaries):,}")
-    c4.metric("Datalog rows", f"{len(datalog):,}")
+    c1.metric("PDF pages", f"{len(pages):,}"); c2.metric("Overview operations", f"{len(overview):,}")
+    c3.metric("Target process runs", f"{len(summaries):,}"); c4.metric("Datalog rows", f"{len(datalog):,}")
+    st.subheader("Batch Details"); st.dataframe(pd.DataFrame([batch]), use_container_width=True, hide_index=True)
+    st.subheader("Process Overview Times"); st.dataframe(overview, use_container_width=True, hide_index=True)
+    st.subheader("Process Summary"); st.dataframe(summaries, use_container_width=True, hide_index=True)
 
-    st.subheader("Batch Details")
-    st.dataframe(pd.DataFrame([batch]), use_container_width=True, hide_index=True)
-    st.subheader("Process Overview Times")
-    st.dataframe(overview, use_container_width=True, hide_index=True)
-    st.subheader("Process Summary")
-    st.dataframe(summaries, use_container_width=True, hide_index=True)
-
-    recipe_tab, datalog_tab, diagnostics_tab = st.tabs([
-        "Recipe Settings", "Datalog Explorer", "Diagnostics"
-    ])
-
+    recipe_tab, datalog_tab, wetting_tab, diagnostics_tab = st.tabs(["Recipe Settings", "Datalog Explorer", "Wetting Rise-Time Plot", "Diagnostics"])
     with recipe_tab:
         st.dataframe(settings, use_container_width=True, hide_index=True, height=520)
-        st.download_button("Download Recipe Settings CSV", settings.to_csv(index=False).encode("utf-8"),
-                           "recipe_settings.csv", "text/csv")
-
+        st.download_button("Download Recipe Settings CSV", settings.to_csv(index=False).encode(), "recipe_settings.csv", "text/csv")
     with datalog_tab:
-        if datalog.empty:
-            st.warning("No datalog rows were extracted.")
+        if datalog.empty: st.warning("No datalog rows were extracted.")
         else:
-            stage_options = [stage for stage in STAGES if stage in set(datalog["Stage"])]
-            stage = st.selectbox("Stage", stage_options)
-            stage_data = datalog[datalog["Stage"].eq(stage)]
-            extruders = sorted(int(value) for value in stage_data["Extruder"].dropna().unique())
-            extruder = st.selectbox("Extruder", extruders) if extruders else None
+            stage = st.selectbox("Stage", [x for x in STAGES if x in set(datalog["Stage"])])
+            stage_data = datalog[datalog["Stage"].eq(stage)]; extruders = sorted(stage_data["Extruder"].dropna().astype(int).unique())
+            extruder = st.selectbox("Extruder", extruders) if len(extruders) else None
             view = stage_data[stage_data["Extruder"].eq(extruder)] if extruder is not None else stage_data
-            steps = sorted(view["Step Name"].dropna().unique())
-            chosen_steps = st.multiselect("Step Name", steps, default=steps)
-            view = view[view["Step Name"].isin(chosen_steps)].copy()
-
-            # Display only the columns belonging to the selected stage. This avoids
-            # blank columns inherited from other stages and preserves exact row alignment.
-            stage_columns = [
-                "Stage", "Machine", "Extruder", "Date & Time", "Step Name", "Source Page"
-            ] + DATALOG_COLUMNS[stage]
-            stage_columns = [column for column in stage_columns if column in view.columns]
-            view = (view[stage_columns]
-                    .sort_values(["Date & Time", "Source Page"], kind="stable")
-                    .reset_index(drop=True))
-            view.insert(0, "Record No.", range(1, len(view) + 1))
-
-            pages_found = sorted(int(value) for value in view["Source Page"].dropna().unique())
-            st.write(f"Rows: **{len(view):,}** | PDF pages: **{pages_found[0] if pages_found else '-'} to {pages_found[-1] if pages_found else '-'}**")
-            st.dataframe(view, use_container_width=True, hide_index=True, height=560)
-            st.download_button("Download Filtered Datalog CSV", view.to_csv(index=False).encode("utf-8"),
-                               f"{stage.lower()}_extruder_{extruder}.csv", "text/csv")
-
+            steps = sorted(view["Step Name"].dropna().unique()); selected_steps = st.multiselect("Step Name", steps, default=steps)
+            view = view[view["Step Name"].isin(selected_steps)].copy()
+            stage_columns = ["Stage", "Machine", "Extruder", "Date & Time", "Step Name", "Source Page"] + DATALOG_COLUMNS[stage]
+            view = view[[c for c in stage_columns if c in view.columns]].sort_values(["Date & Time", "Source Page"], kind="stable").reset_index(drop=True)
+            view.insert(0, "Record No.", range(1, len(view) + 1)); st.dataframe(view, use_container_width=True, hide_index=True, height=560)
+            st.download_button("Download Filtered Datalog CSV", view.to_csv(index=False).encode(), f"{stage.lower()}_extruder_{extruder}.csv", "text/csv")
+    with wetting_tab:
+        st.markdown("#### Wetting Vacuum Rise-Time Analysis")
+        st.caption("Elapsed time starts at the first 'Start Timeout timer'. Rise time is calculated from each 'Vacuum Timers' event to the following 'Stop vacuum timer' event.")
+        limit = st.number_input("Rise time limit (Sec)", min_value=0.0, value=600.0, step=10.0)
+        if wetting_rise_table.empty: st.warning("No Wetting timer-event table was generated.")
+        else:
+            available = sorted(wetting_rise_table["Extruder"].unique()); selected = st.multiselect("Extruders", available, default=available)
+            table_view = wetting_rise_table[wetting_rise_table["Extruder"].isin(selected)].copy()
+            st.dataframe(table_view, use_container_width=True, hide_index=True, height=430)
+            batch_number = batch.get("Batch no.") or "Batch"; fig = create_wetting_rise_time_plot(table_view, batch_number, limit)
+            st.pyplot(fig, use_container_width=True); png = figure_to_png(fig); plt.close(fig)
+            x1, x2 = st.columns(2)
+            x1.download_button("Download Rise-Time Table CSV", table_view.to_csv(index=False).encode(), f"{batch_number}_wetting_rise_time.csv", "text/csv")
+            x2.download_button("Download Rise-Time Plot PNG", png, f"{batch_number}_wetting_rise_time.png", "image/png")
     with diagnostics_tab:
-        st.markdown("#### Assigned process page ranges")
-        if process_ranges.empty:
-            st.warning("No process page ranges could be constructed.")
-        else:
-            st.dataframe(process_ranges, use_container_width=True, hide_index=True)
-
-        if diagnostics.empty:
-            st.warning("No datalog pages were detected.")
-        else:
-            stage_audit = (diagnostics.groupby(["Stage", "Machine", "Extruder"], dropna=False, as_index=False)
-                           .agg(**{
-                               "First Page": ("Source Page", "min"),
-                               "Last Page": ("Source Page", "max"),
-                               "Datalog Pages": ("Source Page", "nunique"),
-                               "Candidate Rows": ("Candidate Timestamp Rows", "sum"),
-                               "Extracted Rows": ("Extracted Rows", "sum"),
-                               "Rejected Rows": ("Rejected/Missing Rows", "sum"),
-                           }))
-            stage_audit["Extraction Rate (%)"] = (
-                100 * stage_audit["Extracted Rows"] / stage_audit["Candidate Rows"].replace(0, pd.NA)
-            ).round(2).fillna(100.0)
-            stage_audit["Status"] = stage_audit["Rejected Rows"].map(lambda x: "OK" if x == 0 else "REVIEW")
-            st.markdown("#### Stage and extruder coverage")
-            st.dataframe(stage_audit, use_container_width=True, hide_index=True)
-            st.markdown("#### Page-level diagnostics")
-            review_only = st.checkbox("Show only pages requiring review", value=False)
-            page_view = diagnostics[diagnostics["Status"].eq("REVIEW")] if review_only else diagnostics
-            st.dataframe(page_view, use_container_width=True, hide_index=True, height=400)
-
+        st.markdown("#### Assigned process page ranges"); st.dataframe(process_ranges, use_container_width=True, hide_index=True)
+        st.markdown("#### Page-level diagnostics"); st.dataframe(diagnostics, use_container_width=True, hide_index=True, height=400)
         st.markdown("#### Rejected rows")
-        if rejected_rows.empty:
-            st.success("No timestamp rows were rejected.")
-        else:
-            st.warning(f"{len(rejected_rows):,} rows require review.")
-            st.dataframe(rejected_rows, use_container_width=True, hide_index=True, height=400)
-            st.download_button("Download Rejected Rows CSV", rejected_rows.to_csv(index=False).encode("utf-8"),
-                               "rejected_datalog_rows.csv", "text/csv")
+        if rejected_rows.empty: st.success("No timestamp rows were rejected.")
+        else: st.dataframe(rejected_rows, use_container_width=True, hide_index=True, height=400)
 
-    excel = make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected_rows, process_ranges)
+    excel = make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected_rows, process_ranges, wetting_rise_table)
     batch_number = batch.get("Batch no.") or "batch"
-    st.download_button("⬇️ Download Complete Excel Extraction", excel,
-                       f"{batch_number}_complete_process_extraction.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+    st.download_button("⬇️ Download Complete Excel Extraction", excel, f"{batch_number}_complete_process_extraction.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
 
 if __name__ == "__main__":
