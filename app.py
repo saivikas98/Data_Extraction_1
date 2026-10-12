@@ -203,6 +203,174 @@ def build_wetting_rise_time_table(wetting_data):
     return result
 
 
+
+def build_mixing_max_pressure_table(mixing_data):
+    """Calculate directional maximum pressure for each extrusion cycle.
+
+    Physical direction mapping:
+    - Movement to accumulator RIGHT: maximum Loadcell LEFT pressure.
+    - Movement to accumulator LEFT: maximum Loadcell RIGHT pressure.
+
+    Separate results are generated for 5 mm, 3.8 mm and 2 mm extrusion steps.
+    Cycle 0 is excluded because it represents initialization rather than a completed cycle.
+    """
+    columns = [
+        "Extruder", "Orifice", "Cycle",
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+        "Move Right Start", "Move Right End",
+        "Move Left Start", "Move Left End",
+        "Move Right Source Pages", "Move Left Source Pages",
+    ]
+    if mixing_data.empty:
+        return pd.DataFrame(columns=columns)
+
+    work = mixing_data.copy()
+    work["Current Cycle"] = pd.to_numeric(work["Current Cycle"], errors="coerce")
+    work["Loadcell Left (bar)"] = pd.to_numeric(work["Loadcell Left (bar)"], errors="coerce")
+    work["Loadcell Right (bar)"] = pd.to_numeric(work["Loadcell Right (bar)"], errors="coerce")
+    work["Normalized Step"] = (
+        work["Step Name"].astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.casefold()
+    )
+
+    patterns = {
+        "5 mm": r"extrusion\s+5\s*mm\s+to\s+accumulator\s+(right|left)",
+        "3.8 mm": r"extrusion\s+3\.8\s*mm\s+to\s+accumulator\s+(right|left)",
+        "2 mm": r"extrusion\s+2\s*mm\s+to\s+accumulator\s+(right|left)",
+    }
+    output = []
+
+    for extruder, extruder_data in work.groupby("Extruder", sort=True):
+        for orifice, pattern in patterns.items():
+            stage_data = extruder_data[
+                extruder_data["Normalized Step"].str.contains(pattern, regex=True, na=False)
+            ].copy()
+            stage_data = stage_data[stage_data["Current Cycle"].gt(0)]
+            if stage_data.empty:
+                continue
+
+            for cycle, cycle_data in stage_data.groupby("Current Cycle", sort=True):
+                right_move = cycle_data[
+                    cycle_data["Normalized Step"].str.endswith("accumulator right")
+                ]
+                left_move = cycle_data[
+                    cycle_data["Normalized Step"].str.endswith("accumulator left")
+                ]
+
+                output.append({
+                    "Extruder": int(extruder),
+                    "Orifice": orifice,
+                    "Cycle": int(cycle),
+                    "Max Pressure Left - Move Right (bar)": (
+                        right_move["Loadcell Left (bar)"].max()
+                        if not right_move.empty else pd.NA
+                    ),
+                    "Max Pressure Right - Move Left (bar)": (
+                        left_move["Loadcell Right (bar)"].max()
+                        if not left_move.empty else pd.NA
+                    ),
+                    "Move Right Start": right_move["Date & Time"].min() if not right_move.empty else pd.NaT,
+                    "Move Right End": right_move["Date & Time"].max() if not right_move.empty else pd.NaT,
+                    "Move Left Start": left_move["Date & Time"].min() if not left_move.empty else pd.NaT,
+                    "Move Left End": left_move["Date & Time"].max() if not left_move.empty else pd.NaT,
+                    "Move Right Source Pages": (
+                        ", ".join(map(str, sorted(right_move["Source Page"].dropna().astype(int).unique())))
+                        if not right_move.empty else ""
+                    ),
+                    "Move Left Source Pages": (
+                        ", ".join(map(str, sorted(left_move["Source Page"].dropna().astype(int).unique())))
+                        if not left_move.empty else ""
+                    ),
+                })
+
+    result = pd.DataFrame(output, columns=columns)
+    if result.empty:
+        return result
+    pressure_columns = [
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+    ]
+    result[pressure_columns] = result[pressure_columns].apply(pd.to_numeric, errors="coerce")
+    return result.sort_values(["Extruder", "Orifice", "Cycle"]).reset_index(drop=True)
+
+
+def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
+    """Create an interactive maximum-pressure-by-cycle chart."""
+    data = table[
+        table["Extruder"].eq(extruder) & table["Orifice"].eq(orifice)
+    ].sort_values("Cycle").copy()
+
+    figure = go.Figure()
+    series = [
+        (
+            "Max Pressure Left - Move Right (bar)",
+            "Loadcell Left Max - movement to accumulator right",
+            "#4F81BD", "diamond",
+            ["Move Right Start", "Move Right End", "Move Right Source Pages"],
+        ),
+        (
+            "Max Pressure Right - Move Left (bar)",
+            "Loadcell Right Max - movement to accumulator left",
+            "#C0504D", "diamond",
+            ["Move Left Start", "Move Left End", "Move Left Source Pages"],
+        ),
+    ]
+
+    for column, name, color, symbol, detail_columns in series:
+        values = data.dropna(subset=[column]).copy()
+        if values.empty:
+            continue
+        custom = values[detail_columns].copy()
+        for date_column in detail_columns[:2]:
+            custom[date_column] = pd.to_datetime(custom[date_column], errors="coerce").dt.strftime(
+                "%d-%m-%Y %H:%M:%S"
+            )
+        figure.add_trace(go.Scatter(
+            x=values["Cycle"],
+            y=values[column],
+            mode="lines+markers",
+            name=name,
+            customdata=custom.to_numpy(),
+            line={"color": color, "width": 2, "dash": "dash" if "Right Max" in name else "solid"},
+            marker={"color": color, "size": 9, "symbol": symbol},
+            hovertemplate=(
+                f"<b>{name}</b><br>"
+                "Cycle: %{x}<br>"
+                "Maximum pressure: %{y:.2f} bar<br>"
+                "Movement start: %{customdata[0]}<br>"
+                "Movement end: %{customdata[1]}<br>"
+                "Source page(s): %{customdata[2]}"
+                "<extra></extra>"
+            ),
+        ))
+
+    max_cycle = int(data["Cycle"].max()) if not data.empty else 1
+    max_pressure = data[[
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+    ]].max().max() if not data.empty else 200
+    y_max = max(200, float(max_pressure) * 1.12) if pd.notna(max_pressure) else 200
+
+    figure.update_layout(
+        title={
+            "text": f"{batch_number}<br>EXTRUDER - {int(extruder)} | MIXING: Extrusion {orifice} cycles",
+            "x": 0.5,
+            "xanchor": "center",
+        },
+        xaxis_title="Cycles",
+        yaxis_title="Maximum Pressure (bar)",
+        xaxis={"dtick": 1, "range": [0.5, max_cycle + 0.5], "showgrid": True},
+        yaxis={"range": [0, y_max], "showgrid": True},
+        hovermode="closest",
+        legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.20},
+        height=620,
+        margin={"l": 70, "r": 30, "t": 100, "b": 120},
+    )
+    return figure
+
 def create_wetting_rise_time_plot(table, batch_number, limit):
     """Create an interactive Plotly chart with point-level hover details."""
     normalized_steps = (
@@ -291,13 +459,14 @@ def figure_to_png(fig):
     buffer = io.BytesIO(); fig.savefig(buffer, format="png", dpi=200, bbox_inches="tight"); return buffer.getvalue()
 
 
-def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected, process_ranges, wetting_rise_table):
+def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected, process_ranges, wetting_rise_table, mixing_pressure_table):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pd.DataFrame([batch]).to_excel(writer, "Batch Details", index=False)
         overview.to_excel(writer, "Process Overview", index=False); summaries.to_excel(writer, "Process Summary", index=False)
         settings.to_excel(writer, "Recipe Settings", index=False); process_ranges.to_excel(writer, "Process Page Ranges", index=False)
         wetting_rise_table.to_excel(writer, "Wetting Rise Time", index=False)
+        mixing_pressure_table.to_excel(writer, "Mixing Max Pressure", index=False)
         diagnostics.to_excel(writer, "Datalog Diagnostics", index=False); rejected.to_excel(writer, "Rejected Rows", index=False)
         for stage in STAGES:
             (datalog[datalog["Stage"].eq(stage)] if not datalog.empty else pd.DataFrame()).to_excel(writer, f"{stage.title()} Datalog"[:31], index=False)
@@ -322,6 +491,8 @@ def main():
             datalog, diagnostics, rejected_rows, process_ranges = parse_datalogs(pages, summaries)
             wetting_data = datalog[datalog["Stage"].eq("WETTING")].copy() if not datalog.empty else pd.DataFrame()
             wetting_rise_table = build_wetting_rise_time_table(wetting_data)
+            mixing_data = datalog[datalog["Stage"].eq("MIXING")].copy() if not datalog.empty else pd.DataFrame()
+            mixing_pressure_table = build_mixing_max_pressure_table(mixing_data)
             status.update(label="Extraction completed", state="complete", expanded=False)
     except Exception as error: st.exception(error); st.stop()
 
@@ -332,7 +503,7 @@ def main():
     st.subheader("Process Overview Times"); st.dataframe(overview, use_container_width=True, hide_index=True)
     st.subheader("Process Summary"); st.dataframe(summaries, use_container_width=True, hide_index=True)
 
-    recipe_tab, datalog_tab, wetting_tab, diagnostics_tab = st.tabs(["Recipe Settings", "Datalog Explorer", "Wetting Rise-Time Plot", "Diagnostics"])
+    recipe_tab, datalog_tab, wetting_tab, mixing_tab, diagnostics_tab = st.tabs(["Recipe Settings", "Datalog Explorer", "Wetting Rise-Time Plot", "Mixing Max-Pressure Plots", "Diagnostics"])
     with recipe_tab:
         st.dataframe(settings, use_container_width=True, hide_index=True, height=520)
         st.download_button("Download Recipe Settings CSV", settings.to_csv(index=False).encode(), "recipe_settings.csv", "text/csv")
@@ -399,6 +570,106 @@ def main():
                 f"{batch_number}_wetting_rise_time_interactive.html",
                 "text/html",
             )
+    with mixing_tab:
+        st.markdown("#### Mixing Maximum Pressure by Extrusion Cycle")
+        st.caption(
+            "For movement to accumulator right, the maximum left-loadcell pressure is used. "
+            "For movement to accumulator left, the maximum right-loadcell pressure is used. "
+            "Cycle 0 is excluded."
+        )
+        if mixing_pressure_table.empty:
+            st.warning("No directional Mixing pressure-cycle data were generated.")
+        else:
+            mixing_extruders = sorted(mixing_pressure_table["Extruder"].unique().astype(int))
+            selected_mixing_extruder = st.selectbox(
+                "Mixing extruder", mixing_extruders, key="mixing_plot_extruder"
+            )
+            available_orifices = [
+                item for item in ["5 mm", "3.8 mm", "2 mm"]
+                if item in set(
+                    mixing_pressure_table.loc[
+                        mixing_pressure_table["Extruder"].eq(selected_mixing_extruder),
+                        "Orifice",
+                    ]
+                )
+            ]
+            selected_orifices = st.multiselect(
+                "Extrusion stages", available_orifices,
+                default=available_orifices,
+                key="mixing_plot_orifices",
+            )
+            mixing_view = mixing_pressure_table[
+                mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
+                & mixing_pressure_table["Orifice"].isin(selected_orifices)
+            ].copy()
+            st.dataframe(
+                mixing_view,
+                use_container_width=True,
+                hide_index=True,
+                height=360,
+            )
+
+            batch_number_for_mixing = batch.get("Batch no.") or "Batch"
+            for orifice in selected_orifices:
+                mixing_figure = create_mixing_pressure_plot(
+                    mixing_pressure_table,
+                    selected_mixing_extruder,
+                    orifice,
+                    batch_number_for_mixing,
+                )
+                st.plotly_chart(
+                    mixing_figure,
+                    use_container_width=True,
+                    config={
+                        "displaylogo": False,
+                        "scrollZoom": True,
+                        "toImageButtonOptions": {
+                            "format": "png",
+                            "filename": (
+                                f"{batch_number_for_mixing}_extruder_"
+                                f"{selected_mixing_extruder}_{orifice.replace(' ', '_')}_max_pressure"
+                            ),
+                            "height": 620,
+                            "width": 1200,
+                            "scale": 2,
+                        },
+                    },
+                    key=f"mixing_chart_{selected_mixing_extruder}_{orifice}",
+                )
+
+            mixing_html_figure = go.Figure()
+            for orifice in selected_orifices:
+                source_figure = create_mixing_pressure_plot(
+                    mixing_pressure_table,
+                    selected_mixing_extruder,
+                    orifice,
+                    batch_number_for_mixing,
+                )
+                for trace in source_figure.data:
+                    trace.name = f"{orifice} | {trace.name}"
+                    mixing_html_figure.add_trace(trace)
+            mixing_html_figure.update_layout(
+                title=f"{batch_number_for_mixing} | Extruder {selected_mixing_extruder} | Mixing Max Pressure",
+                xaxis_title="Cycles", yaxis_title="Maximum Pressure (bar)",
+                hovermode="closest", height=700,
+            )
+            mixing_html = pio.to_html(
+                mixing_html_figure, include_plotlyjs="cdn", full_html=True
+            ).encode("utf-8")
+            m1, m2 = st.columns(2)
+            m1.download_button(
+                "Download Mixing Max-Pressure Table CSV",
+                mixing_view.to_csv(index=False).encode("utf-8"),
+                f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_mixing_max_pressure.csv",
+                "text/csv",
+            )
+            m2.download_button(
+                "Download Interactive Mixing Plot HTML",
+                mixing_html,
+                f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_mixing_max_pressure.html",
+                "text/html",
+            )
+
     with diagnostics_tab:
         st.markdown("#### Assigned process page ranges"); st.dataframe(process_ranges, use_container_width=True, hide_index=True)
         st.markdown("#### Page-level diagnostics"); st.dataframe(diagnostics, use_container_width=True, hide_index=True, height=400)
@@ -406,7 +677,7 @@ def main():
         if rejected_rows.empty: st.success("No timestamp rows were rejected.")
         else: st.dataframe(rejected_rows, use_container_width=True, hide_index=True, height=400)
 
-    excel = make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected_rows, process_ranges, wetting_rise_table)
+    excel = make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected_rows, process_ranges, wetting_rise_table, mixing_pressure_table)
     batch_number = batch.get("Batch no.") or "batch"
     st.download_button("⬇️ Download Complete Excel Extraction", excel, f"{batch_number}_complete_process_extraction.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
