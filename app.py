@@ -208,79 +208,62 @@ def summary_for_datalog_page(stage, page_number, summaries):
     return candidates.iloc[-1] if not candidates.empty else None
 
 
-def build_process_ranges(summaries, total_pages):
-    """Create non-overlapping PDF page ranges for every process run.
-
-    A range begins on a process-summary page and ends immediately before
-    the next process-summary page. This prevents pages from one extruder
-    being assigned to another extruder by timestamp proximity.
-    """
-    if summaries.empty:
-        return []
-
-    ordered = summaries.sort_values("Source Page").reset_index(drop=True)
-    ranges = []
-    for index, summary in ordered.iterrows():
-        start_page = int(summary["Source Page"])
-        if index + 1 < len(ordered):
-            end_page = int(ordered.iloc[index + 1]["Source Page"]) - 1
-        else:
-            end_page = total_pages
-        ranges.append({
-            "Stage": summary["Stage"],
-            "Machine": summary["Machine"],
-            "Extruder": summary["Extruder"],
-            "Process Start": summary["Process start"],
-            "Process End": summary["Process end"],
-            "Summary Page": start_page,
-            "Range Start Page": start_page,
-            "Range End Page": end_page,
-        })
-    return ranges
-
-
 def parse_datalogs(pages, summaries):
-    """Extract every datalog page within its process-summary page range.
+    """Extract each process block from its own contiguous datalog pages.
 
-    Page ownership is determined from non-overlapping process ranges, not
-    by the median timestamp of an individual page. This reliably keeps,
-    for example, Wetting Extruder 1 pages 36-189 separate from Wetting
-    Extruder 2 pages 329-470.
+    The parser starts at the relevant process-summary page, waits until it finds
+    that stage's first DATALOG page, and then continues until the first page that
+    no longer carries the same datalog heading. This prevents data from the next
+    extruder or a later report section from being joined to the selected run.
     """
     extracted_frames = []
     diagnostic_rows = []
     rejected_rows = []
+    process_ranges = []
     timestamp_start = re.compile(rf"^\s*({DATE})\s+({TIME})\s+")
-    process_ranges = build_process_ranges(summaries, len(pages))
 
-    for process_range in process_ranges:
-        stage = process_range["Stage"]
+    ordered = summaries.sort_values("Source Page").reset_index(drop=True)
+
+    for _, summary in ordered.iterrows():
+        stage = summary["Stage"]
+        machine = summary["Machine"]
+        extruder = summary["Extruder"]
+        summary_page = int(summary["Source Page"])
         expected_fields = len(DATALOG_COLUMNS[stage])
         row_pattern = re.compile(
             rf"^\s*({DATE})\s+({TIME})\s+(.+?)\s+"
             rf"((?:\S+\s+){{{expected_fields - 1}}}\S+)\s*$"
         )
 
-        datalog_started = False
-        range_frames = []
+        started = False
+        first_datalog_page = None
+        last_datalog_page = None
+        run_frames = []
+        terminal_step_found = False
+        terminal_step_name = None
 
-        for page_number in range(
-            process_range["Range Start Page"],
-            process_range["Range End Page"] + 1,
-        ):
+        for page_number in range(summary_page, len(pages) + 1):
             text = pages[page_number - 1]
-            heading_found = bool(re.search(
-                rf"(?mi)^\s*{stage}\s+DATALOG\s*$", text
-            ))
+            heading_found = bool(
+                re.search(rf"(?mi)^\s*{stage}\s+DATALOG\s*$", text)
+            )
 
-            if heading_found:
-                datalog_started = True
+            if not started:
+                if not heading_found:
+                    # Recipe settings may occupy a few pages after the summary.
+                    # Stop if a different target process summary is reached.
+                    different_summary = identify_stage(text, "PROCESS")
+                    if page_number > summary_page and different_summary:
+                        break
+                    continue
+                started = True
+                first_datalog_page = page_number
 
-            # Ignore process-summary and recipe pages until the first
-            # datalog heading belonging to this exact process range.
-            if not datalog_started:
-                continue
+            elif not heading_found:
+                # The contiguous datalog block for this run has ended.
+                break
 
+            last_datalog_page = page_number
             records = []
             candidate_count = 0
             rejected_count = 0
@@ -288,17 +271,13 @@ def parse_datalogs(pages, summaries):
             for line_number, line in enumerate(text.splitlines(), 1):
                 if not timestamp_start.match(line):
                     continue
-
                 candidate_count += 1
                 match = row_pattern.match(line)
                 if not match:
                     rejected_count += 1
                     rejected_rows.append({
-                        "Stage": stage,
-                        "Extruder": process_range["Extruder"],
-                        "Machine": process_range["Machine"],
-                        "Source Page": page_number,
-                        "Line Number": line_number,
+                        "Stage": stage, "Machine": machine, "Extruder": extruder,
+                        "Source Page": page_number, "Line Number": line_number,
                         "Reason": f"Could not isolate {expected_fields} trailing fields",
                         "Raw Line": line.strip(),
                     })
@@ -308,48 +287,49 @@ def parse_datalogs(pages, summaries):
                 if len(raw_values) != expected_fields:
                     rejected_count += 1
                     rejected_rows.append({
-                        "Stage": stage,
-                        "Extruder": process_range["Extruder"],
-                        "Machine": process_range["Machine"],
-                        "Source Page": page_number,
-                        "Line Number": line_number,
+                        "Stage": stage, "Machine": machine, "Extruder": extruder,
+                        "Source Page": page_number, "Line Number": line_number,
                         "Reason": f"Expected {expected_fields} fields; found {len(raw_values)}",
                         "Raw Line": line.strip(),
                     })
                     continue
 
-                converted_values = []
-                for raw_value in raw_values:
-                    if raw_value.upper() == "NA":
-                        converted_values.append(None)
+                converted = []
+                for value in raw_values:
+                    if value.upper() == "NA":
+                        converted.append(None)
                     else:
                         try:
-                            converted_values.append(float(raw_value))
+                            converted.append(float(value))
                         except ValueError:
-                            converted_values.append(raw_value)
+                            converted.append(value)
 
                 record = {
                     "Stage": stage,
-                    "Extruder": process_range["Extruder"],
-                    "Machine": process_range["Machine"],
+                    "Machine": machine,
+                    "Extruder": extruder,
                     "Date & Time": parse_dt(f"{match.group(1)} {match.group(2)}"),
                     "Step Name": match.group(3).strip(),
                     "Source Page": page_number,
                 }
-                record.update(dict(zip(DATALOG_COLUMNS[stage], converted_values)))
+                record.update(dict(zip(DATALOG_COLUMNS[stage], converted)))
                 records.append(record)
 
+                # Blending is complete when the report records "Blending is done".
+                # Include the terminal row, then stop the blending block at this page.
+                normalized_step = re.sub(r"\s+", " ", record["Step Name"]).strip().casefold()
+                if stage == "BLENDING" and normalized_step in {
+                    "blending is done",
+                    "blending is completed",
+                    "blending completed",
+                }:
+                    terminal_step_found = True
+                    terminal_step_name = record["Step Name"]
+                    break
+
             diagnostic_rows.append({
-                "Stage": stage,
-                "Extruder": process_range["Extruder"],
-                "Machine": process_range["Machine"],
-                "Summary Page": process_range["Summary Page"],
-                "Assigned Range": (
-                    f'{process_range["Range Start Page"]}-'
-                    f'{process_range["Range End Page"]}'
-                ),
-                "Source Page": page_number,
-                "Datalog Heading Found": heading_found,
+                "Stage": stage, "Machine": machine, "Extruder": extruder,
+                "Summary Page": summary_page, "Source Page": page_number,
                 "Expected Fields": expected_fields,
                 "Candidate Timestamp Rows": candidate_count,
                 "Extracted Rows": len(records),
@@ -360,12 +340,35 @@ def parse_datalogs(pages, summaries):
                 ),
                 "Status": "OK" if rejected_count == 0 else "REVIEW",
             })
-
             if records:
-                range_frames.append(pd.DataFrame(records))
+                run_frames.append(pd.DataFrame(records))
 
-        if range_frames:
-            extracted_frames.append(pd.concat(range_frames, ignore_index=True))
+            if terminal_step_found:
+                break
+
+        process_ranges.append({
+            "Stage": stage, "Machine": machine, "Extruder": extruder,
+            "Summary Page": summary_page,
+            "First Datalog Page": first_datalog_page,
+            "Last Datalog Page": last_datalog_page,
+            "Datalog Pages": (
+                last_datalog_page - first_datalog_page + 1
+                if first_datalog_page is not None and last_datalog_page is not None
+                else 0
+            ),
+            "Terminal Step Found": terminal_step_found,
+            "Terminal Step Name": terminal_step_name,
+            "Status": (
+                "OK"
+                if first_datalog_page is not None
+                and (stage != "BLENDING" or terminal_step_found)
+                else "DATALOG NOT FOUND"
+                if first_datalog_page is None
+                else "TERMINAL STEP NOT FOUND"
+            ),
+        })
+        if run_frames:
+            extracted_frames.append(pd.concat(run_frames, ignore_index=True))
 
     datalog = (
         pd.concat(extracted_frames, ignore_index=True)
@@ -374,10 +377,17 @@ def parse_datalogs(pages, summaries):
         .reset_index(drop=True)
         if extracted_frames else pd.DataFrame()
     )
-    diagnostics = pd.DataFrame(diagnostic_rows)
-    rejected = pd.DataFrame(rejected_rows)
-    ranges = pd.DataFrame(process_ranges)
-    return datalog, diagnostics, rejected, ranges
+    if not datalog.empty:
+        preferred = ["Stage", "Machine", "Extruder", "Date & Time", "Step Name", "Source Page"]
+        remaining = [column for column in datalog.columns if column not in preferred]
+        datalog = datalog[[column for column in preferred if column in datalog.columns] + remaining]
+
+    return (
+        datalog,
+        pd.DataFrame(diagnostic_rows),
+        pd.DataFrame(rejected_rows),
+        pd.DataFrame(process_ranges),
+    )
 
 
 def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected, process_ranges):
