@@ -3,6 +3,8 @@ import re
 
 import matplotlib.pyplot as plt
 import pandas as pd
+import plotly.graph_objects as go
+import plotly.io as pio
 import streamlit as st
 from pypdf import PdfReader
 
@@ -202,21 +204,87 @@ def build_wetting_rise_time_table(wetting_data):
 
 
 def create_wetting_rise_time_plot(table, batch_number, limit):
-    plot_data = table[table["Step Name"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip().str.casefold().eq("stop vacuum timer")].dropna(subset=["Rise time (Sec)"])
-    fig, ax = plt.subplots(figsize=(12, 7.2))
-    ax.axhline(limit, color="#C0504D", lw=3, label="RISE TIME LIMIT")
-    styles = {1: ("^", "#9BBB59", "EXTRUDER - 01"), 2: ("x", "#35A9D6", "EXTRUDER - 02"), 3: ("o", "#4F81BD", "EXTRUDER - 03")}
-    for ext in sorted(plot_data["Extruder"].unique()):
-        data = plot_data[plot_data["Extruder"].eq(ext)]
-        marker, color, label = styles.get(int(ext), ("o", None, f"EXTRUDER - {int(ext):02d}"))
-        ax.scatter(data["Time taken to reach vacuum rise (min)"], data["Rise time (Sec)"], marker=marker, color=color, s=55, linewidths=1.2, label=label, zorder=3)
-    x_max = max(10, float(plot_data["Time taken to reach vacuum rise (min)"].max()) * 1.08 if not plot_data.empty else 10)
-    ax.set_xlim(0, x_max); ax.set_ylim(0, max(700, limit * 1.15))
-    ax.set_title(str(batch_number), fontsize=20, fontweight="bold", pad=18)
-    ax.set_xlabel("Time taken to reach vacuum rise (min)", fontsize=13, fontweight="bold")
-    ax.set_ylabel("Rise time (Sec)", fontsize=13, fontweight="bold")
-    ax.grid(True, color="#D9D9D9"); ax.set_axisbelow(True); ax.legend(loc="center right", frameon=False, fontsize=12)
-    fig.tight_layout(); return fig
+    """Create an interactive Plotly chart with point-level hover details."""
+    normalized_steps = (
+        table["Step Name"].astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.casefold()
+    )
+    plot_data = table[normalized_steps.eq("stop vacuum timer")].dropna(
+        subset=["Time taken to reach vacuum rise (min)", "Rise time (Sec)"]
+    ).copy()
+
+    figure = go.Figure()
+    styles = {
+        1: {"symbol": "triangle-up", "color": "#9BBB59", "label": "EXTRUDER - 01"},
+        2: {"symbol": "x", "color": "#35A9D6", "label": "EXTRUDER - 02"},
+        3: {"symbol": "circle", "color": "#4F81BD", "label": "EXTRUDER - 03"},
+    }
+
+    for extruder in sorted(plot_data["Extruder"].dropna().unique()):
+        values = plot_data[plot_data["Extruder"].eq(extruder)].sort_values(
+            "Time taken to reach vacuum rise (min)", kind="stable"
+        )
+        style = styles.get(
+            int(extruder),
+            {"symbol": "circle", "color": "#666666", "label": f"EXTRUDER - {int(extruder):02d}"},
+        )
+        custom_data = values[[
+            "Date & Time", "Step Name", "Vacuum Timer Start", "Source Page"
+        ]].copy()
+        custom_data["Date & Time"] = custom_data["Date & Time"].dt.strftime("%d-%m-%Y %H:%M:%S")
+        custom_data["Vacuum Timer Start"] = custom_data["Vacuum Timer Start"].dt.strftime("%d-%m-%Y %H:%M:%S")
+
+        figure.add_trace(go.Scatter(
+            x=values["Time taken to reach vacuum rise (min)"],
+            y=values["Rise time (Sec)"],
+            mode="markers",
+            name=style["label"],
+            customdata=custom_data.to_numpy(),
+            marker={
+                "symbol": style["symbol"],
+                "color": style["color"],
+                "size": 9,
+                "line": {"width": 1, "color": style["color"]},
+            },
+            hovertemplate=(
+                "<b>%{fullData.name}</b><br>"
+                "Date & Time: %{customdata[0]}<br>"
+                "Step Name: %{customdata[1]}<br>"
+                "Elapsed time: %{x:.3f} min<br>"
+                "Rise time: %{y:.0f} sec<br>"
+                "Vacuum Timer Start: %{customdata[2]}<br>"
+                "Source Page: %{customdata[3]}"
+                "<extra></extra>"
+            ),
+        ))
+
+    x_max = max(
+        10.0,
+        float(plot_data["Time taken to reach vacuum rise (min)"].max()) * 1.08
+        if not plot_data.empty else 10.0,
+    )
+    figure.add_hline(
+        y=limit,
+        line_color="#C0504D",
+        line_width=3,
+        annotation_text="RISE TIME LIMIT",
+        annotation_position="top right",
+        annotation_font_color="#C0504D",
+    )
+    figure.update_layout(
+        title={"text": str(batch_number), "x": 0.5, "xanchor": "center"},
+        xaxis_title="Time taken to reach vacuum rise (min)",
+        yaxis_title="Rise time (Sec)",
+        xaxis={"range": [0, x_max], "showgrid": True},
+        yaxis={"range": [0, max(700.0, limit * 1.15)], "showgrid": True},
+        hovermode="closest",
+        legend={"x": 0.72, "y": 0.45, "bgcolor": "rgba(255,255,255,0.65)"},
+        height=700,
+        margin={"l": 70, "r": 30, "t": 80, "b": 70},
+    )
+    return figure
 
 
 def figure_to_png(fig):
@@ -290,11 +358,47 @@ def main():
             available = sorted(wetting_rise_table["Extruder"].unique()); selected = st.multiselect("Extruders", available, default=available)
             table_view = wetting_rise_table[wetting_rise_table["Extruder"].isin(selected)].copy()
             st.dataframe(table_view, use_container_width=True, hide_index=True, height=430)
-            batch_number = batch.get("Batch no.") or "Batch"; fig = create_wetting_rise_time_plot(table_view, batch_number, limit)
-            st.pyplot(fig, use_container_width=True); png = figure_to_png(fig); plt.close(fig)
+            batch_number = batch.get("Batch no.") or "Batch"
+            interactive_figure = create_wetting_rise_time_plot(
+                table_view, batch_number, limit
+            )
+            st.plotly_chart(
+                interactive_figure,
+                use_container_width=True,
+                config={
+                    "displaylogo": False,
+                    "scrollZoom": True,
+                    "modeBarButtonsToAdd": ["drawline", "eraseshape"],
+                    "toImageButtonOptions": {
+                        "format": "png",
+                        "filename": f"{batch_number}_wetting_rise_time",
+                        "height": 700,
+                        "width": 1200,
+                        "scale": 2,
+                    },
+                },
+            )
+            st.caption(
+                "Move the cursor over any point to view Extruder, timestamp, Step Name, "
+                "elapsed time, rise time, paired Vacuum Timer timestamp, and source page. "
+                "Use the chart toolbar to zoom, pan, reset, or download a PNG."
+            )
+            interactive_html = pio.to_html(
+                interactive_figure, include_plotlyjs="cdn", full_html=True
+            ).encode("utf-8")
             x1, x2 = st.columns(2)
-            x1.download_button("Download Rise-Time Table CSV", table_view.to_csv(index=False).encode(), f"{batch_number}_wetting_rise_time.csv", "text/csv")
-            x2.download_button("Download Rise-Time Plot PNG", png, f"{batch_number}_wetting_rise_time.png", "image/png")
+            x1.download_button(
+                "Download Rise-Time Table CSV",
+                table_view.to_csv(index=False).encode(),
+                f"{batch_number}_wetting_rise_time.csv",
+                "text/csv",
+            )
+            x2.download_button(
+                "Download Interactive Plot HTML",
+                interactive_html,
+                f"{batch_number}_wetting_rise_time_interactive.html",
+                "text/html",
+            )
     with diagnostics_tab:
         st.markdown("#### Assigned process page ranges"); st.dataframe(process_ranges, use_container_width=True, hide_index=True)
         st.markdown("#### Page-level diagnostics"); st.dataframe(diagnostics, use_container_width=True, hide_index=True, height=400)
