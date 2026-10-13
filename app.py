@@ -54,7 +54,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-grid-border-controls-v17"
+    parser_version = "2026.10.13-independent-grid-controls-v18"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -1227,6 +1227,7 @@ body { margin:0; background:#fff; font-family:'Times New Roman',serif; }
 #graph_editor_panel input,#graph_editor_panel select,#graph_editor_panel button { font-family:inherit; font-size:12px; padding:4px 6px; }
 #editable_plot { margin:10px 20px 20px 20px; border:2px solid #000; box-sizing:border-box; }
 .editor_field { display:flex; flex-direction:column; gap:2px; }
+.grid_option { display:flex; align-items:center; gap:5px; padding-bottom:5px; }
 </style>
 <div id="graph_editor_panel">
 <div class="editor_field"><label>X minimum</label><input id="x_min" type="number" step="any"></div>
@@ -1235,6 +1236,9 @@ body { margin:0; background:#fff; font-family:'Times New Roman',serif; }
 <div class="editor_field"><label>Y maximum</label><input id="y_max" type="number" step="any"></div>
 <div class="editor_field"><label>Font</label><select id="font_family"><option>Times New Roman</option><option>Arial</option><option>Calibri</option><option>Georgia</option></select></div>
 <div class="editor_field"><label>Font size</label><input id="font_size" type="number" min="8" max="40" value="12"></div>
+<div class="grid_option"><input id="x_grid" type="checkbox" checked><label for="x_grid">X-axis gridlines</label></div>
+<div class="grid_option"><input id="y_grid" type="checkbox" checked><label for="y_grid">Y-axis gridlines</label></div>
+<div class="grid_option"><input id="y2_grid" type="checkbox"><label for="y2_grid">Secondary Y-axis gridlines</label></div>
 <button id="apply_graph_settings">Apply</button><button id="auto_scale">Auto scale</button>
 <span><b>Tip:</b> drag the title, legend and annotations directly in the graph.</span>
 </div>
@@ -1244,9 +1248,14 @@ window.addEventListener('load',function(){
  const xr=layout.xaxis&&layout.xaxis.range?layout.xaxis.range:[],yr=layout.yaxis&&layout.yaxis.range?layout.yaxis.range:[];
  if(xr.length===2){x_min.value=xr[0];x_max.value=xr[1];} if(yr.length===2){y_min.value=yr[0];y_max.value=yr[1];}
  if(layout.font&&layout.font.family)font_family.value=layout.font.family; if(layout.font&&layout.font.size)font_size.value=layout.font.size;
+ x_grid.checked = !(layout.xaxis && layout.xaxis.showgrid === false);
+ y_grid.checked = !(layout.yaxis && layout.yaxis.showgrid === false);
+ y2_grid.checked = !!(layout.yaxis2 && layout.yaxis2.showgrid === true);
+ if (!(layout.yaxis2)) { y2_grid.disabled = true; y2_grid.parentElement.style.opacity = '0.5'; }
  apply_graph_settings.onclick=function(){
   const xmin=parseFloat(x_min.value),xmax=parseFloat(x_max.value),ymin=parseFloat(y_min.value),ymax=parseFloat(y_max.value),family=font_family.value,size=parseInt(font_size.value||'12');
-  const u={'font.family':family,'font.size':size,'title.font.family':family,'title.font.size':size,'legend.font.family':family,'legend.font.size':size,'xaxis.tickfont.family':family,'xaxis.tickfont.size':size,'xaxis.title.font.family':family,'xaxis.title.font.size':size,'yaxis.tickfont.family':family,'yaxis.tickfont.size':size,'yaxis.title.font.family':family,'yaxis.title.font.size':size};
+  const u={'font.family':family,'font.size':size,'title.font.family':family,'title.font.size':size,'legend.font.family':family,'legend.font.size':size,'xaxis.tickfont.family':family,'xaxis.tickfont.size':size,'xaxis.title.font.family':family,'xaxis.title.font.size':size,'yaxis.tickfont.family':family,'yaxis.tickfont.size':size,'yaxis.title.font.family':family,'yaxis.title.font.size':size,'xaxis.showgrid':x_grid.checked,'yaxis.showgrid':y_grid.checked};
+  if(layout.yaxis2) u['yaxis2.showgrid']=y2_grid.checked;
   if(!Number.isNaN(xmin)&&!Number.isNaN(xmax)&&xmin<xmax)u['xaxis.range']=[xmin,xmax]; if(!Number.isNaN(ymin)&&!Number.isNaN(ymax)&&ymin<ymax)u['yaxis.range']=[ymin,ymax]; Plotly.relayout(plot,u);
  };
  auto_scale.onclick=function(){Plotly.relayout(plot,{'xaxis.autorange':true,'yaxis.autorange':true});x_min.value='';x_max.value='';y_min.value='';y_max.value='';};
