@@ -8,6 +8,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
 import streamlit as st
+import streamlit.components.v1 as components
 from pypdf import PdfReader
 
 st.set_page_config(page_title="Batch Process Data Extractor", page_icon="🧪", layout="wide")
@@ -54,7 +55,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-plot-font-times-v12"
+    parser_version = "2026.10.13-graph-controls-v13"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -461,9 +462,8 @@ def predict_premixing_pressure_level(actual_pressure):
 def normalize_premixing_pressure(actual_pressure):
     """Normalize pressure using the approved 0.5-bar rule.
 
-    Decimal part up to and including 0.5 rounds down to the lower whole bar.
-    Decimal part above 0.5 rounds up to the next whole bar.
-    Examples: 60.5 -> 60 bar; 60.6 -> 61 bar.
+    Decimal part up to and including 0.5 rounds down. Values above 0.5
+    round up. Examples: 60.5 becomes 60 bar and 60.6 becomes 61 bar.
     """
     if pd.isna(actual_pressure):
         return np.nan
@@ -481,24 +481,7 @@ def expected_premixing_left_volume(volume_step_ml):
 
 
 def reverse_predict_premixing_volume_step(paired_attempts):
-    """Reconstruct Premixing volume step using cycle, pressure, and left volume.
-
-    Decision order:
-    1. The first attempt starts at 16.5 mL.
-    2. If the current cycle is higher than the previous cycle, the attempt is a
-       repeat at the same volume step.
-    3. If the cycle resets from 3 to 1:
-       a. If normalized pressure increased, retain the same volume step.
-       b. Otherwise compare actual L-to-R pushed volume with the standard left
-          volume, calculated as (2 x current volume step) - 16.5 mL.
-       c. If the difference is within +/-1.0 mL, retain the same volume step.
-       d. Otherwise advance the volume step by 16.5 mL.
-    4. For every other Cycle 1 occurrence, including Cycle 1 followed by Cycle
-       1, advance the volume step by 16.5 mL.
-
-    Pressure normalization uses the approved 0.5-bar rule: decimal values up to
-    and including 0.5 round down; values above 0.5 round up.
-    """
+    """Reconstruct Premixing volume step using cycle, pressure, and left volume."""
     if paired_attempts.empty:
         return pd.DataFrame()
 
@@ -587,7 +570,6 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                 "Left Volume Difference (mL)": left_volume_difference,
                 "Left Volume Matches Standard": "Yes" if left_volume_matches else "No",
             })
-
             if current_cycle is not None:
                 previous_cycle = current_cycle
 
@@ -626,25 +608,93 @@ def build_premixing_volume_step_summary(prediction):
     ).reset_index(drop=True)
 
 
-def apply_plotly_times_new_roman(figure):
-    """Apply consistent Times New Roman typography to Plotly charts."""
+def apply_graph_typography(figure, font_size=12):
+    """Apply Times New Roman and the selected font size to a Plotly figure."""
+    size = int(font_size)
     figure.update_layout(
-        font={"family": "Times New Roman", "size": 12, "color": "#000000"},
-        title_font={"family": "Times New Roman", "size": 12, "color": "#000000"},
-        legend_font={"family": "Times New Roman", "size": 12, "color": "#000000"},
+        font={"family": "Times New Roman", "size": size, "color": "#000000"},
+        title_font={"family": "Times New Roman", "size": size, "color": "#000000"},
+        legend_font={"family": "Times New Roman", "size": size, "color": "#000000"},
     )
     figure.update_xaxes(
-        tickfont={"family": "Times New Roman", "size": 12, "color": "#000000"},
-        title_font={"family": "Times New Roman", "size": 12, "color": "#000000"},
+        tickfont={"family": "Times New Roman", "size": size, "color": "#000000"},
+        title_font={"family": "Times New Roman", "size": size, "color": "#000000"},
     )
     figure.update_yaxes(
-        tickfont={"family": "Times New Roman", "size": 12, "color": "#000000"},
-        title_font={"family": "Times New Roman", "size": 12, "color": "#000000"},
+        tickfont={"family": "Times New Roman", "size": size, "color": "#000000"},
+        title_font={"family": "Times New Roman", "size": size, "color": "#000000"},
     )
     return figure
 
 
-def create_premixing_volume_step_plot(summary, extruder, batch_number):
+def graph_font_controls():
+    """Return one font size shared by all graphs in the application."""
+    presets = {
+        "Small (10 pt)": 10,
+        "Medium (12 pt)": 12,
+        "Large (16 pt)": 16,
+        "Presentation (20 pt)": 20,
+        "Custom": None,
+    }
+    with st.sidebar:
+        st.markdown("### Graph Controls")
+        preset = st.selectbox(
+            "Graph text size",
+            options=list(presets),
+            index=1,
+            key="global_graph_font_preset",
+        )
+        if preset == "Custom":
+            return int(st.number_input(
+                "Custom font size (pt)",
+                min_value=8,
+                max_value=30,
+                value=12,
+                step=1,
+                key="global_graph_custom_font_size",
+            ))
+        return presets[preset]
+
+
+def render_copy_graph_button(label="Copy Graph", key="graph"):
+    """Render a browser button that copies the most recently displayed Plotly chart."""
+    safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", str(key))
+    components.html(
+        f"""
+        <button id="copy_{safe_key}" style="
+            font-family: 'Times New Roman'; font-size: 12pt; font-weight: bold;
+            padding: 0.45rem 0.85rem; border: 1px solid #808080;
+            border-radius: 0.4rem; background: white; cursor: pointer;">
+            {label}
+        </button>
+        <span id="status_{safe_key}" style="font-family:'Times New Roman';font-size:12pt;margin-left:8px;"></span>
+        <script>
+        const button = document.getElementById('copy_{safe_key}');
+        const status = document.getElementById('status_{safe_key}');
+        button.addEventListener('click', async () => {{
+            try {{
+                const charts = window.parent.document.querySelectorAll('.js-plotly-plot');
+                if (!charts.length) throw new Error('No Plotly graph found');
+                const chart = charts[charts.length - 1];
+                const PlotlyRef = window.parent.Plotly || window.Plotly;
+                if (!PlotlyRef) throw new Error('Plotly is unavailable');
+                const dataUrl = await PlotlyRef.toImage(chart, {{format:'png', scale:2}});
+                const blob = await (await fetch(dataUrl)).blob();
+                await navigator.clipboard.write([new ClipboardItem({{'image/png': blob}})]);
+                status.textContent = 'Graph copied';
+                status.style.color = '#167D20';
+            }} catch (error) {{
+                status.textContent = 'Clipboard copy is blocked. Use the camera icon to download PNG.';
+                status.style.color = '#A61B1B';
+            }}
+        }});
+        </script>
+        """,
+        height=52,
+    )
+
+
+def create_premixing_volume_step_plot(summary, extruder, batch_number, font_size=12):
     """Create an interactive dual-axis Premixing pressure/attempt plot."""
     data = summary[summary["Extruder"].eq(extruder)].sort_values(
         "Volume Step (mL)"
@@ -713,7 +763,7 @@ def create_premixing_volume_step_plot(summary, extruder, batch_number):
             "xanchor": "center",
             "y": 0.97,
             "yanchor": "top",
-            "font": {"family": "Times New Roman", "size": 12, "color": "#000000"},
+            "font": {"family": "Times New Roman", "size": font_size, "color": "#000000"},
         },
         xaxis={
             "title": {"text": "<b>VOLUME STEP (mL)</b>", "standoff": 18},
@@ -745,7 +795,7 @@ def create_premixing_volume_step_plot(summary, extruder, batch_number):
             "xanchor": "center",
             "y": 1.03,
             "yanchor": "bottom",
-            "font": {"family": "Times New Roman", "size": 12},
+            "font": {"family": "Times New Roman", "size": font_size},
             "bgcolor": "rgba(255,255,255,0.9)",
         },
         plot_bgcolor="white",
@@ -753,7 +803,7 @@ def create_premixing_volume_step_plot(summary, extruder, batch_number):
         height=720,
         margin={"l": 90, "r": 90, "t": 150, "b": 90},
     )
-    return apply_plotly_times_new_roman(figure)
+    return apply_graph_typography(figure, font_size)
 
 
 def build_wetting_rise_time_table(wetting_data):
@@ -989,7 +1039,7 @@ def build_blending_max_pressure_table(blending_data):
     ).reset_index(drop=True)
 
 
-def create_blending_pressure_plot(table, extruder, phase, batch_number):
+def create_blending_pressure_plot(table, extruder, phase, batch_number, font_size=12):
     """Create an interactive maximum-pressure plot for one Blending phase."""
     data = table[
         table["Extruder"].eq(extruder)
@@ -1057,9 +1107,9 @@ def create_blending_pressure_plot(table, extruder, phase, batch_number):
         height=620,
         margin={"l": 70, "r": 30, "t": 100, "b": 120},
     )
-    return apply_plotly_times_new_roman(figure)
+    return apply_graph_typography(figure, font_size)
 
-def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
+def create_mixing_pressure_plot(table, extruder, orifice, batch_number, font_size=12):
     """Create an interactive maximum-pressure-by-cycle chart."""
     data = table[
         table["Extruder"].eq(extruder) & table["Orifice"].eq(orifice)
@@ -1131,9 +1181,9 @@ def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
         height=620,
         margin={"l": 70, "r": 30, "t": 100, "b": 120},
     )
-    return apply_plotly_times_new_roman(figure)
+    return apply_graph_typography(figure, font_size)
 
-def create_wetting_rise_time_plot(table, batch_number, limit):
+def create_wetting_rise_time_plot(table, batch_number, limit, font_size=12):
     """Create an interactive Plotly chart with point-level hover details."""
     normalized_steps = (
         table["Step Name"].astype(str)
@@ -1214,7 +1264,7 @@ def create_wetting_rise_time_plot(table, batch_number, limit):
         height=700,
         margin={"l": 70, "r": 30, "t": 80, "b": 70},
     )
-    return apply_plotly_times_new_roman(figure)
+    return apply_graph_typography(figure, font_size)
 
 
 def figure_to_png(fig):
@@ -1250,6 +1300,7 @@ def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejec
 def main():
     st.title("🧪 Complete Batch Process Report Extractor")
     st.caption("Extracts Process Overview, recipe settings, complete datalogs, diagnostics, and Wetting rise-time analysis.")
+    graph_font_size = graph_font_controls()
     uploaded = st.file_uploader("Upload Batch Cycle Report PDF", type=["pdf"])
     if uploaded is None: st.info("Upload a batch-report PDF to begin."); st.stop()
     try:
@@ -1319,7 +1370,7 @@ def main():
             st.dataframe(table_view, use_container_width=True, hide_index=True, height=430)
             batch_number = batch.get("Batch no.") or "Batch"
             interactive_figure = create_wetting_rise_time_plot(
-                table_view, batch_number, limit
+                table_view, batch_number, limit, graph_font_size
             )
             st.plotly_chart(
                 interactive_figure,
@@ -1337,6 +1388,7 @@ def main():
                     },
                 },
             )
+            render_copy_graph_button("Copy Wetting Graph", key="wetting_copy")
             st.caption(
                 "Move the cursor over any point to view Extruder, timestamp, Step Name, "
                 "elapsed time, rise time, paired Vacuum Timer timestamp, and source page. "
@@ -1404,6 +1456,7 @@ def main():
                     selected_mixing_extruder,
                     orifice,
                     batch_number_for_mixing,
+                    graph_font_size,
                 )
                 st.plotly_chart(
                     mixing_figure,
@@ -1424,6 +1477,10 @@ def main():
                     },
                     key=f"mixing_chart_{selected_mixing_extruder}_{orifice}",
                 )
+                render_copy_graph_button(
+                    "Copy Mixing Graph",
+                    key=f"mixing_copy_{selected_mixing_extruder}_{orifice}",
+                )
 
             mixing_html_figure = go.Figure()
             for orifice in selected_orifices:
@@ -1432,6 +1489,7 @@ def main():
                     selected_mixing_extruder,
                     orifice,
                     batch_number_for_mixing,
+                    graph_font_size,
                 )
                 for trace in source_figure.data:
                     trace.name = f"{orifice} | {trace.name}"
@@ -1441,7 +1499,7 @@ def main():
                 xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
                 hovermode="closest", height=700,
             )
-            apply_plotly_times_new_roman(mixing_html_figure)
+            apply_graph_typography(mixing_html_figure, graph_font_size)
             mixing_html = pio.to_html(
                 mixing_html_figure, include_plotlyjs="cdn", full_html=True
             ).encode("utf-8")
@@ -1507,6 +1565,7 @@ def main():
                     selected_blending_extruder,
                     phase,
                     batch_number_for_blending,
+                    graph_font_size,
                 )
                 st.plotly_chart(
                     blending_figure,
@@ -1525,6 +1584,10 @@ def main():
                     },
                     key=f"blending_chart_{selected_blending_extruder}_{phase}",
                 )
+                render_copy_graph_button(
+                    "Copy Blending Graph",
+                    key=f"blending_copy_{selected_blending_extruder}_{phase}",
+                )
 
             combined_blending_figure = go.Figure()
             for phase in selected_phases:
@@ -1533,6 +1596,7 @@ def main():
                     selected_blending_extruder,
                     phase,
                     batch_number_for_blending,
+                    graph_font_size,
                 )
                 for trace in source_figure.data:
                     trace.name = f"{phase} | {trace.name}"
@@ -1545,7 +1609,7 @@ def main():
                 xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
                 hovermode="closest", height=700,
             )
-            apply_plotly_times_new_roman(combined_blending_figure)
+            apply_graph_typography(combined_blending_figure, graph_font_size)
             blending_html = pio.to_html(
                 combined_blending_figure,
                 include_plotlyjs="cdn", full_html=True,
@@ -1570,8 +1634,8 @@ def main():
             "Cylinder diameter = 80.1 mm for all extruders. Direction is inferred from "
             "servo-speed signs. Opposite movement blocks are paired using same-cycle "
             "preference. A higher cycle number is a repeat attempt. At a 3-to-1 reset, "
-            "the app checks normalized pressure and the standard left-pushed volume, using "
-            "a +/-1.0 mL volume tolerance. Consecutive Cycle 1 attempts advance the step."
+            "the app checks normalized pressure and standard left-pushed volume within "
+            "+/-1.0 mL. Consecutive Cycle 1 attempts advance the volume step."
         )
         if premix_summary.empty:
             st.warning("No Premixing bidirectional volume-step analysis was generated.")
@@ -1589,6 +1653,7 @@ def main():
                 premix_summary,
                 selected_premix_extruder,
                 batch_number_for_premix,
+                graph_font_size,
             )
             st.plotly_chart(
                 premix_figure,
@@ -1606,6 +1671,10 @@ def main():
                     },
                 },
                 key=f"premix_chart_{selected_premix_extruder}",
+            )
+            render_copy_graph_button(
+                "Copy Premixing Graph",
+                key=f"premixing_copy_{selected_premix_extruder}",
             )
             st.dataframe(
                 summary_view, use_container_width=True,
