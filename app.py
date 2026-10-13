@@ -52,7 +52,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-premixing-cycle-pressure-rule-v2"
+    parser_version = "2026.10.13-premixing-stateful-pressure-v3"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -463,8 +463,10 @@ def reverse_predict_premixing_volume_step(paired_attempts):
     - First attempt starts at 16.5 mL.
     - Cycle 2 or 3 remains at the current volume step.
     - When the logged cycle returns to 1:
-      * if the inferred pressure step increased, retain the same volume step;
-      * if pressure did not increase, advance the volume step by 16.5 mL.
+      * if the established pressure target increased, retain the same volume step;
+      * if the established pressure target did not increase, advance by 16.5 mL.
+    - The established pressure target is monotonic. It can increase in 15-bar
+      increments but cannot decrease because of a low measured peak in a repeat cycle.
 
     Actual piston-volume achievement is retained for diagnostics only and does
     not control the reconstructed volume-step sequence. This avoids distortion
@@ -487,18 +489,27 @@ def reverse_predict_premixing_volume_step(paired_attempts):
             representative = min(ltr_volume, rtl_volume)
             actual_pressure = row["Maximum Actual Pressure (bar)"]
             actual_cycle = row["Actual Logged Cycle"]
-            pressure_step, pressure_target = predict_premixing_pressure_level(
+            raw_pressure_step, raw_pressure_target = predict_premixing_pressure_level(
                 actual_pressure
+            )
+
+            # The active pressure target is stateful and cannot decrease within
+            # a Premixing run. A low measured peak in a repeat cycle must not be
+            # interpreted as a return to a lower recipe pressure level.
+            if pd.isna(previous_pressure_step):
+                pressure_step = raw_pressure_step
+            else:
+                pressure_step = max(int(previous_pressure_step), int(raw_pressure_step))
+            pressure_target = min(
+                pressure_step * PREMIXING_PRESSURE_STEP_BAR,
+                PREMIXING_MAX_PRESSURE_BAR,
             )
 
             pressure_increased = (
                 False if pd.isna(previous_pressure_step)
                 else pressure_step > previous_pressure_step
             )
-            pressure_decreased = (
-                False if pd.isna(previous_pressure_step)
-                else pressure_step < previous_pressure_step
-            )
+            pressure_decreased = False
 
             # Volume-step reconstruction uses only the logged cycle and whether
             # the pressure level increased. Piston-volume achievement is ignored.
@@ -560,6 +571,8 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                 "Cycle Prediction Match": (
                     "Match" if pd.notna(actual_cycle) else "Review"
                 ),
+                "Raw Pressure Step from Actual Peak": raw_pressure_step,
+                "Raw Pressure Target from Actual Peak (bar)": raw_pressure_target,
                 "Predicted Pressure Step Number": pressure_step,
                 "Predicted Pressure Target (bar)": pressure_target,
                 "Actual-Predicted Pressure Difference (bar)": pressure_difference,
