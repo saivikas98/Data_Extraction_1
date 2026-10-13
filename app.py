@@ -2,6 +2,7 @@ import io
 import re
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
@@ -20,6 +21,20 @@ DATALOG_COLUMNS = {
     "BLENDING": ["Current Cycle", "Vacuum Left (mbar)", "Vacuum Right (mbar)", "Loadcell Left (bar)", "Loadcell Right (bar)", "Servo Position Left (mm)", "Servo Position Right (mm)", "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)", "Measured pH", "Added Water (mL)"],
 }
 
+# Premixing engineering constants
+PREMIXING_VOLUME_STEP_ML = 16.5
+PREMIXING_PRESSURE_STEP_BAR = 15.0
+PREMIXING_REPEAT_CYCLES = 3
+PREMIXING_MAX_PRESSURE_BAR = 190.0
+PREMIXING_CYLINDER_DIAMETER_MM = 80.1
+PREMIXING_CYLINDER_AREA_MM2 = (
+    np.pi * PREMIXING_CYLINDER_DIAMETER_MM ** 2 / 4
+)
+PREMIXING_VOLUME_PER_MM_ML = PREMIXING_CYLINDER_AREA_MM2 / 1000
+PREMIXING_TARGET_ACHIEVEMENT_PERCENT = 95.0
+PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR = 2.0
+PREMIXING_SPEED_DIRECTION_TOLERANCE = 0.005
+
 
 def parse_dt(value):
     return pd.to_datetime(value, format="%d/%m/%Y %H:%M:%S", errors="coerce")
@@ -37,7 +52,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.12-mixing-3.8mm-typo-v2"
+    parser_version = "2026.10.13-premixing-engineering-v1"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -189,6 +204,471 @@ def parse_datalogs(pages, summaries):
         datalog = datalog[preferred + [c for c in datalog.columns if c not in preferred]]
     return datalog, pd.DataFrame(diagnostic_rows), pd.DataFrame(rejected_rows), pd.DataFrame(process_ranges)
 
+
+
+def premixing_movement_direction(left_speed, right_speed):
+    """Infer direction from the two servo-speed signs."""
+    if pd.isna(left_speed) or pd.isna(right_speed):
+        return ""
+    left_speed = float(left_speed)
+    right_speed = float(right_speed)
+    tolerance = PREMIXING_SPEED_DIRECTION_TOLERANCE
+    if left_speed > tolerance and right_speed < -tolerance:
+        return "L-to-R"
+    if left_speed < -tolerance and right_speed > tolerance:
+        return "R-to-L"
+    return ""
+
+
+def prepare_premixing_engineering_data(premixing_data):
+    """Prepare Premixing datalog for movement-block analysis."""
+    if premixing_data.empty:
+        return pd.DataFrame()
+    data = premixing_data.copy()
+    numeric_columns = [
+        "Current Cycle", "Loadcell Left (bar)", "Loadcell Right (bar)",
+        "Servo Position Left (mm)", "Servo Position Right (mm)",
+        "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)",
+    ]
+    for column in numeric_columns:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = data.sort_values(
+        ["Extruder", "Source Page", "Source Line"], kind="stable"
+    ).reset_index(drop=True)
+    data["Elapsed Time (min)"] = data.groupby("Extruder")["Date & Time"].transform(
+        lambda values: (values - values.min()).dt.total_seconds() / 60
+    )
+    data["Direction"] = [
+        premixing_movement_direction(left, right)
+        for left, right in zip(
+            data["Servo Speed Left (mm/s)"],
+            data["Servo Speed Right (mm/s)"],
+        )
+    ]
+    context = (
+        data["Step Name"].fillna("").astype(str).str.casefold()
+        .str.contains(r"premix|accumulator|void reduction", regex=True)
+    )
+    data.loc[~context, "Direction"] = ""
+
+    all_ids = []
+    for _, group in data.groupby("Extruder", sort=False):
+        block_id = 0
+        prior_direction = ""
+        active = False
+        for direction in group["Direction"]:
+            if direction:
+                if not active or direction != prior_direction:
+                    block_id += 1
+                all_ids.append(block_id)
+                active = True
+                prior_direction = direction
+            else:
+                all_ids.append(pd.NA)
+                active = False
+                prior_direction = ""
+    data["Directional Block ID"] = pd.array(all_ids, dtype="Int64")
+    return data
+
+
+def summarize_premixing_directional_blocks(prepared_data):
+    """Summarize every continuous directional Premixing movement."""
+    columns = [
+        "Extruder", "Directional Block ID", "Logged Cycle", "Direction",
+        "Start Date & Time", "End Date & Time", "Duration (s)",
+        "Start Source Page", "End Source Page", "Start Source Line", "End Source Line",
+        "Left Start Position (mm)", "Left End Position (mm)",
+        "Right Start Position (mm)", "Right End Position (mm)",
+        "Left Movement (mm)", "Right Movement (mm)",
+        "Left Volume (mL)", "Right Volume (mL)",
+        "Pushed Volume (mL)", "Received Volume (mL)",
+        "Volume Difference (mL)", "Average Actual Speed (mL/min)",
+        "Maximum Push Pressure (bar)", "Maximum Receiving Pressure (bar)",
+    ]
+    if prepared_data.empty:
+        return pd.DataFrame(columns=columns)
+
+    output = []
+    for extruder, extruder_data in prepared_data.groupby("Extruder", sort=True):
+        moving = extruder_data.dropna(subset=["Directional Block ID"])
+        for block_id, group in moving.groupby("Directional Block ID", sort=True):
+            group = group.sort_values(["Source Page", "Source Line"], kind="stable")
+            direction = group["Direction"].iloc[0]
+            first_index = group.index[0]
+            previous_index = extruder_data.index[extruder_data.index < first_index]
+            start = (
+                extruder_data.loc[previous_index[-1]]
+                if len(previous_index) else group.iloc[0]
+            )
+            end = group.iloc[-1]
+            left_delta = float(end["Servo Position Left (mm)"] - start["Servo Position Left (mm)"])
+            right_delta = float(end["Servo Position Right (mm)"] - start["Servo Position Right (mm)"])
+            left_volume = abs(left_delta) * PREMIXING_VOLUME_PER_MM_ML
+            right_volume = abs(right_delta) * PREMIXING_VOLUME_PER_MM_ML
+            if direction == "L-to-R":
+                pushed, received = left_volume, right_volume
+                max_push = group["Loadcell Left (bar)"].max()
+                max_receive = group["Loadcell Right (bar)"].max()
+            else:
+                pushed, received = right_volume, left_volume
+                max_push = group["Loadcell Right (bar)"].max()
+                max_receive = group["Loadcell Left (bar)"].max()
+            duration = (end["Date & Time"] - start["Date & Time"]).total_seconds()
+            cycles = group["Current Cycle"].dropna()
+            logged_cycle = int(cycles.mode().iloc[0]) if not cycles.empty else pd.NA
+            output.append({
+                "Extruder": int(extruder),
+                "Directional Block ID": int(block_id),
+                "Logged Cycle": logged_cycle,
+                "Direction": direction,
+                "Start Date & Time": start["Date & Time"],
+                "End Date & Time": end["Date & Time"],
+                "Duration (s)": duration,
+                "Start Source Page": int(group["Source Page"].iloc[0]),
+                "End Source Page": int(group["Source Page"].iloc[-1]),
+                "Start Source Line": int(group["Source Line"].iloc[0]),
+                "End Source Line": int(group["Source Line"].iloc[-1]),
+                "Left Start Position (mm)": start["Servo Position Left (mm)"],
+                "Left End Position (mm)": end["Servo Position Left (mm)"],
+                "Right Start Position (mm)": start["Servo Position Right (mm)"],
+                "Right End Position (mm)": end["Servo Position Right (mm)"],
+                "Left Movement (mm)": left_delta,
+                "Right Movement (mm)": right_delta,
+                "Left Volume (mL)": left_volume,
+                "Right Volume (mL)": right_volume,
+                "Pushed Volume (mL)": pushed,
+                "Received Volume (mL)": received,
+                "Volume Difference (mL)": abs(pushed - received),
+                "Average Actual Speed (mL/min)": (
+                    pushed / duration * 60 if duration > 0 else np.nan
+                ),
+                "Maximum Push Pressure (bar)": max_push,
+                "Maximum Receiving Pressure (bar)": max_receive,
+            })
+    return pd.DataFrame(output, columns=columns)
+
+
+def pair_premixing_bidirectional_attempts(directional):
+    """Pair adjacent opposite-direction blocks with cycle-aware scoring.
+
+    Either L-to-R/R-to-L or R-to-L/L-to-R order is accepted. A same-cycle
+    opposite-direction block is preferred; otherwise the nearest immediately
+    following opposite-direction block is used and marked for review.
+    """
+    columns = [
+        "Extruder", "Bidirectional Attempt ID", "Pairing Status",
+        "Start Date & Time", "End Date & Time",
+        "First Direction", "Second Direction", "First Block ID", "Second Block ID",
+        "Logged Cycle First", "Logged Cycle Second", "Actual Logged Cycle",
+        "L-to-R Pushed Volume (mL)", "R-to-L Pushed Volume (mL)",
+        "Representative Achieved Volume (mL)",
+        "L-to-R Maximum Push Pressure (bar)",
+        "R-to-L Maximum Push Pressure (bar)",
+        "Maximum Actual Pressure (bar)",
+        "L-to-R Average Speed (mL/min)", "R-to-L Average Speed (mL/min)",
+    ]
+    if directional.empty:
+        return pd.DataFrame(columns=columns)
+    output = []
+    for extruder, group in directional.groupby("Extruder", sort=True):
+        data = group.sort_values("Start Date & Time").reset_index(drop=True)
+        used = set()
+        attempt_id = 0
+        for i in range(len(data)):
+            if i in used:
+                continue
+            first = data.iloc[i]
+            candidates = []
+            for j in range(i + 1, min(i + 4, len(data))):
+                if j in used or data.iloc[j]["Direction"] == first["Direction"]:
+                    continue
+                second = data.iloc[j]
+                same_cycle = (
+                    pd.notna(first["Logged Cycle"])
+                    and pd.notna(second["Logged Cycle"])
+                    and int(first["Logged Cycle"]) == int(second["Logged Cycle"])
+                )
+                candidates.append((0 if same_cycle else 1, j, second))
+            if not candidates:
+                continue
+            _, j, second = sorted(candidates, key=lambda item: (item[0], item[1]))[0]
+            used.update({i, j})
+            attempt_id += 1
+            blocks = {first["Direction"]: first, second["Direction"]: second}
+            ltr = blocks.get("L-to-R")
+            rtl = blocks.get("R-to-L")
+            same_cycle = (
+                pd.notna(first["Logged Cycle"])
+                and pd.notna(second["Logged Cycle"])
+                and int(first["Logged Cycle"]) == int(second["Logged Cycle"])
+            )
+            actual_cycle = (
+                int(first["Logged Cycle"])
+                if same_cycle else
+                int(first["Logged Cycle"]) if pd.notna(first["Logged Cycle"])
+                else int(second["Logged Cycle"]) if pd.notna(second["Logged Cycle"])
+                else pd.NA
+            )
+            output.append({
+                "Extruder": int(extruder),
+                "Bidirectional Attempt ID": attempt_id,
+                "Pairing Status": "Same logged cycle" if same_cycle else "Nearest opposite block - review",
+                "Start Date & Time": min(first["Start Date & Time"], second["Start Date & Time"]),
+                "End Date & Time": max(first["End Date & Time"], second["End Date & Time"]),
+                "First Direction": first["Direction"],
+                "Second Direction": second["Direction"],
+                "First Block ID": int(first["Directional Block ID"]),
+                "Second Block ID": int(second["Directional Block ID"]),
+                "Logged Cycle First": first["Logged Cycle"],
+                "Logged Cycle Second": second["Logged Cycle"],
+                "Actual Logged Cycle": actual_cycle,
+                "L-to-R Pushed Volume (mL)": ltr["Pushed Volume (mL)"],
+                "R-to-L Pushed Volume (mL)": rtl["Pushed Volume (mL)"],
+                "Representative Achieved Volume (mL)": min(
+                    ltr["Pushed Volume (mL)"], rtl["Pushed Volume (mL)"]
+                ),
+                "L-to-R Maximum Push Pressure (bar)": ltr["Maximum Push Pressure (bar)"],
+                "R-to-L Maximum Push Pressure (bar)": rtl["Maximum Push Pressure (bar)"],
+                "Maximum Actual Pressure (bar)": max(
+                    ltr["Maximum Push Pressure (bar)"], rtl["Maximum Push Pressure (bar)"]
+                ),
+                "L-to-R Average Speed (mL/min)": ltr["Average Actual Speed (mL/min)"],
+                "R-to-L Average Speed (mL/min)": rtl["Average Actual Speed (mL/min)"],
+            })
+    return pd.DataFrame(output, columns=columns)
+
+
+def predict_premixing_pressure_level(actual_pressure):
+    if pd.isna(actual_pressure):
+        return np.nan, np.nan
+    actual_pressure = float(actual_pressure)
+    if actual_pressure <= 0:
+        return 0, 0.0
+    step_number = max(
+        1,
+        int(np.floor((actual_pressure + PREMIXING_PRESSURE_STEP_BAR / 2)
+                     / PREMIXING_PRESSURE_STEP_BAR)),
+    )
+    target = min(
+        step_number * PREMIXING_PRESSURE_STEP_BAR,
+        PREMIXING_MAX_PRESSURE_BAR,
+    )
+    return step_number, target
+
+
+def reverse_predict_premixing_volume_step(paired_attempts):
+    """Reverse-predict cumulative volume target and repeat cycle."""
+    if paired_attempts.empty:
+        return pd.DataFrame()
+    all_predictions = []
+    for extruder, attempts in paired_attempts.groupby("Extruder", sort=True):
+        predicted_step = 1
+        predicted_target = PREMIXING_VOLUME_STEP_ML
+        previous_pressure_step = np.nan
+        previous_logged_cycle = np.nan
+        previous_target_achieved = False
+        for row_index, (_, row) in enumerate(
+            attempts.sort_values("Start Date & Time").iterrows()
+        ):
+            ltr_volume = row["L-to-R Pushed Volume (mL)"]
+            rtl_volume = row["R-to-L Pushed Volume (mL)"]
+            representative = min(ltr_volume, rtl_volume)
+            actual_pressure = row["Maximum Actual Pressure (bar)"]
+            actual_cycle = row["Actual Logged Cycle"]
+            pressure_step, pressure_target = predict_premixing_pressure_level(actual_pressure)
+            pressure_increased = (
+                False if pd.isna(previous_pressure_step)
+                else pressure_step > previous_pressure_step
+            )
+            pressure_decreased = (
+                False if pd.isna(previous_pressure_step)
+                else pressure_step < previous_pressure_step
+            )
+            if row_index > 0 and previous_target_achieved:
+                predicted_step += 1
+                predicted_target = predicted_step * PREMIXING_VOLUME_STEP_ML
+                volume_status = "Advanced to next volume target"
+            elif pressure_increased and not previous_target_achieved:
+                volume_status = "Same volume target; pressure increased"
+            else:
+                volume_status = "Same volume target"
+            if row_index == 0 or previous_target_achieved or pressure_increased:
+                predicted_cycle = 1
+            elif pd.notna(previous_logged_cycle) and previous_logged_cycle < PREMIXING_REPEAT_CYCLES:
+                predicted_cycle = int(previous_logged_cycle) + 1
+            else:
+                predicted_cycle = 1
+            threshold = (
+                predicted_target * PREMIXING_TARGET_ACHIEVEMENT_PERCENT / 100
+            )
+            ltr_achieved = pd.notna(ltr_volume) and ltr_volume >= threshold
+            rtl_achieved = pd.notna(rtl_volume) and rtl_volume >= threshold
+            target_achieved = ltr_achieved and rtl_achieved
+            escalation_expected = (
+                not target_achieved
+                and predicted_cycle == PREMIXING_REPEAT_CYCLES
+                and pressure_target < PREMIXING_MAX_PRESSURE_BAR
+            )
+            expected_next_pressure = (
+                min(pressure_target + PREMIXING_PRESSURE_STEP_BAR,
+                    PREMIXING_MAX_PRESSURE_BAR)
+                if escalation_expected else pressure_target
+            )
+            pressure_difference = actual_pressure - pressure_target
+            all_predictions.append({
+                **row.to_dict(),
+                "Predicted Repeat Cycle": predicted_cycle,
+                "Cycle Prediction Match": (
+                    "Match" if pd.notna(actual_cycle)
+                    and int(actual_cycle) == predicted_cycle else "Review"
+                ),
+                "Predicted Pressure Step Number": pressure_step,
+                "Predicted Pressure Target (bar)": pressure_target,
+                "Actual-Predicted Pressure Difference (bar)": pressure_difference,
+                "Pressure Target Match": (
+                    "Match" if abs(pressure_difference)
+                    <= PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR else "Review"
+                ),
+                "Pressure Increased from Previous Attempt": "Yes" if pressure_increased else "No",
+                "Pressure Decreased from Previous Attempt": "Yes" if pressure_decreased else "No",
+                "Predicted Volume Step Number": predicted_step,
+                "Predicted Cumulative Volume Target (mL)": predicted_target,
+                "Volume Step Status": volume_status,
+                "Achievement Threshold (mL)": threshold,
+                "Actual Representative Volume (mL)": representative,
+                "Representative Volume Difference from Target (mL)": representative - predicted_target,
+                "L-to-R Volume Achievement (%)": ltr_volume / predicted_target * 100,
+                "R-to-L Volume Achievement (%)": rtl_volume / predicted_target * 100,
+                "Bidirectional Volume Target Achieved": "Yes" if target_achieved else "No",
+                "Pressure Escalation Expected": "Yes" if escalation_expected else "No",
+                "Expected Next Pressure Target (bar)": expected_next_pressure,
+            })
+            previous_pressure_step = pressure_step
+            previous_logged_cycle = actual_cycle
+            previous_target_achieved = target_achieved
+    prediction = pd.DataFrame(all_predictions)
+    prediction["Next Actual Pressure Target Inferred from Data (bar)"] = (
+        prediction.groupby("Extruder")["Predicted Pressure Target (bar)"].shift(-1)
+    )
+    prediction["Expected vs Actual Next Pressure Difference (bar)"] = (
+        prediction["Next Actual Pressure Target Inferred from Data (bar)"]
+        - prediction["Expected Next Pressure Target (bar)"]
+    )
+    prediction["Pressure Escalation Match"] = np.where(
+        prediction["Expected vs Actual Next Pressure Difference (bar)"].abs()
+        <= PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR,
+        "Match", "Review",
+    )
+    return prediction
+
+
+def build_premixing_volume_step_summary(prediction):
+    """Create one chart row for each predicted cumulative volume target."""
+    columns = [
+        "Extruder", "Volume Step (mL)", "Cycles",
+        "Max Loadcell Left (bar)", "Max Loadcell Right (bar)",
+        "Attempts", "Target Achieved", "First Attempt", "Last Attempt",
+    ]
+    if prediction.empty:
+        return pd.DataFrame(columns=columns)
+    output = []
+    for (extruder, target), group in prediction.groupby(
+        ["Extruder", "Predicted Cumulative Volume Target (mL)"], sort=True
+    ):
+        output.append({
+            "Extruder": int(extruder),
+            "Volume Step (mL)": float(target),
+            "Cycles": pd.to_numeric(group["Actual Logged Cycle"], errors="coerce").max(),
+            "Max Loadcell Left (bar)": group["L-to-R Maximum Push Pressure (bar)"].max(),
+            "Max Loadcell Right (bar)": group["R-to-L Maximum Push Pressure (bar)"].max(),
+            "Attempts": len(group),
+            "Target Achieved": (
+                "Yes" if group["Bidirectional Volume Target Achieved"].eq("Yes").any()
+                else "No"
+            ),
+            "First Attempt": group["Start Date & Time"].min(),
+            "Last Attempt": group["End Date & Time"].max(),
+        })
+    return pd.DataFrame(output, columns=columns).sort_values(
+        ["Extruder", "Volume Step (mL)"]
+    ).reset_index(drop=True)
+
+
+def create_premixing_volume_step_plot(summary, extruder, batch_number):
+    """Create the requested dual-axis Premixing pressure/cycle plot."""
+    data = summary[summary["Extruder"].eq(extruder)].sort_values(
+        "Volume Step (mL)"
+    ).copy()
+    figure = go.Figure()
+    hover_custom = data[["Attempts", "Target Achieved", "First Attempt", "Last Attempt"]].copy()
+    for column in ["First Attempt", "Last Attempt"]:
+        hover_custom[column] = pd.to_datetime(
+            hover_custom[column], errors="coerce"
+        ).dt.strftime("%d-%m-%Y %H:%M:%S")
+    figure.add_trace(go.Bar(
+        x=data["Volume Step (mL)"], y=data["Cycles"],
+        name="Cycles", yaxis="y2",
+        marker={"color": "rgba(198, 218, 166, 0.75)"},
+        customdata=hover_custom.to_numpy(),
+        hovertemplate=(
+            "<b>Cycles</b><br>Volume step: %{x:.1f} mL<br>"
+            "Cycle used: %{y:.0f}<br>Attempts: %{customdata[0]}<br>"
+            "Target achieved: %{customdata[1]}<br>"
+            "First attempt: %{customdata[2]}<br>Last attempt: %{customdata[3]}"
+            "<extra></extra>"
+        ),
+    ))
+    figure.add_trace(go.Scatter(
+        x=data["Volume Step (mL)"], y=data["Max Loadcell Left (bar)"],
+        mode="lines+markers", name="Max Loadcell Left (bar)",
+        line={"color": "#4F81BD", "width": 3, "shape": "hv"},
+        marker={"size": 7},
+        hovertemplate=(
+            "<b>Max Loadcell Left</b><br>Volume step: %{x:.1f} mL<br>"
+            "Maximum pressure: %{y:.2f} bar<extra></extra>"
+        ),
+    ))
+    figure.add_trace(go.Scatter(
+        x=data["Volume Step (mL)"], y=data["Max Loadcell Right (bar)"],
+        mode="lines+markers", name="Max Loadcell Right (bar)",
+        line={"color": "#8064A2", "width": 3, "shape": "hv"},
+        marker={"size": 7},
+        hovertemplate=(
+            "<b>Max Loadcell Right</b><br>Volume step: %{x:.1f} mL<br>"
+            "Maximum pressure: %{y:.2f} bar<extra></extra>"
+        ),
+    ))
+    x_max = max(
+        PREMIXING_VOLUME_STEP_ML,
+        float(data["Volume Step (mL)"].max()) * 1.08 if not data.empty else 231,
+    )
+    figure.update_layout(
+        title={
+            "text": f"{batch_number}<br>EXTRUDER-{int(extruder)}, PRE-MIXING",
+            "x": 0.5, "xanchor": "center",
+        },
+        xaxis={
+            "title": "VOLUME STEP (mL)",
+            "range": [0, x_max],
+            "dtick": PREMIXING_VOLUME_STEP_ML,
+            "showgrid": True,
+        },
+        yaxis={
+            "title": "MAX PRESSURE (bar)",
+            "range": [0, max(200, PREMIXING_MAX_PRESSURE_BAR)],
+            "showgrid": True,
+        },
+        yaxis2={
+            "title": "CYCLES", "overlaying": "y", "side": "right",
+            "range": [0, 3.5], "dtick": 0.5, "showgrid": False,
+        },
+        barmode="overlay",
+        hovermode="x unified",
+        legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": 1.12},
+        height=700,
+        margin={"l": 80, "r": 80, "t": 120, "b": 80},
+    )
+    return figure
 
 def build_wetting_rise_time_table(wetting_data):
     columns = ["Extruder", "Date & Time", "Step Name", "Time taken to reach vacuum rise (min)", "Rise time (Sec)", "Vacuum Timer Start", "Source Page"]
@@ -655,7 +1135,7 @@ def figure_to_png(fig):
     buffer = io.BytesIO(); fig.savefig(buffer, format="png", dpi=200, bbox_inches="tight"); return buffer.getvalue()
 
 
-def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected, process_ranges, wetting_rise_table, mixing_pressure_table, blending_pressure_table):
+def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected, process_ranges, wetting_rise_table, mixing_pressure_table, blending_pressure_table, premix_prepared, premix_blocks, premix_pairs, premix_prediction, premix_summary):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pd.DataFrame([batch]).to_excel(writer, "Batch Details", index=False)
@@ -664,6 +1144,11 @@ def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejec
         wetting_rise_table.to_excel(writer, "Wetting Rise Time", index=False)
         mixing_pressure_table.to_excel(writer, "Mixing Max Pressure", index=False)
         blending_pressure_table.to_excel(writer, "Blending Max Pressure", index=False)
+        premix_prepared.to_excel(writer, "Premix Calculated Datalog", index=False)
+        premix_blocks.to_excel(writer, "Premix Direction Blocks", index=False)
+        premix_pairs.to_excel(writer, "Premix Bidirectional", index=False)
+        premix_prediction.to_excel(writer, "Premix Prediction", index=False)
+        premix_summary.to_excel(writer, "Premix Volume Summary", index=False)
         diagnostics.to_excel(writer, "Datalog Diagnostics", index=False); rejected.to_excel(writer, "Rejected Rows", index=False)
         for stage in STAGES:
             (datalog[datalog["Stage"].eq(stage)] if not datalog.empty else pd.DataFrame()).to_excel(writer, f"{stage.title()} Datalog"[:31], index=False)
@@ -692,6 +1177,12 @@ def main():
             mixing_pressure_table = build_mixing_max_pressure_table(mixing_data)
             blending_data = datalog[datalog["Stage"].eq("BLENDING")].copy() if not datalog.empty else pd.DataFrame()
             blending_pressure_table = build_blending_max_pressure_table(blending_data)
+            premixing_data = datalog[datalog["Stage"].eq("PREMIXING")].copy() if not datalog.empty else pd.DataFrame()
+            premix_prepared = prepare_premixing_engineering_data(premixing_data)
+            premix_blocks = summarize_premixing_directional_blocks(premix_prepared)
+            premix_pairs = pair_premixing_bidirectional_attempts(premix_blocks)
+            premix_prediction = reverse_predict_premixing_volume_step(premix_pairs)
+            premix_summary = build_premixing_volume_step_summary(premix_prediction)
             status.update(label="Extraction completed", state="complete", expanded=False)
     except Exception as error: st.exception(error); st.stop()
 
@@ -702,7 +1193,7 @@ def main():
     st.subheader("Process Overview Times"); st.dataframe(overview, use_container_width=True, hide_index=True)
     st.subheader("Process Summary"); st.dataframe(summaries, use_container_width=True, hide_index=True)
 
-    recipe_tab, datalog_tab, wetting_tab, mixing_tab, blending_tab, diagnostics_tab = st.tabs(["Recipe Settings", "Datalog Explorer", "Wetting Rise-Time Plot", "Mixing Max-Pressure Plots", "Blending Max-Pressure Plots", "Diagnostics"])
+    recipe_tab, datalog_tab, wetting_tab, mixing_tab, blending_tab, premixing_tab, diagnostics_tab = st.tabs(["Recipe Settings", "Datalog Explorer", "Wetting Rise-Time Plot", "Mixing Max-Pressure Plots", "Blending Max-Pressure Plots", "Premixing Engineering Analysis", "Diagnostics"])
     with recipe_tab:
         st.dataframe(settings, use_container_width=True, hide_index=True, height=520)
         st.download_button("Download Recipe Settings CSV", settings.to_csv(index=False).encode(), "recipe_settings.csv", "text/csv")
@@ -973,6 +1464,91 @@ def main():
                 "text/html",
             )
 
+    with premixing_tab:
+        st.markdown("#### Premixing Predicted Volume-Step Analysis")
+        st.caption(
+            "Cylinder diameter = 80.1 mm for all extruders. Direction is inferred from "
+            "servo-speed signs. Opposite movement blocks are paired using same-cycle "
+            "preference, with nearest opposite block as a review fallback."
+        )
+        if premix_summary.empty:
+            st.warning("No Premixing bidirectional volume-step analysis was generated.")
+        else:
+            premix_extruders = sorted(premix_summary["Extruder"].unique().astype(int))
+            selected_premix_extruder = st.selectbox(
+                "Premixing extruder", premix_extruders,
+                key="premixing_analysis_extruder",
+            )
+            summary_view = premix_summary[
+                premix_summary["Extruder"].eq(selected_premix_extruder)
+            ].copy()
+            batch_number_for_premix = batch.get("Batch no.") or "Batch"
+            premix_figure = create_premixing_volume_step_plot(
+                premix_summary,
+                selected_premix_extruder,
+                batch_number_for_premix,
+            )
+            st.plotly_chart(
+                premix_figure,
+                use_container_width=True,
+                config={
+                    "displaylogo": False,
+                    "scrollZoom": True,
+                    "toImageButtonOptions": {
+                        "format": "png",
+                        "filename": (
+                            f"{batch_number_for_premix}_extruder_"
+                            f"{selected_premix_extruder}_premixing_volume_step"
+                        ),
+                        "height": 700, "width": 1200, "scale": 2,
+                    },
+                },
+                key=f"premix_chart_{selected_premix_extruder}",
+            )
+            st.dataframe(
+                summary_view, use_container_width=True,
+                hide_index=True, height=360,
+            )
+
+            with st.expander("Directional movement blocks"):
+                st.dataframe(
+                    premix_blocks[
+                        premix_blocks["Extruder"].eq(selected_premix_extruder)
+                    ],
+                    use_container_width=True, hide_index=True, height=420,
+                )
+            with st.expander("Improved bidirectional pairing"):
+                st.dataframe(
+                    premix_pairs[
+                        premix_pairs["Extruder"].eq(selected_premix_extruder)
+                    ],
+                    use_container_width=True, hide_index=True, height=420,
+                )
+            with st.expander("Reverse-predicted volume and pressure sequence"):
+                st.dataframe(
+                    premix_prediction[
+                        premix_prediction["Extruder"].eq(selected_premix_extruder)
+                    ],
+                    use_container_width=True, hide_index=True, height=450,
+                )
+
+            premix_html = pio.to_html(
+                premix_figure, include_plotlyjs="cdn", full_html=True
+            ).encode("utf-8")
+            p1, p2 = st.columns(2)
+            p1.download_button(
+                "Download Premixing Volume-Step Summary CSV",
+                summary_view.to_csv(index=False).encode("utf-8"),
+                f"{batch_number_for_premix}_extruder_{selected_premix_extruder}_premixing_summary.csv",
+                "text/csv",
+            )
+            p2.download_button(
+                "Download Interactive Premixing Plot HTML",
+                premix_html,
+                f"{batch_number_for_premix}_extruder_{selected_premix_extruder}_premixing_plot.html",
+                "text/html",
+            )
+
     with diagnostics_tab:
         st.markdown("#### Assigned process page ranges"); st.dataframe(process_ranges, use_container_width=True, hide_index=True)
         st.markdown("#### Page-level diagnostics"); st.dataframe(diagnostics, use_container_width=True, hide_index=True, height=400)
@@ -980,7 +1556,7 @@ def main():
         if rejected_rows.empty: st.success("No timestamp rows were rejected.")
         else: st.dataframe(rejected_rows, use_container_width=True, hide_index=True, height=400)
 
-    excel = make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected_rows, process_ranges, wetting_rise_table, mixing_pressure_table, blending_pressure_table)
+    excel = make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected_rows, process_ranges, wetting_rise_table, mixing_pressure_table, blending_pressure_table, premix_prepared, premix_blocks, premix_pairs, premix_prediction, premix_summary)
     batch_number = batch.get("Batch no.") or "batch"
     st.download_button("⬇️ Download Complete Excel Extraction", excel, f"{batch_number}_complete_process_extraction.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
