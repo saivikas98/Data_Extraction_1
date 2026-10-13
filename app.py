@@ -35,7 +35,6 @@ PREMIXING_VOLUME_PER_MM_ML = PREMIXING_CYLINDER_AREA_MM2 / 1000
 PREMIXING_TARGET_ACHIEVEMENT_PERCENT = 95.0
 PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR = 0.5
 PREMIXING_SPEED_DIRECTION_TOLERANCE = 0.005
-PREMIXING_LEFT_VOLUME_MATCH_TOLERANCE_ML = 1.0
 
 
 def parse_dt(value):
@@ -54,7 +53,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-independent-grid-controls-v18"
+    parser_version = "2026.10.13-pushed-volume-target-rule-v19"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -532,9 +531,10 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                 if pd.notna(actual_left_volume) and pd.notna(expected_left_volume)
                 else np.nan
             )
-            left_matches = (
-                pd.notna(left_difference)
-                and abs(left_difference) <= PREMIXING_LEFT_VOLUME_MATCH_TOLERANCE_ML
+            pushed_volume_within_target = (
+                pd.notna(actual_left_volume)
+                and pd.notna(expected_left_volume)
+                and actual_left_volume <= expected_left_volume
             )
 
             if attempt_number == 1:
@@ -544,12 +544,12 @@ def reverse_predict_premixing_volume_step(paired_attempts):
             elif previous_cycle == PREMIXING_REPEAT_CYCLES and current_cycle == 1:
                 if pressure_increased:
                     rule = "Same volume step: Cycle 3 to 1 pressure increase"
-                elif left_matches:
-                    rule = "Same volume step: left volume matches standard"
+                elif pushed_volume_within_target:
+                    rule = "Same volume step: L-to-R pushed volume <= target volume"
                 else:
                     volume_step_number += 1
                     volume_step_size = volume_step_number * PREMIXING_VOLUME_STEP_ML
-                    rule = "Advanced by 16.5 mL: no pressure increase or left-volume match"
+                    rule = "Advanced by 16.5 mL: no pressure increase or L-to-R pushed-volume <= target-volume condition"
             elif current_cycle == 1:
                 volume_step_number += 1
                 volume_step_size = volume_step_number * PREMIXING_VOLUME_STEP_ML
@@ -578,7 +578,9 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                 "Expected Left Volume (mL)": expected_left_volume,
                 "Actual Left Volume (mL)": actual_left_volume,
                 "Left Volume Difference (mL)": left_difference,
-                "Left Volume Matches Standard": "Yes" if left_matches else "No",
+                "L-to-R Pushed Volume <= Target Volume": (
+                    "Yes" if pushed_volume_within_target else "No"
+                ),
             })
             if current_cycle is not None:
                 previous_cycle = current_cycle
