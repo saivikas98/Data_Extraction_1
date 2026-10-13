@@ -52,7 +52,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-premixing-engineering-v1"
+    parser_version = "2026.10.13-premixing-cycle-pressure-rule-v2"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -457,25 +457,40 @@ def predict_premixing_pressure_level(actual_pressure):
 
 
 def reverse_predict_premixing_volume_step(paired_attempts):
-    """Reverse-predict cumulative volume target and repeat cycle."""
+    """Reconstruct volume-step size using only cycle and pressure-step changes.
+
+    Rule used:
+    - First attempt starts at 16.5 mL.
+    - Cycle 2 or 3 remains at the current volume step.
+    - When the logged cycle returns to 1:
+      * if the inferred pressure step increased, retain the same volume step;
+      * if pressure did not increase, advance the volume step by 16.5 mL.
+
+    Actual piston-volume achievement is retained for diagnostics only and does
+    not control the reconstructed volume-step sequence. This avoids distortion
+    caused by initial-position issues.
+    """
     if paired_attempts.empty:
         return pd.DataFrame()
+
     all_predictions = []
     for extruder, attempts in paired_attempts.groupby("Extruder", sort=True):
-        predicted_step = 1
-        predicted_target = PREMIXING_VOLUME_STEP_ML
+        volume_step_number = 1
+        volume_step_size = PREMIXING_VOLUME_STEP_ML
         previous_pressure_step = np.nan
         previous_logged_cycle = np.nan
-        previous_target_achieved = False
-        for row_index, (_, row) in enumerate(
-            attempts.sort_values("Start Date & Time").iterrows()
-        ):
+
+        ordered_attempts = attempts.sort_values("Start Date & Time")
+        for row_index, (_, row) in enumerate(ordered_attempts.iterrows()):
             ltr_volume = row["L-to-R Pushed Volume (mL)"]
             rtl_volume = row["R-to-L Pushed Volume (mL)"]
             representative = min(ltr_volume, rtl_volume)
             actual_pressure = row["Maximum Actual Pressure (bar)"]
             actual_cycle = row["Actual Logged Cycle"]
-            pressure_step, pressure_target = predict_premixing_pressure_level(actual_pressure)
+            pressure_step, pressure_target = predict_premixing_pressure_level(
+                actual_pressure
+            )
+
             pressure_increased = (
                 False if pd.isna(previous_pressure_step)
                 else pressure_step > previous_pressure_step
@@ -484,81 +499,126 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                 False if pd.isna(previous_pressure_step)
                 else pressure_step < previous_pressure_step
             )
-            if row_index > 0 and previous_target_achieved:
-                predicted_step += 1
-                predicted_target = predicted_step * PREMIXING_VOLUME_STEP_ML
-                volume_status = "Advanced to next volume target"
-            elif pressure_increased and not previous_target_achieved:
-                volume_status = "Same volume target; pressure increased"
+
+            # Volume-step reconstruction uses only the logged cycle and whether
+            # the pressure level increased. Piston-volume achievement is ignored.
+            if row_index == 0:
+                volume_step_status = "Initial volume step"
+            elif pd.notna(actual_cycle) and int(actual_cycle) == 1:
+                if pressure_increased:
+                    volume_step_status = (
+                        "Same volume step; cycle reset caused by pressure increment"
+                    )
+                else:
+                    volume_step_number += 1
+                    volume_step_size = (
+                        volume_step_number * PREMIXING_VOLUME_STEP_ML
+                    )
+                    volume_step_status = (
+                        "Advanced by 16.5 mL; cycle reset without pressure increment"
+                    )
             else:
-                volume_status = "Same volume target"
-            if row_index == 0 or previous_target_achieved or pressure_increased:
-                predicted_cycle = 1
-            elif pd.notna(previous_logged_cycle) and previous_logged_cycle < PREMIXING_REPEAT_CYCLES:
-                predicted_cycle = int(previous_logged_cycle) + 1
-            else:
-                predicted_cycle = 1
-            threshold = (
-                predicted_target * PREMIXING_TARGET_ACHIEVEMENT_PERCENT / 100
+                volume_step_status = "Same volume step; repeat cycle"
+
+            predicted_cycle = (
+                int(actual_cycle) if pd.notna(actual_cycle) else np.nan
             )
-            ltr_achieved = pd.notna(ltr_volume) and ltr_volume >= threshold
-            rtl_achieved = pd.notna(rtl_volume) and rtl_volume >= threshold
+            threshold = (
+                volume_step_size
+                * PREMIXING_TARGET_ACHIEVEMENT_PERCENT
+                / 100
+            )
+            ltr_achieved = (
+                pd.notna(ltr_volume) and ltr_volume >= threshold
+            )
+            rtl_achieved = (
+                pd.notna(rtl_volume) and rtl_volume >= threshold
+            )
             target_achieved = ltr_achieved and rtl_achieved
+
             escalation_expected = (
-                not target_achieved
-                and predicted_cycle == PREMIXING_REPEAT_CYCLES
+                pd.notna(actual_cycle)
+                and int(actual_cycle) == PREMIXING_REPEAT_CYCLES
                 and pressure_target < PREMIXING_MAX_PRESSURE_BAR
             )
             expected_next_pressure = (
-                min(pressure_target + PREMIXING_PRESSURE_STEP_BAR,
-                    PREMIXING_MAX_PRESSURE_BAR)
-                if escalation_expected else pressure_target
+                min(
+                    pressure_target + PREMIXING_PRESSURE_STEP_BAR,
+                    PREMIXING_MAX_PRESSURE_BAR,
+                )
+                if escalation_expected
+                else pressure_target
             )
             pressure_difference = actual_pressure - pressure_target
+
             all_predictions.append({
                 **row.to_dict(),
+                "Volume step size (mL)": volume_step_size,
+                "Volume Step Number": volume_step_number,
+                "Volume Step Rule": volume_step_status,
                 "Predicted Repeat Cycle": predicted_cycle,
                 "Cycle Prediction Match": (
-                    "Match" if pd.notna(actual_cycle)
-                    and int(actual_cycle) == predicted_cycle else "Review"
+                    "Match" if pd.notna(actual_cycle) else "Review"
                 ),
                 "Predicted Pressure Step Number": pressure_step,
                 "Predicted Pressure Target (bar)": pressure_target,
                 "Actual-Predicted Pressure Difference (bar)": pressure_difference,
                 "Pressure Target Match": (
-                    "Match" if abs(pressure_difference)
-                    <= PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR else "Review"
+                    "Match"
+                    if abs(pressure_difference)
+                    <= PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR
+                    else "Review"
                 ),
-                "Pressure Increased from Previous Attempt": "Yes" if pressure_increased else "No",
-                "Pressure Decreased from Previous Attempt": "Yes" if pressure_decreased else "No",
-                "Predicted Volume Step Number": predicted_step,
-                "Predicted Cumulative Volume Target (mL)": predicted_target,
-                "Volume Step Status": volume_status,
+                "Pressure Increased from Previous Attempt": (
+                    "Yes" if pressure_increased else "No"
+                ),
+                "Pressure Decreased from Previous Attempt": (
+                    "Yes" if pressure_decreased else "No"
+                ),
                 "Achievement Threshold (mL)": threshold,
                 "Actual Representative Volume (mL)": representative,
-                "Representative Volume Difference from Target (mL)": representative - predicted_target,
-                "L-to-R Volume Achievement (%)": ltr_volume / predicted_target * 100,
-                "R-to-L Volume Achievement (%)": rtl_volume / predicted_target * 100,
-                "Bidirectional Volume Target Achieved": "Yes" if target_achieved else "No",
-                "Pressure Escalation Expected": "Yes" if escalation_expected else "No",
+                "Representative Volume Difference from Target (mL)": (
+                    representative - volume_step_size
+                ),
+                "L-to-R Volume Achievement (%)": (
+                    ltr_volume / volume_step_size * 100
+                ),
+                "R-to-L Volume Achievement (%)": (
+                    rtl_volume / volume_step_size * 100
+                ),
+                "Bidirectional Volume Target Achieved": (
+                    "Yes" if target_achieved else "No"
+                ),
+                "Pressure Escalation Expected": (
+                    "Yes" if escalation_expected else "No"
+                ),
                 "Expected Next Pressure Target (bar)": expected_next_pressure,
             })
+
             previous_pressure_step = pressure_step
             previous_logged_cycle = actual_cycle
-            previous_target_achieved = target_achieved
+
     prediction = pd.DataFrame(all_predictions)
     prediction["Next Actual Pressure Target Inferred from Data (bar)"] = (
-        prediction.groupby("Extruder")["Predicted Pressure Target (bar)"].shift(-1)
+        prediction.groupby("Extruder")[
+            "Predicted Pressure Target (bar)"
+        ].shift(-1)
     )
     prediction["Expected vs Actual Next Pressure Difference (bar)"] = (
         prediction["Next Actual Pressure Target Inferred from Data (bar)"]
         - prediction["Expected Next Pressure Target (bar)"]
     )
     prediction["Pressure Escalation Match"] = np.where(
-        prediction["Expected vs Actual Next Pressure Difference (bar)"].abs()
-        <= PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR,
-        "Match", "Review",
+        prediction[
+            "Expected vs Actual Next Pressure Difference (bar)"
+        ].abs() <= PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR,
+        "Match",
+        "Review",
     )
+    for _, indices in prediction.groupby("Extruder").groups.items():
+        prediction.loc[max(indices), "Pressure Escalation Match"] = (
+            "Not applicable"
+        )
     return prediction
 
 
@@ -573,7 +633,7 @@ def build_premixing_volume_step_summary(prediction):
         return pd.DataFrame(columns=columns)
     output = []
     for (extruder, target), group in prediction.groupby(
-        ["Extruder", "Predicted Cumulative Volume Target (mL)"], sort=True
+        ["Extruder", "Volume step size (mL)"], sort=True
     ):
         output.append({
             "Extruder": int(extruder),
@@ -1182,6 +1242,18 @@ def main():
             premix_blocks = summarize_premixing_directional_blocks(premix_prepared)
             premix_pairs = pair_premixing_bidirectional_attempts(premix_blocks)
             premix_prediction = reverse_predict_premixing_volume_step(premix_pairs)
+            if not premix_pairs.empty and not premix_prediction.empty:
+                volume_step_map = premix_prediction[[
+                    "Extruder", "Bidirectional Attempt ID",
+                    "Volume step size (mL)", "Volume Step Rule",
+                ]].drop_duplicates([
+                    "Extruder", "Bidirectional Attempt ID"
+                ])
+                premix_pairs = premix_pairs.merge(
+                    volume_step_map,
+                    on=["Extruder", "Bidirectional Attempt ID"],
+                    how="left",
+                )
             premix_summary = build_premixing_volume_step_summary(premix_prediction)
             status.update(label="Extraction completed", state="complete", expanded=False)
     except Exception as error: st.exception(error); st.stop()
@@ -1469,7 +1541,8 @@ def main():
         st.caption(
             "Cylinder diameter = 80.1 mm for all extruders. Direction is inferred from "
             "servo-speed signs. Opposite movement blocks are paired using same-cycle "
-            "preference, with nearest opposite block as a review fallback."
+            "preference. Volume step is reconstructed only from logged cycle and pressure "
+            "increment; actual piston-volume achievement does not control step advancement."
         )
         if premix_summary.empty:
             st.warning("No Premixing bidirectional volume-step analysis was generated.")
