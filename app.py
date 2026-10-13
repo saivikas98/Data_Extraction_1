@@ -54,7 +54,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-premixing-left-volume-check-v11"
+    parser_version = "2026.10.13-plot-font-times-v12"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -626,6 +626,24 @@ def build_premixing_volume_step_summary(prediction):
     ).reset_index(drop=True)
 
 
+def apply_plotly_times_new_roman(figure):
+    """Apply consistent Times New Roman typography to Plotly charts."""
+    figure.update_layout(
+        font={"family": "Times New Roman", "size": 12, "color": "#000000"},
+        title_font={"family": "Times New Roman", "size": 12, "color": "#000000"},
+        legend_font={"family": "Times New Roman", "size": 12, "color": "#000000"},
+    )
+    figure.update_xaxes(
+        tickfont={"family": "Times New Roman", "size": 12, "color": "#000000"},
+        title_font={"family": "Times New Roman", "size": 12, "color": "#000000"},
+    )
+    figure.update_yaxes(
+        tickfont={"family": "Times New Roman", "size": 12, "color": "#000000"},
+        title_font={"family": "Times New Roman", "size": 12, "color": "#000000"},
+    )
+    return figure
+
+
 def create_premixing_volume_step_plot(summary, extruder, batch_number):
     """Create an interactive dual-axis Premixing pressure/attempt plot."""
     data = summary[summary["Extruder"].eq(extruder)].sort_values(
@@ -695,24 +713,24 @@ def create_premixing_volume_step_plot(summary, extruder, batch_number):
             "xanchor": "center",
             "y": 0.97,
             "yanchor": "top",
-            "font": {"size": 24, "color": "#1F2937"},
+            "font": {"family": "Times New Roman", "size": 12, "color": "#000000"},
         },
         xaxis={
-            "title": {"text": "VOLUME STEP (mL)", "standoff": 18},
+            "title": {"text": "<b>VOLUME STEP (mL)</b>", "standoff": 18},
             "range": [0, x_max],
             "dtick": PREMIXING_VOLUME_STEP_ML,
             "showgrid": True,
             "gridcolor": "#D9E1EA",
         },
         yaxis={
-            "title": {"text": "MAX PRESSURE (bar)", "standoff": 12},
+            "title": {"text": "<b>MAX PRESSURE (bar)</b>", "standoff": 12},
             "range": [0, 200],
             "dtick": 20,
             "showgrid": True,
             "gridcolor": "#D9E1EA",
         },
         yaxis2={
-            "title": {"text": "ATTEMPTS", "standoff": 12},
+            "title": {"text": "<b>ATTEMPTS</b>", "standoff": 12},
             "overlaying": "y",
             "side": "right",
             "range": [0, max(4, max_attempts + 1)],
@@ -727,7 +745,7 @@ def create_premixing_volume_step_plot(summary, extruder, batch_number):
             "xanchor": "center",
             "y": 1.03,
             "yanchor": "bottom",
-            "font": {"size": 13},
+            "font": {"family": "Times New Roman", "size": 12},
             "bgcolor": "rgba(255,255,255,0.9)",
         },
         plot_bgcolor="white",
@@ -735,7 +753,7 @@ def create_premixing_volume_step_plot(summary, extruder, batch_number):
         height=720,
         margin={"l": 90, "r": 90, "t": 150, "b": 90},
     )
-    return figure
+    return apply_plotly_times_new_roman(figure)
 
 
 def build_wetting_rise_time_table(wetting_data):
@@ -1031,7 +1049,7 @@ def create_blending_pressure_plot(table, extruder, phase, batch_number):
             "text": f"{batch_number}<br>EXTRUDER - {int(extruder)} | {phase}",
             "x": 0.5, "xanchor": "center",
         },
-        xaxis_title="Cycles", yaxis_title="Maximum Pressure (bar)",
+        xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
         xaxis={"range": [0, expected_cycles + 2], "showgrid": True},
         yaxis={"range": [0, y_max], "showgrid": True},
         hovermode="closest",
@@ -1039,7 +1057,7 @@ def create_blending_pressure_plot(table, extruder, phase, batch_number):
         height=620,
         margin={"l": 70, "r": 30, "t": 100, "b": 120},
     )
-    return figure
+    return apply_plotly_times_new_roman(figure)
 
 def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
     """Create an interactive maximum-pressure-by-cycle chart."""
@@ -1104,8 +1122,8 @@ def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
             "x": 0.5,
             "xanchor": "center",
         },
-        xaxis_title="Cycles",
-        yaxis_title="Maximum Pressure (bar)",
+        xaxis_title="<b>Cycles</b>",
+        yaxis_title="<b>Maximum Pressure (bar)</b>",
         xaxis={"dtick": 1, "range": [0.5, max_cycle + 0.5], "showgrid": True},
         yaxis={"range": [0, y_max], "showgrid": True},
         hovermode="closest",
@@ -1113,7 +1131,7 @@ def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
         height=620,
         margin={"l": 70, "r": 30, "t": 100, "b": 120},
     )
-    return figure
+    return apply_plotly_times_new_roman(figure)
 
 def create_wetting_rise_time_plot(table, batch_number, limit):
     """Create an interactive Plotly chart with point-level hover details."""
@@ -1187,8 +1205,8 @@ def create_wetting_rise_time_plot(table, batch_number, limit):
     )
     figure.update_layout(
         title={"text": str(batch_number), "x": 0.5, "xanchor": "center"},
-        xaxis_title="Time taken to reach vacuum rise (min)",
-        yaxis_title="Rise time (Sec)",
+        xaxis_title="<b>Time taken to reach vacuum rise (min)</b>",
+        yaxis_title="<b>Rise time (Sec)</b>",
         xaxis={"range": [0, x_max], "showgrid": True},
         yaxis={"range": [0, max(700.0, limit * 1.15)], "showgrid": True},
         hovermode="closest",
@@ -1196,7 +1214,7 @@ def create_wetting_rise_time_plot(table, batch_number, limit):
         height=700,
         margin={"l": 70, "r": 30, "t": 80, "b": 70},
     )
-    return figure
+    return apply_plotly_times_new_roman(figure)
 
 
 def figure_to_png(fig):
@@ -1420,9 +1438,10 @@ def main():
                     mixing_html_figure.add_trace(trace)
             mixing_html_figure.update_layout(
                 title=f"{batch_number_for_mixing} | Extruder {selected_mixing_extruder} | Mixing Max Pressure",
-                xaxis_title="Cycles", yaxis_title="Maximum Pressure (bar)",
+                xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
                 hovermode="closest", height=700,
             )
+            apply_plotly_times_new_roman(mixing_html_figure)
             mixing_html = pio.to_html(
                 mixing_html_figure, include_plotlyjs="cdn", full_html=True
             ).encode("utf-8")
@@ -1523,9 +1542,10 @@ def main():
                     f"{batch_number_for_blending} | Extruder "
                     f"{selected_blending_extruder} | Blending Max Pressure"
                 ),
-                xaxis_title="Cycles", yaxis_title="Maximum Pressure (bar)",
+                xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
                 hovermode="closest", height=700,
             )
+            apply_plotly_times_new_roman(combined_blending_figure)
             blending_html = pio.to_html(
                 combined_blending_figure,
                 include_plotlyjs="cdn", full_html=True,
