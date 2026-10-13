@@ -54,7 +54,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-axis-scale-font-border-v16"
+    parser_version = "2026.10.13-grid-border-controls-v17"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -685,13 +685,13 @@ def create_premixing_volume_step_plot(
         font={"family": "Times New Roman", "size": 12, "color": "#000000"},
         xaxis={"title": {"text": "<b>VOLUME STEP (mL)</b>", "standoff": 18},
                "range": [0, 198], "dtick": PREMIXING_VOLUME_STEP_ML,
-               "showgrid": False, },
+               "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
         yaxis={"title": {"text": "<b>PRESSURE (bar)</b>", "standoff": 12},
                "range": [0, 200], "dtick": 15 if pressure_mode == "Pressure Step" else 20,
-               "showgrid": False, },
+               "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
         yaxis2={"title": {"text": "<b>ATTEMPTS</b>", "standoff": 12},
                 "overlaying": "y", "side": "right",
-                "range": [0, max(4, max_attempts + 1)], "dtick": 1, "showgrid": False},
+                "range": [0, max(4, max_attempts + 1)], "dtick": 1, "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1},
         barmode="overlay", hovermode="x unified",
         legend={"orientation": "h", "x": 0.5, "xanchor": "center",
                 "y": 1.03, "yanchor": "bottom",
@@ -997,8 +997,8 @@ def create_blending_pressure_plot(table, extruder, phase, batch_number):
             "x": 0.5, "xanchor": "center",
         },
         xaxis_title="Cycles", yaxis_title="Maximum Pressure (bar)",
-        xaxis={"range": [0, expected_cycles + 2], "showgrid": False, },
-        yaxis={"range": [0, y_max], "showgrid": False, },
+        xaxis={"range": [0, expected_cycles + 2], "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+        yaxis={"range": [0, y_max], "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
         hovermode="closest",
         legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.20},
         height=620,
@@ -1071,8 +1071,8 @@ def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
         },
         xaxis_title="Cycles",
         yaxis_title="Maximum Pressure (bar)",
-        xaxis={"dtick": 1, "range": [0.5, max_cycle + 0.5], "showgrid": False, },
-        yaxis={"range": [0, y_max], "showgrid": False, },
+        xaxis={"dtick": 1, "range": [0.5, max_cycle + 0.5], "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+        yaxis={"range": [0, y_max], "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
         hovermode="closest",
         legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.20},
         height=620,
@@ -1154,8 +1154,8 @@ def create_wetting_rise_time_plot(table, batch_number, limit):
         title={"text": str(batch_number), "x": 0.5, "xanchor": "center"},
         xaxis_title="Time taken to reach vacuum rise (min)",
         yaxis_title="Rise time (Sec)",
-        xaxis={"range": [0, x_max], "showgrid": False, },
-        yaxis={"range": [0, max(700.0, limit * 1.15)], "showgrid": False, },
+        xaxis={"range": [0, x_max], "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+        yaxis={"range": [0, max(700.0, limit * 1.15)], "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
         hovermode="closest",
         legend={"x": 0.72, "y": 0.45, "bgcolor": "rgba(255,255,255,0.65)"},
         height=700,
@@ -1177,11 +1177,13 @@ def apply_graph_style(figure, font_family="Times New Roman", font_size=12):
         legend_font={"family": font_family, "size": size, "color": "#000000"},
         paper_bgcolor="white", plot_bgcolor="white",
     )
-    figure.update_xaxes(showgrid=False, showline=True, mirror=True, linewidth=1.5,
+    figure.update_xaxes(showgrid=True, gridcolor="#C7C7C7", gridwidth=1,
+        showline=True, mirror=True, linewidth=1.5,
         linecolor="#000000", ticks="outside",
         tickfont={"family": font_family, "size": size, "color": "#000000"},
         title_font={"family": font_family, "size": size, "color": "#000000"})
-    figure.update_yaxes(showgrid=False, showline=True, mirror=True, linewidth=1.5,
+    figure.update_yaxes(showgrid=True, gridcolor="#C7C7C7", gridwidth=1,
+        showline=True, mirror=True, linewidth=1.5,
         linecolor="#000000", ticks="outside",
         tickfont={"family": font_family, "size": size, "color": "#000000"},
         title_font={"family": font_family, "size": size, "color": "#000000"})
@@ -1489,8 +1491,8 @@ def main():
             mixing_html_figure.update_layout(
                 title=f"{batch_number_for_mixing} | Extruder {selected_mixing_extruder} | Mixing Max Pressure",
                 xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
-                xaxis={"showgrid": False, },
-                yaxis={"showgrid": False, },
+                xaxis={"showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+                yaxis={"showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
                 hovermode="closest", height=700,
             )
             apply_graph_style(mixing_html_figure, graph_font_family, graph_font_size)
@@ -1610,8 +1612,8 @@ def main():
                     f"{selected_blending_extruder} | Blending Max Pressure"
                 ),
                 xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
-                xaxis={"showgrid": False, },
-                yaxis={"showgrid": False, },
+                xaxis={"showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+                yaxis={"showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
                 hovermode="closest", height=700,
             )
             apply_graph_style(combined_blending_figure, graph_font_family, graph_font_size)
