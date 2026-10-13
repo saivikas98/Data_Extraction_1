@@ -1,4 +1,5 @@
 import io
+import math
 import re
 
 import matplotlib.pyplot as plt
@@ -52,7 +53,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-premixing-pressure-tolerance-0.5-v8"
+    parser_version = "2026.10.13-premixing-pressure-normalization-v9"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -456,23 +457,23 @@ def predict_premixing_pressure_level(actual_pressure):
     return step_number, target
 
 
-def reverse_predict_premixing_volume_step(paired_attempts):
-    """Reconstruct Premixing volume step from cycle and actual pressure increases.
+def normalize_premixing_pressure(actual_pressure):
+    """Normalize pressure using the approved 0.5-bar rule.
 
-    Minimal process rule:
-    - Start at 16.5 mL.
-    - Logged cycle 2 or 3 means another attempt at the same volume step.
-    - When the cycle returns to 1, compare the current maximum actual pressure
-      with the highest maximum actual pressure already observed in that extruder.
-    - A pressure rise is recognized only when the current maximum pressure is
-      more than 0.5 bar above the previous highest pressure.
-    - If cycle returns to 1 without a pressure increase, advance the cumulative
-      volume step by 16.5 mL.
-
-    No pressure rounding or 15-bar binning is used. A strict 0.5-bar
-    tolerance is applied: an increase of exactly 0.5 bar is not classified as
-    a pressure increase; the increase must be greater than 0.5 bar.
+    Decimal part up to and including 0.5 rounds down to the lower whole bar.
+    Decimal part above 0.5 rounds up to the next whole bar.
+    Examples: 60.5 -> 60 bar; 60.6 -> 61 bar.
     """
+    if pd.isna(actual_pressure):
+        return np.nan
+    pressure = float(actual_pressure)
+    lower_bar = math.floor(pressure)
+    decimal_part = pressure - lower_bar
+    return int(lower_bar if decimal_part <= 0.5 else lower_bar + 1)
+
+
+def reverse_predict_premixing_volume_step(paired_attempts):
+    """Reconstruct Premixing volume step from cycle and normalized pressure."""
     if paired_attempts.empty:
         return pd.DataFrame()
 
@@ -480,49 +481,53 @@ def reverse_predict_premixing_volume_step(paired_attempts):
     for extruder, attempts in paired_attempts.groupby("Extruder", sort=True):
         volume_step_number = 1
         volume_step_size = PREMIXING_VOLUME_STEP_ML
-        highest_pressure_seen = None
+        highest_normalized_pressure = None
 
-        for sequence, (_, row) in enumerate(
-            attempts.sort_values("Start Date & Time").iterrows(), start=1
-        ):
+        ordered_attempts = attempts.sort_values("Start Date & Time", kind="stable")
+        for attempt_number, (_, row) in enumerate(ordered_attempts.iterrows(), start=1):
             actual_cycle = row["Actual Logged Cycle"]
-            actual_pressure = float(row["Maximum Actual Pressure (bar)"])
-
-            pressure_increased = (
-                highest_pressure_seen is not None
-                and actual_pressure
-                > highest_pressure_seen + PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR
+            actual_pressure = pd.to_numeric(
+                row["Maximum Actual Pressure (bar)"], errors="coerce"
             )
-            previous_highest_pressure = highest_pressure_seen
+            normalized_pressure = normalize_premixing_pressure(actual_pressure)
+            previous_highest = highest_normalized_pressure
+            pressure_increased = (
+                previous_highest is not None
+                and pd.notna(normalized_pressure)
+                and normalized_pressure > previous_highest
+            )
 
-            if sequence == 1:
+            if attempt_number == 1:
                 rule = "Initial volume step"
+            elif pd.notna(actual_cycle) and int(actual_cycle) in (2, 3):
+                rule = "Same volume step: repeat attempt"
             elif pd.notna(actual_cycle) and int(actual_cycle) == 1:
                 if pressure_increased:
-                    rule = "Same volume step: pressure increased"
+                    rule = "Same volume step: normalized pressure increased"
                 else:
                     volume_step_number += 1
-                    volume_step_size = (
-                        volume_step_number * PREMIXING_VOLUME_STEP_ML
-                    )
+                    volume_step_size = volume_step_number * PREMIXING_VOLUME_STEP_ML
                     rule = "Advanced by 16.5 mL"
             else:
-                rule = "Same volume step: repeat attempt"
+                rule = "Same volume step: cycle unavailable"
 
-            highest_pressure_seen = (
-                actual_pressure
-                if highest_pressure_seen is None
-                else max(highest_pressure_seen, actual_pressure)
-            )
+            if pd.notna(normalized_pressure):
+                highest_normalized_pressure = (
+                    normalized_pressure
+                    if highest_normalized_pressure is None
+                    else max(highest_normalized_pressure, normalized_pressure)
+                )
 
             output.append({
                 **row.to_dict(),
-                "Attempt Number": sequence,
+                "Attempt Number": attempt_number,
                 "Volume step size (mL)": volume_step_size,
                 "Volume Step Number": volume_step_number,
                 "Volume Step Rule": rule,
-                "Previous Highest Pressure (bar)": previous_highest_pressure,
-                "Highest Pressure Seen (bar)": highest_pressure_seen,
+                "Actual Maximum Pressure (bar)": actual_pressure,
+                "Normalized Maximum Pressure (bar)": normalized_pressure,
+                "Previous Highest Normalized Pressure (bar)": previous_highest,
+                "Highest Normalized Pressure Seen (bar)": highest_normalized_pressure,
                 "Pressure Increased": "Yes" if pressure_increased else "No",
             })
 
@@ -1485,8 +1490,8 @@ def main():
             "Cylinder diameter = 80.1 mm for all extruders. Direction is inferred from "
             "servo-speed signs. Opposite movement blocks are paired using same-cycle "
             "preference. Volume step is reconstructed dynamically from each batch's "
-            "logged-cycle sequence and actual maximum-pressure increases. Any positive "
-            "pressure increase is recognized; no pressure tolerance or fixed attempt count is used."
+            "logged-cycle sequence and normalized maximum pressure. Decimal values up to "
+            "0.5 round down, while values above 0.5 round up. No fixed attempt count is used."
         )
         if premix_summary.empty:
             st.warning("No Premixing bidirectional volume-step analysis was generated.")
