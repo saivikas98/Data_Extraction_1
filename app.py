@@ -53,7 +53,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-pushed-volume-target-rule-v19"
+    parser_version = "2026.10.13-pushed-volume-target-plus-one-v20"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -534,7 +534,7 @@ def reverse_predict_premixing_volume_step(paired_attempts):
             pushed_volume_within_target = (
                 pd.notna(actual_left_volume)
                 and pd.notna(expected_left_volume)
-                and actual_left_volume <= expected_left_volume
+                and actual_left_volume <= expected_left_volume + 1.0
             )
 
             if attempt_number == 1:
@@ -549,7 +549,7 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                 else:
                     volume_step_number += 1
                     volume_step_size = volume_step_number * PREMIXING_VOLUME_STEP_ML
-                    rule = "Advanced by 16.5 mL: no pressure increase or L-to-R pushed-volume <= target-volume condition"
+                    rule = "Advanced by 16.5 mL: no pressure increase and L-to-R pushed volume > target volume + 1"
             elif current_cycle == 1:
                 volume_step_number += 1
                 volume_step_size = volume_step_number * PREMIXING_VOLUME_STEP_ML
