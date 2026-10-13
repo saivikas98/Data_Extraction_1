@@ -8,7 +8,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
 import streamlit as st
-import streamlit.components.v1 as components
 from pypdf import PdfReader
 
 st.set_page_config(page_title="Batch Process Data Extractor", page_icon="🧪", layout="wide")
@@ -55,7 +54,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-graph-controls-v13"
+    parser_version = "2026.10.13-interactive-html-controls-v15"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -460,28 +459,40 @@ def predict_premixing_pressure_level(actual_pressure):
 
 
 def normalize_premixing_pressure(actual_pressure):
-    """Normalize pressure using the approved 0.5-bar rule.
-
-    Decimal part up to and including 0.5 rounds down. Values above 0.5
-    round up. Examples: 60.5 becomes 60 bar and 60.6 becomes 61 bar.
-    """
+    """Normalize pressure: decimal <= 0.5 rounds down; > 0.5 rounds up."""
     if pd.isna(actual_pressure):
         return np.nan
     pressure = float(actual_pressure)
     lower_bar = math.floor(pressure)
-    decimal_part = pressure - lower_bar
-    return int(lower_bar if decimal_part <= 0.5 else lower_bar + 1)
+    return int(lower_bar if pressure - lower_bar <= 0.5 else lower_bar + 1)
 
 
 def expected_premixing_left_volume(volume_step_ml):
-    """Return the standard left-pushed volume for a cumulative volume step."""
+    """Standard left-pushed volume for a cumulative Premixing volume step."""
     if pd.isna(volume_step_ml):
         return np.nan
     return 2 * float(volume_step_ml) - PREMIXING_VOLUME_STEP_ML
 
 
+def premixing_recipe_pressure_step(actual_pressure):
+    """Map the actual maximum pressure to the nearest 15-bar recipe step."""
+    if pd.isna(actual_pressure):
+        return np.nan
+    normalized = normalize_premixing_pressure(actual_pressure)
+    if normalized <= 0:
+        return 0.0
+    step_number = max(1, int(np.floor(
+        (normalized + PREMIXING_PRESSURE_STEP_BAR / 2)
+        / PREMIXING_PRESSURE_STEP_BAR
+    )))
+    return float(min(
+        step_number * PREMIXING_PRESSURE_STEP_BAR,
+        PREMIXING_MAX_PRESSURE_BAR,
+    ))
+
+
 def reverse_predict_premixing_volume_step(paired_attempts):
-    """Reconstruct Premixing volume step using cycle, pressure, and left volume."""
+    """Reconstruct volume step using cycle, normalized pressure, and left volume."""
     if paired_attempts.empty:
         return pd.DataFrame()
 
@@ -490,10 +501,11 @@ def reverse_predict_premixing_volume_step(paired_attempts):
         volume_step_number = 1
         volume_step_size = PREMIXING_VOLUME_STEP_ML
         highest_normalized_pressure = int(PREMIXING_PRESSURE_STEP_BAR)
+        established_recipe_pressure = PREMIXING_PRESSURE_STEP_BAR
         previous_cycle = None
 
-        ordered_attempts = attempts.sort_values("Start Date & Time", kind="stable")
-        for attempt_number, (_, row) in enumerate(ordered_attempts.iterrows(), start=1):
+        ordered = attempts.sort_values("Start Date & Time", kind="stable")
+        for attempt_number, (_, row) in enumerate(ordered.iterrows(), start=1):
             actual_cycle = row["Actual Logged Cycle"]
             current_cycle = int(actual_cycle) if pd.notna(actual_cycle) else None
             actual_pressure = pd.to_numeric(
@@ -505,42 +517,39 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                 pd.notna(normalized_pressure)
                 and normalized_pressure > previous_highest
             )
+            inferred_recipe_pressure = premixing_recipe_pressure_step(actual_pressure)
+            if pd.notna(inferred_recipe_pressure):
+                established_recipe_pressure = max(
+                    established_recipe_pressure, inferred_recipe_pressure
+                )
 
             actual_left_volume = pd.to_numeric(
                 row["L-to-R Pushed Volume (mL)"], errors="coerce"
             )
             expected_left_volume = expected_premixing_left_volume(volume_step_size)
-            left_volume_difference = (
+            left_difference = (
                 actual_left_volume - expected_left_volume
                 if pd.notna(actual_left_volume) and pd.notna(expected_left_volume)
                 else np.nan
             )
-            left_volume_matches = (
-                pd.notna(left_volume_difference)
-                and abs(left_volume_difference)
-                <= PREMIXING_LEFT_VOLUME_MATCH_TOLERANCE_ML
+            left_matches = (
+                pd.notna(left_difference)
+                and abs(left_difference) <= PREMIXING_LEFT_VOLUME_MATCH_TOLERANCE_ML
             )
 
             if attempt_number == 1:
                 rule = "Initial volume step"
-            elif (
-                current_cycle is not None
-                and previous_cycle is not None
-                and current_cycle > previous_cycle
-            ):
+            elif current_cycle is not None and previous_cycle is not None and current_cycle > previous_cycle:
                 rule = "Same volume step: higher cycle repeat attempt"
             elif previous_cycle == PREMIXING_REPEAT_CYCLES and current_cycle == 1:
                 if pressure_increased:
                     rule = "Same volume step: Cycle 3 to 1 pressure increase"
-                elif left_volume_matches:
+                elif left_matches:
                     rule = "Same volume step: left volume matches standard"
                 else:
                     volume_step_number += 1
                     volume_step_size = volume_step_number * PREMIXING_VOLUME_STEP_ML
-                    rule = (
-                        "Advanced by 16.5 mL: Cycle 3 to 1 without pressure "
-                        "increase or left-volume match"
-                    )
+                    rule = "Advanced by 16.5 mL: no pressure increase or left-volume match"
             elif current_cycle == 1:
                 volume_step_number += 1
                 volume_step_size = volume_step_number * PREMIXING_VOLUME_STEP_ML
@@ -562,13 +571,14 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                 "Volume Step Rule": rule,
                 "Actual Maximum Pressure (bar)": actual_pressure,
                 "Normalized Maximum Pressure (bar)": normalized_pressure,
+                "Pressure Step (bar)": established_recipe_pressure,
                 "Previous Highest Normalized Pressure (bar)": previous_highest,
                 "Highest Normalized Pressure Seen (bar)": highest_normalized_pressure,
                 "Pressure Increased": "Yes" if pressure_increased else "No",
                 "Expected Left Volume (mL)": expected_left_volume,
                 "Actual Left Volume (mL)": actual_left_volume,
-                "Left Volume Difference (mL)": left_volume_difference,
-                "Left Volume Matches Standard": "Yes" if left_volume_matches else "No",
+                "Left Volume Difference (mL)": left_difference,
+                "Left Volume Matches Standard": "Yes" if left_matches else "No",
             })
             if current_cycle is not None:
                 previous_cycle = current_cycle
@@ -577,11 +587,11 @@ def reverse_predict_premixing_volume_step(paired_attempts):
 
 
 def build_premixing_volume_step_summary(prediction):
-    """Summarize attempts and directional maximum pressures by volume step."""
+    """Summarize attempts, actual pressures, and recipe pressure step by volume step."""
     columns = [
         "Extruder", "Volume Step (mL)", "Attempts",
         "Max Loadcell Left (bar)", "Max Loadcell Right (bar)",
-        "First Attempt", "Last Attempt",
+        "Pressure Step (bar)", "First Attempt", "Last Attempt",
     ]
     if prediction.empty:
         return pd.DataFrame(columns=columns)
@@ -594,12 +604,9 @@ def build_premixing_volume_step_summary(prediction):
             "Extruder": int(extruder),
             "Volume Step (mL)": float(volume_step),
             "Attempts": len(group),
-            "Max Loadcell Left (bar)": group[
-                "L-to-R Maximum Push Pressure (bar)"
-            ].max(),
-            "Max Loadcell Right (bar)": group[
-                "R-to-L Maximum Push Pressure (bar)"
-            ].max(),
+            "Max Loadcell Left (bar)": group["L-to-R Maximum Push Pressure (bar)"].max(),
+            "Max Loadcell Right (bar)": group["R-to-L Maximum Push Pressure (bar)"].max(),
+            "Pressure Step (bar)": group["Pressure Step (bar)"].max(),
             "First Attempt": group["Start Date & Time"].min(),
             "Last Attempt": group["End Date & Time"].max(),
         })
@@ -608,94 +615,10 @@ def build_premixing_volume_step_summary(prediction):
     ).reset_index(drop=True)
 
 
-def apply_graph_typography(figure, font_size=12):
-    """Apply Times New Roman and the selected font size to a Plotly figure."""
-    size = int(font_size)
-    figure.update_layout(
-        font={"family": "Times New Roman", "size": size, "color": "#000000"},
-        title_font={"family": "Times New Roman", "size": size, "color": "#000000"},
-        legend_font={"family": "Times New Roman", "size": size, "color": "#000000"},
-    )
-    figure.update_xaxes(
-        tickfont={"family": "Times New Roman", "size": size, "color": "#000000"},
-        title_font={"family": "Times New Roman", "size": size, "color": "#000000"},
-    )
-    figure.update_yaxes(
-        tickfont={"family": "Times New Roman", "size": size, "color": "#000000"},
-        title_font={"family": "Times New Roman", "size": size, "color": "#000000"},
-    )
-    return figure
-
-
-def graph_font_controls():
-    """Return one font size shared by all graphs in the application."""
-    presets = {
-        "Small (10 pt)": 10,
-        "Medium (12 pt)": 12,
-        "Large (16 pt)": 16,
-        "Presentation (20 pt)": 20,
-        "Custom": None,
-    }
-    with st.sidebar:
-        st.markdown("### Graph Controls")
-        preset = st.selectbox(
-            "Graph text size",
-            options=list(presets),
-            index=1,
-            key="global_graph_font_preset",
-        )
-        if preset == "Custom":
-            return int(st.number_input(
-                "Custom font size (pt)",
-                min_value=8,
-                max_value=30,
-                value=12,
-                step=1,
-                key="global_graph_custom_font_size",
-            ))
-        return presets[preset]
-
-
-def render_copy_graph_button(label="Copy Graph", key="graph"):
-    """Render a browser button that copies the most recently displayed Plotly chart."""
-    safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", str(key))
-    components.html(
-        f"""
-        <button id="copy_{safe_key}" style="
-            font-family: 'Times New Roman'; font-size: 12pt; font-weight: bold;
-            padding: 0.45rem 0.85rem; border: 1px solid #808080;
-            border-radius: 0.4rem; background: white; cursor: pointer;">
-            {label}
-        </button>
-        <span id="status_{safe_key}" style="font-family:'Times New Roman';font-size:12pt;margin-left:8px;"></span>
-        <script>
-        const button = document.getElementById('copy_{safe_key}');
-        const status = document.getElementById('status_{safe_key}');
-        button.addEventListener('click', async () => {{
-            try {{
-                const charts = window.parent.document.querySelectorAll('.js-plotly-plot');
-                if (!charts.length) throw new Error('No Plotly graph found');
-                const chart = charts[charts.length - 1];
-                const PlotlyRef = window.parent.Plotly || window.Plotly;
-                if (!PlotlyRef) throw new Error('Plotly is unavailable');
-                const dataUrl = await PlotlyRef.toImage(chart, {{format:'png', scale:2}});
-                const blob = await (await fetch(dataUrl)).blob();
-                await navigator.clipboard.write([new ClipboardItem({{'image/png': blob}})]);
-                status.textContent = 'Graph copied';
-                status.style.color = '#167D20';
-            }} catch (error) {{
-                status.textContent = 'Clipboard copy is blocked. Use the camera icon to download PNG.';
-                status.style.color = '#A61B1B';
-            }}
-        }});
-        </script>
-        """,
-        height=52,
-    )
-
-
-def create_premixing_volume_step_plot(summary, extruder, batch_number, font_size=12):
-    """Create an interactive dual-axis Premixing pressure/attempt plot."""
+def create_premixing_volume_step_plot(
+    summary, extruder, batch_number, pressure_mode="Actual Max Pressure"
+):
+    """Create Premixing pressure/attempt plot with fixed 0-198 mL x-axis."""
     data = summary[summary["Extruder"].eq(extruder)].sort_values(
         "Volume Step (mL)"
     ).copy()
@@ -708,102 +631,76 @@ def create_premixing_volume_step_plot(summary, extruder, batch_number, font_size
         ).dt.strftime("%d-%m-%Y %H:%M:%S")
 
     figure.add_trace(go.Bar(
-        x=data["Volume Step (mL)"],
-        y=data["Attempts"],
-        name="Attempts",
-        yaxis="y2",
+        x=data["Volume Step (mL)"], y=data["Attempts"],
+        name="Attempts", yaxis="y2",
         width=PREMIXING_VOLUME_STEP_ML * 0.62,
-        marker={
-            "color": "rgba(181, 211, 143, 0.55)",
-            "line": {"color": "rgba(123, 158, 83, 0.85)", "width": 1},
-        },
+        marker={"color": "rgba(181, 211, 143, 0.55)",
+                "line": {"color": "rgba(123, 158, 83, 0.85)", "width": 1}},
         customdata=date_details.to_numpy(),
         hovertemplate=(
             "<b>Attempts</b><br>Volume step: %{x:.1f} mL<br>"
-            "Number of attempts: %{y:.0f}<br>"
-            "First attempt: %{customdata[0]}<br>"
+            "Number of attempts: %{y:.0f}<br>First attempt: %{customdata[0]}<br>"
             "Last attempt: %{customdata[1]}<extra></extra>"
         ),
     ))
-    figure.add_trace(go.Scatter(
-        x=data["Volume Step (mL)"],
-        y=data["Max Loadcell Left (bar)"],
-        mode="lines+markers",
-        name="Max Loadcell Left (bar)",
-        line={"color": "#0057B8", "width": 4, "shape": "hv"},
-        marker={"size": 9, "color": "#0057B8", "symbol": "circle"},
-        hovertemplate=(
-            "<b>Max Loadcell Left</b><br>Volume step: %{x:.1f} mL<br>"
-            "Maximum pressure: %{y:.2f} bar<extra></extra>"
-        ),
-    ))
-    figure.add_trace(go.Scatter(
-        x=data["Volume Step (mL)"],
-        y=data["Max Loadcell Right (bar)"],
-        mode="lines+markers",
-        name="Max Loadcell Right (bar)",
-        line={"color": "#D62728", "width": 4, "shape": "hv"},
-        marker={"size": 9, "color": "#D62728", "symbol": "diamond"},
-        hovertemplate=(
-            "<b>Max Loadcell Right</b><br>Volume step: %{x:.1f} mL<br>"
-            "Maximum pressure: %{y:.2f} bar<extra></extra>"
-        ),
-    ))
 
-    x_max = max(
-        231.0,
-        float(data["Volume Step (mL)"].max()) + PREMIXING_VOLUME_STEP_ML
-        if not data.empty else 231.0,
-    )
+    if pressure_mode == "Pressure Step":
+        figure.add_trace(go.Scatter(
+            x=data["Volume Step (mL)"], y=data["Pressure Step (bar)"],
+            mode="lines+markers", name="Pressure Step (bar)",
+            line={"color": "#7030A0", "width": 4, "shape": "hv"},
+            marker={"size": 9, "color": "#7030A0", "symbol": "square"},
+            hovertemplate=(
+                "<b>Pressure Step</b><br>Volume step: %{x:.1f} mL<br>"
+                "Recipe pressure step: %{y:.0f} bar<extra></extra>"
+            ),
+        ))
+    else:
+        figure.add_trace(go.Scatter(
+            x=data["Volume Step (mL)"], y=data["Max Loadcell Left (bar)"],
+            mode="lines+markers", name="Max Loadcell Left (bar)",
+            line={"color": "#0057B8", "width": 4, "shape": "hv"},
+            marker={"size": 9, "color": "#0057B8", "symbol": "circle"},
+            hovertemplate=(
+                "<b>Max Loadcell Left</b><br>Volume step: %{x:.1f} mL<br>"
+                "Maximum pressure: %{y:.2f} bar<extra></extra>"
+            ),
+        ))
+        figure.add_trace(go.Scatter(
+            x=data["Volume Step (mL)"], y=data["Max Loadcell Right (bar)"],
+            mode="lines+markers", name="Max Loadcell Right (bar)",
+            line={"color": "#D62728", "width": 4, "shape": "hv"},
+            marker={"size": 9, "color": "#D62728", "symbol": "diamond"},
+            hovertemplate=(
+                "<b>Max Loadcell Right</b><br>Volume step: %{x:.1f} mL<br>"
+                "Maximum pressure: %{y:.2f} bar<extra></extra>"
+            ),
+        ))
+
     max_attempts = int(data["Attempts"].max()) if not data.empty else 1
     figure.update_layout(
-        title={
-            "text": f"{batch_number} | EXTRUDER-{int(extruder)} PRE-MIXING",
-            "x": 0.5,
-            "xanchor": "center",
-            "y": 0.97,
-            "yanchor": "top",
-            "font": {"family": "Times New Roman", "size": font_size, "color": "#000000"},
-        },
-        xaxis={
-            "title": {"text": "<b>VOLUME STEP (mL)</b>", "standoff": 18},
-            "range": [0, x_max],
-            "dtick": PREMIXING_VOLUME_STEP_ML,
-            "showgrid": True,
-            "gridcolor": "#D9E1EA",
-        },
-        yaxis={
-            "title": {"text": "<b>MAX PRESSURE (bar)</b>", "standoff": 12},
-            "range": [0, 200],
-            "dtick": 20,
-            "showgrid": True,
-            "gridcolor": "#D9E1EA",
-        },
-        yaxis2={
-            "title": {"text": "<b>ATTEMPTS</b>", "standoff": 12},
-            "overlaying": "y",
-            "side": "right",
-            "range": [0, max(4, max_attempts + 1)],
-            "dtick": 1,
-            "showgrid": False,
-        },
-        barmode="overlay",
-        hovermode="x unified",
-        legend={
-            "orientation": "h",
-            "x": 0.5,
-            "xanchor": "center",
-            "y": 1.03,
-            "yanchor": "bottom",
-            "font": {"family": "Times New Roman", "size": font_size},
-            "bgcolor": "rgba(255,255,255,0.9)",
-        },
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        height=720,
+        title={"text": f"{batch_number} | EXTRUDER-{int(extruder)} PRE-MIXING",
+               "x": 0.5, "xanchor": "center", "y": 0.97, "yanchor": "top",
+               "font": {"family": "Times New Roman", "size": 12, "color": "#000000"}},
+        font={"family": "Times New Roman", "size": 12, "color": "#000000"},
+        xaxis={"title": {"text": "<b>VOLUME STEP (mL)</b>", "standoff": 18},
+               "range": [0, 198], "dtick": PREMIXING_VOLUME_STEP_ML,
+               "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+        yaxis={"title": {"text": "<b>PRESSURE (bar)</b>", "standoff": 12},
+               "range": [0, 200], "dtick": 15 if pressure_mode == "Pressure Step" else 20,
+               "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+        yaxis2={"title": {"text": "<b>ATTEMPTS</b>", "standoff": 12},
+                "overlaying": "y", "side": "right",
+                "range": [0, max(4, max_attempts + 1)], "dtick": 1, "showgrid": False},
+        barmode="overlay", hovermode="x unified",
+        legend={"orientation": "h", "x": 0.5, "xanchor": "center",
+                "y": 1.03, "yanchor": "bottom",
+                "font": {"family": "Times New Roman", "size": 12},
+                "bgcolor": "rgba(255,255,255,0.9)"},
+        plot_bgcolor="white", paper_bgcolor="white", height=720,
         margin={"l": 90, "r": 90, "t": 150, "b": 90},
     )
-    return apply_graph_typography(figure, font_size)
+    return figure
 
 
 def build_wetting_rise_time_table(wetting_data):
@@ -1039,7 +936,7 @@ def build_blending_max_pressure_table(blending_data):
     ).reset_index(drop=True)
 
 
-def create_blending_pressure_plot(table, extruder, phase, batch_number, font_size=12):
+def create_blending_pressure_plot(table, extruder, phase, batch_number):
     """Create an interactive maximum-pressure plot for one Blending phase."""
     data = table[
         table["Extruder"].eq(extruder)
@@ -1099,17 +996,17 @@ def create_blending_pressure_plot(table, extruder, phase, batch_number, font_siz
             "text": f"{batch_number}<br>EXTRUDER - {int(extruder)} | {phase}",
             "x": 0.5, "xanchor": "center",
         },
-        xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
-        xaxis={"range": [0, expected_cycles + 2], "showgrid": True},
-        yaxis={"range": [0, y_max], "showgrid": True},
+        xaxis_title="Cycles", yaxis_title="Maximum Pressure (bar)",
+        xaxis={"range": [0, expected_cycles + 2], "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+        yaxis={"range": [0, y_max], "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
         hovermode="closest",
         legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.20},
         height=620,
         margin={"l": 70, "r": 30, "t": 100, "b": 120},
     )
-    return apply_graph_typography(figure, font_size)
+    return figure
 
-def create_mixing_pressure_plot(table, extruder, orifice, batch_number, font_size=12):
+def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
     """Create an interactive maximum-pressure-by-cycle chart."""
     data = table[
         table["Extruder"].eq(extruder) & table["Orifice"].eq(orifice)
@@ -1172,18 +1069,18 @@ def create_mixing_pressure_plot(table, extruder, orifice, batch_number, font_siz
             "x": 0.5,
             "xanchor": "center",
         },
-        xaxis_title="<b>Cycles</b>",
-        yaxis_title="<b>Maximum Pressure (bar)</b>",
-        xaxis={"dtick": 1, "range": [0.5, max_cycle + 0.5], "showgrid": True},
-        yaxis={"range": [0, y_max], "showgrid": True},
+        xaxis_title="Cycles",
+        yaxis_title="Maximum Pressure (bar)",
+        xaxis={"dtick": 1, "range": [0.5, max_cycle + 0.5], "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+        yaxis={"range": [0, y_max], "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
         hovermode="closest",
         legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.20},
         height=620,
         margin={"l": 70, "r": 30, "t": 100, "b": 120},
     )
-    return apply_graph_typography(figure, font_size)
+    return figure
 
-def create_wetting_rise_time_plot(table, batch_number, limit, font_size=12):
+def create_wetting_rise_time_plot(table, batch_number, limit):
     """Create an interactive Plotly chart with point-level hover details."""
     normalized_steps = (
         table["Step Name"].astype(str)
@@ -1255,20 +1152,66 @@ def create_wetting_rise_time_plot(table, batch_number, limit, font_size=12):
     )
     figure.update_layout(
         title={"text": str(batch_number), "x": 0.5, "xanchor": "center"},
-        xaxis_title="<b>Time taken to reach vacuum rise (min)</b>",
-        yaxis_title="<b>Rise time (Sec)</b>",
-        xaxis={"range": [0, x_max], "showgrid": True},
-        yaxis={"range": [0, max(700.0, limit * 1.15)], "showgrid": True},
+        xaxis_title="Time taken to reach vacuum rise (min)",
+        yaxis_title="Rise time (Sec)",
+        xaxis={"range": [0, x_max], "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+        yaxis={"range": [0, max(700.0, limit * 1.15)], "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
         hovermode="closest",
         legend={"x": 0.72, "y": 0.45, "bgcolor": "rgba(255,255,255,0.65)"},
         height=700,
         margin={"l": 70, "r": 30, "t": 80, "b": 70},
     )
-    return apply_graph_typography(figure, font_size)
+    return figure
 
 
 def figure_to_png(fig):
     buffer = io.BytesIO(); fig.savefig(buffer, format="png", dpi=200, bbox_inches="tight"); return buffer.getvalue()
+
+
+def create_editable_interactive_html(figure, x_axis_label="X-axis scale"):
+    """Export Plotly HTML with editable labels and an interactive x-axis range slider."""
+    html_figure = go.Figure(figure)
+    html_figure.update_xaxes(
+        rangeslider={"visible": True, "thickness": 0.08},
+        fixedrange=False,
+    )
+    html_figure.update_layout(
+        dragmode="zoom",
+        margin={**dict(html_figure.layout.margin.to_plotly_json()), "b": 130},
+        annotations=list(html_figure.layout.annotations or ()) + [
+            {
+                "text": (
+                    "Editable HTML: drag the title, legend and annotations; "
+                    "use the range slider or zoom tools to change the x-axis scale."
+                ),
+                "xref": "paper", "yref": "paper", "x": 0, "y": -0.24,
+                "showarrow": False, "xanchor": "left",
+                "font": {"family": "Times New Roman", "size": 12, "color": "#333333"},
+            }
+        ],
+    )
+    config = {
+        "editable": True,
+        "edits": {
+            "annotationPosition": True,
+            "annotationText": True,
+            "axisTitleText": True,
+            "legendPosition": True,
+            "legendText": True,
+            "shapePosition": True,
+            "titleText": True,
+        },
+        "displaylogo": False,
+        "scrollZoom": True,
+        "responsive": True,
+        "toImageButtonOptions": {"format": "png", "scale": 2},
+    }
+    return pio.to_html(
+        html_figure,
+        include_plotlyjs=True,
+        full_html=True,
+        config=config,
+    ).encode("utf-8")
 
 
 def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected, process_ranges, wetting_rise_table, mixing_pressure_table, blending_pressure_table, premix_prepared, premix_blocks, premix_pairs, premix_prediction, premix_summary):
@@ -1300,7 +1243,6 @@ def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejec
 def main():
     st.title("🧪 Complete Batch Process Report Extractor")
     st.caption("Extracts Process Overview, recipe settings, complete datalogs, diagnostics, and Wetting rise-time analysis.")
-    graph_font_size = graph_font_controls()
     uploaded = st.file_uploader("Upload Batch Cycle Report PDF", type=["pdf"])
     if uploaded is None: st.info("Upload a batch-report PDF to begin."); st.stop()
     try:
@@ -1370,7 +1312,7 @@ def main():
             st.dataframe(table_view, use_container_width=True, hide_index=True, height=430)
             batch_number = batch.get("Batch no.") or "Batch"
             interactive_figure = create_wetting_rise_time_plot(
-                table_view, batch_number, limit, graph_font_size
+                table_view, batch_number, limit
             )
             st.plotly_chart(
                 interactive_figure,
@@ -1388,15 +1330,14 @@ def main():
                     },
                 },
             )
-            render_copy_graph_button("Copy Wetting Graph", key="wetting_copy")
             st.caption(
                 "Move the cursor over any point to view Extruder, timestamp, Step Name, "
                 "elapsed time, rise time, paired Vacuum Timer timestamp, and source page. "
                 "Use the chart toolbar to zoom, pan, reset, or download a PNG."
             )
-            interactive_html = pio.to_html(
-                interactive_figure, include_plotlyjs="cdn", full_html=True
-            ).encode("utf-8")
+            interactive_html = create_editable_interactive_html(
+                interactive_figure, "Elapsed time"
+            )
             x1, x2 = st.columns(2)
             x1.download_button(
                 "Download Rise-Time Table CSV",
@@ -1456,7 +1397,6 @@ def main():
                     selected_mixing_extruder,
                     orifice,
                     batch_number_for_mixing,
-                    graph_font_size,
                 )
                 st.plotly_chart(
                     mixing_figure,
@@ -1477,32 +1417,42 @@ def main():
                     },
                     key=f"mixing_chart_{selected_mixing_extruder}_{orifice}",
                 )
-                render_copy_graph_button(
-                    "Copy Mixing Graph",
-                    key=f"mixing_copy_{selected_mixing_extruder}_{orifice}",
-                )
 
             mixing_html_figure = go.Figure()
+            mixing_colors = ["#0057B8", "#D62728", "#2E8B57", "#FF8C00", "#7030A0", "#008B8B"]
+            mixing_symbols = ["circle", "diamond", "square", "triangle-up", "x", "star"]
+            mixing_dashes = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
+            mixing_style_index = 0
             for orifice in selected_orifices:
                 source_figure = create_mixing_pressure_plot(
                     mixing_pressure_table,
                     selected_mixing_extruder,
                     orifice,
                     batch_number_for_mixing,
-                    graph_font_size,
                 )
                 for trace in source_figure.data:
+                    color = mixing_colors[mixing_style_index % len(mixing_colors)]
+                    symbol = mixing_symbols[mixing_style_index % len(mixing_symbols)]
+                    dash = mixing_dashes[mixing_style_index % len(mixing_dashes)]
                     trace.name = f"{orifice} | {trace.name}"
+                    trace.line.color = color
+                    trace.line.dash = dash
+                    trace.line.width = 3
+                    trace.marker.color = color
+                    trace.marker.symbol = symbol
+                    trace.marker.size = 9
                     mixing_html_figure.add_trace(trace)
+                    mixing_style_index += 1
             mixing_html_figure.update_layout(
                 title=f"{batch_number_for_mixing} | Extruder {selected_mixing_extruder} | Mixing Max Pressure",
                 xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
+                xaxis={"showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+                yaxis={"showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
                 hovermode="closest", height=700,
             )
-            apply_graph_typography(mixing_html_figure, graph_font_size)
-            mixing_html = pio.to_html(
-                mixing_html_figure, include_plotlyjs="cdn", full_html=True
-            ).encode("utf-8")
+            mixing_html = create_editable_interactive_html(
+                mixing_html_figure, "Cycles"
+            )
             m1, m2 = st.columns(2)
             m1.download_button(
                 "Download Mixing Max-Pressure Table CSV",
@@ -1565,7 +1515,6 @@ def main():
                     selected_blending_extruder,
                     phase,
                     batch_number_for_blending,
-                    graph_font_size,
                 )
                 st.plotly_chart(
                     blending_figure,
@@ -1584,36 +1533,45 @@ def main():
                     },
                     key=f"blending_chart_{selected_blending_extruder}_{phase}",
                 )
-                render_copy_graph_button(
-                    "Copy Blending Graph",
-                    key=f"blending_copy_{selected_blending_extruder}_{phase}",
-                )
 
             combined_blending_figure = go.Figure()
+            blending_colors = ["#0057B8", "#D62728", "#2E8B57", "#FF8C00"]
+            blending_symbols = ["circle", "diamond", "triangle-up", "square"]
+            blending_dashes = ["solid", "dash", "dot", "dashdot"]
+            blending_style_index = 0
             for phase in selected_phases:
                 source_figure = create_blending_pressure_plot(
                     blending_pressure_table,
                     selected_blending_extruder,
                     phase,
                     batch_number_for_blending,
-                    graph_font_size,
                 )
                 for trace in source_figure.data:
+                    color = blending_colors[blending_style_index % len(blending_colors)]
+                    symbol = blending_symbols[blending_style_index % len(blending_symbols)]
+                    dash = blending_dashes[blending_style_index % len(blending_dashes)]
                     trace.name = f"{phase} | {trace.name}"
+                    trace.line.color = color
+                    trace.line.dash = dash
+                    trace.line.width = 3
+                    trace.marker.color = color
+                    trace.marker.symbol = symbol
+                    trace.marker.size = 9
                     combined_blending_figure.add_trace(trace)
+                    blending_style_index += 1
             combined_blending_figure.update_layout(
                 title=(
                     f"{batch_number_for_blending} | Extruder "
                     f"{selected_blending_extruder} | Blending Max Pressure"
                 ),
                 xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
+                xaxis={"showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+                yaxis={"showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
                 hovermode="closest", height=700,
             )
-            apply_graph_typography(combined_blending_figure, graph_font_size)
-            blending_html = pio.to_html(
-                combined_blending_figure,
-                include_plotlyjs="cdn", full_html=True,
-            ).encode("utf-8")
+            blending_html = create_editable_interactive_html(
+                combined_blending_figure, "Cycles"
+            )
             b1, b2 = st.columns(2)
             b1.download_button(
                 "Download Blending Max-Pressure Table CSV",
@@ -1633,9 +1591,8 @@ def main():
         st.caption(
             "Cylinder diameter = 80.1 mm for all extruders. Direction is inferred from "
             "servo-speed signs. Opposite movement blocks are paired using same-cycle "
-            "preference. A higher cycle number is a repeat attempt. At a 3-to-1 reset, "
-            "the app checks normalized pressure and standard left-pushed volume within "
-            "+/-1.0 mL. Consecutive Cycle 1 attempts advance the volume step."
+            "preference. Select Actual Max Pressure or the inferred 15-bar Pressure Step. "
+            "The Premixing x-axis is fixed from 0 to 198 mL."
         )
         if premix_summary.empty:
             st.warning("No Premixing bidirectional volume-step analysis was generated.")
@@ -1648,12 +1605,22 @@ def main():
             summary_view = premix_summary[
                 premix_summary["Extruder"].eq(selected_premix_extruder)
             ].copy()
+            selected_premix_pressure_mode = st.radio(
+                "Pressure to plot",
+                options=["Actual Max Pressure", "Pressure Step"],
+                horizontal=True,
+                key="premixing_pressure_plot_mode",
+                help=(
+                    "Actual Max Pressure plots left and right loadcell maxima. "
+                    "Pressure Step plots the inferred 15-bar recipe steps."
+                ),
+            )
             batch_number_for_premix = batch.get("Batch no.") or "Batch"
             premix_figure = create_premixing_volume_step_plot(
                 premix_summary,
                 selected_premix_extruder,
                 batch_number_for_premix,
-                graph_font_size,
+                selected_premix_pressure_mode,
             )
             st.plotly_chart(
                 premix_figure,
@@ -1671,10 +1638,6 @@ def main():
                     },
                 },
                 key=f"premix_chart_{selected_premix_extruder}",
-            )
-            render_copy_graph_button(
-                "Copy Premixing Graph",
-                key=f"premixing_copy_{selected_premix_extruder}",
             )
             st.dataframe(
                 summary_view, use_container_width=True,
@@ -1703,9 +1666,9 @@ def main():
                     use_container_width=True, hide_index=True, height=450,
                 )
 
-            premix_html = pio.to_html(
-                premix_figure, include_plotlyjs="cdn", full_html=True
-            ).encode("utf-8")
+            premix_html = create_editable_interactive_html(
+                premix_figure, "Volume step"
+            )
             p1, p2 = st.columns(2)
             p1.download_button(
                 "Download Premixing Volume-Step Summary CSV",
