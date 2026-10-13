@@ -32,7 +32,7 @@ PREMIXING_CYLINDER_AREA_MM2 = (
 )
 PREMIXING_VOLUME_PER_MM_ML = PREMIXING_CYLINDER_AREA_MM2 / 1000
 PREMIXING_TARGET_ACHIEVEMENT_PERCENT = 95.0
-PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR = 2.0
+PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR = 0.5
 PREMIXING_SPEED_DIRECTION_TOLERANCE = 0.005
 
 
@@ -52,7 +52,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-premixing-strict-pressure-increase-v7"
+    parser_version = "2026.10.13-premixing-pressure-tolerance-0.5-v8"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -464,13 +464,14 @@ def reverse_predict_premixing_volume_step(paired_attempts):
     - Logged cycle 2 or 3 means another attempt at the same volume step.
     - When the cycle returns to 1, compare the current maximum actual pressure
       with the highest maximum actual pressure already observed in that extruder.
-    - Any positive increase, even 0.1 bar, is a pressure increase and keeps the
-      same volume step.
+    - A pressure rise is recognized only when the current maximum pressure is
+      more than 0.5 bar above the previous highest pressure.
     - If cycle returns to 1 without a pressure increase, advance the cumulative
       volume step by 16.5 mL.
 
-    No pressure rounding, 15-bar binning, or pressure tolerance is used for
-    deciding whether the volume step advances.
+    No pressure rounding or 15-bar binning is used. A strict 0.5-bar
+    tolerance is applied: an increase of exactly 0.5 bar is not classified as
+    a pressure increase; the increase must be greater than 0.5 bar.
     """
     if paired_attempts.empty:
         return pd.DataFrame()
@@ -489,7 +490,8 @@ def reverse_predict_premixing_volume_step(paired_attempts):
 
             pressure_increased = (
                 highest_pressure_seen is not None
-                and actual_pressure > highest_pressure_seen
+                and actual_pressure
+                > highest_pressure_seen + PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR
             )
             previous_highest_pressure = highest_pressure_seen
 
