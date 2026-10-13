@@ -35,6 +35,7 @@ PREMIXING_VOLUME_PER_MM_ML = PREMIXING_CYLINDER_AREA_MM2 / 1000
 PREMIXING_TARGET_ACHIEVEMENT_PERCENT = 95.0
 PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR = 0.5
 PREMIXING_SPEED_DIRECTION_TOLERANCE = 0.005
+PREMIXING_LEFT_VOLUME_MATCH_TOLERANCE_ML = 1.0
 
 
 def parse_dt(value):
@@ -53,7 +54,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-premixing-pressure-normalization-v9"
+    parser_version = "2026.10.13-premixing-left-volume-check-v11"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -472,8 +473,32 @@ def normalize_premixing_pressure(actual_pressure):
     return int(lower_bar if decimal_part <= 0.5 else lower_bar + 1)
 
 
+def expected_premixing_left_volume(volume_step_ml):
+    """Return the standard left-pushed volume for a cumulative volume step."""
+    if pd.isna(volume_step_ml):
+        return np.nan
+    return 2 * float(volume_step_ml) - PREMIXING_VOLUME_STEP_ML
+
+
 def reverse_predict_premixing_volume_step(paired_attempts):
-    """Reconstruct Premixing volume step from cycle and normalized pressure."""
+    """Reconstruct Premixing volume step using cycle, pressure, and left volume.
+
+    Decision order:
+    1. The first attempt starts at 16.5 mL.
+    2. If the current cycle is higher than the previous cycle, the attempt is a
+       repeat at the same volume step.
+    3. If the cycle resets from 3 to 1:
+       a. If normalized pressure increased, retain the same volume step.
+       b. Otherwise compare actual L-to-R pushed volume with the standard left
+          volume, calculated as (2 x current volume step) - 16.5 mL.
+       c. If the difference is within +/-1.0 mL, retain the same volume step.
+       d. Otherwise advance the volume step by 16.5 mL.
+    4. For every other Cycle 1 occurrence, including Cycle 1 followed by Cycle
+       1, advance the volume step by 16.5 mL.
+
+    Pressure normalization uses the approved 0.5-bar rule: decimal values up to
+    and including 0.5 round down; values above 0.5 round up.
+    """
     if paired_attempts.empty:
         return pd.DataFrame()
 
@@ -481,46 +506,74 @@ def reverse_predict_premixing_volume_step(paired_attempts):
     for extruder, attempts in paired_attempts.groupby("Extruder", sort=True):
         volume_step_number = 1
         volume_step_size = PREMIXING_VOLUME_STEP_ML
-        highest_normalized_pressure = None
+        highest_normalized_pressure = int(PREMIXING_PRESSURE_STEP_BAR)
+        previous_cycle = None
 
         ordered_attempts = attempts.sort_values("Start Date & Time", kind="stable")
         for attempt_number, (_, row) in enumerate(ordered_attempts.iterrows(), start=1):
             actual_cycle = row["Actual Logged Cycle"]
+            current_cycle = int(actual_cycle) if pd.notna(actual_cycle) else None
             actual_pressure = pd.to_numeric(
                 row["Maximum Actual Pressure (bar)"], errors="coerce"
             )
             normalized_pressure = normalize_premixing_pressure(actual_pressure)
             previous_highest = highest_normalized_pressure
             pressure_increased = (
-                previous_highest is not None
-                and pd.notna(normalized_pressure)
+                pd.notna(normalized_pressure)
                 and normalized_pressure > previous_highest
+            )
+
+            actual_left_volume = pd.to_numeric(
+                row["L-to-R Pushed Volume (mL)"], errors="coerce"
+            )
+            expected_left_volume = expected_premixing_left_volume(volume_step_size)
+            left_volume_difference = (
+                actual_left_volume - expected_left_volume
+                if pd.notna(actual_left_volume) and pd.notna(expected_left_volume)
+                else np.nan
+            )
+            left_volume_matches = (
+                pd.notna(left_volume_difference)
+                and abs(left_volume_difference)
+                <= PREMIXING_LEFT_VOLUME_MATCH_TOLERANCE_ML
             )
 
             if attempt_number == 1:
                 rule = "Initial volume step"
-            elif pd.notna(actual_cycle) and int(actual_cycle) in (2, 3):
-                rule = "Same volume step: repeat attempt"
-            elif pd.notna(actual_cycle) and int(actual_cycle) == 1:
+            elif (
+                current_cycle is not None
+                and previous_cycle is not None
+                and current_cycle > previous_cycle
+            ):
+                rule = "Same volume step: higher cycle repeat attempt"
+            elif previous_cycle == PREMIXING_REPEAT_CYCLES and current_cycle == 1:
                 if pressure_increased:
-                    rule = "Same volume step: normalized pressure increased"
+                    rule = "Same volume step: Cycle 3 to 1 pressure increase"
+                elif left_volume_matches:
+                    rule = "Same volume step: left volume matches standard"
                 else:
                     volume_step_number += 1
                     volume_step_size = volume_step_number * PREMIXING_VOLUME_STEP_ML
-                    rule = "Advanced by 16.5 mL"
+                    rule = (
+                        "Advanced by 16.5 mL: Cycle 3 to 1 without pressure "
+                        "increase or left-volume match"
+                    )
+            elif current_cycle == 1:
+                volume_step_number += 1
+                volume_step_size = volume_step_number * PREMIXING_VOLUME_STEP_ML
+                rule = "Advanced by 16.5 mL: Cycle 1 did not increase"
             else:
-                rule = "Same volume step: cycle unavailable"
+                rule = "Same volume step: cycle sequence review"
 
             if pd.notna(normalized_pressure):
-                highest_normalized_pressure = (
-                    normalized_pressure
-                    if highest_normalized_pressure is None
-                    else max(highest_normalized_pressure, normalized_pressure)
+                highest_normalized_pressure = max(
+                    highest_normalized_pressure, normalized_pressure
                 )
 
             output.append({
                 **row.to_dict(),
                 "Attempt Number": attempt_number,
+                "Previous Logged Cycle": previous_cycle,
                 "Volume step size (mL)": volume_step_size,
                 "Volume Step Number": volume_step_number,
                 "Volume Step Rule": rule,
@@ -529,7 +582,14 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                 "Previous Highest Normalized Pressure (bar)": previous_highest,
                 "Highest Normalized Pressure Seen (bar)": highest_normalized_pressure,
                 "Pressure Increased": "Yes" if pressure_increased else "No",
+                "Expected Left Volume (mL)": expected_left_volume,
+                "Actual Left Volume (mL)": actual_left_volume,
+                "Left Volume Difference (mL)": left_volume_difference,
+                "Left Volume Matches Standard": "Yes" if left_volume_matches else "No",
             })
+
+            if current_cycle is not None:
+                previous_cycle = current_cycle
 
     return pd.DataFrame(output)
 
@@ -1489,9 +1549,9 @@ def main():
         st.caption(
             "Cylinder diameter = 80.1 mm for all extruders. Direction is inferred from "
             "servo-speed signs. Opposite movement blocks are paired using same-cycle "
-            "preference. Volume step is reconstructed dynamically from each batch's "
-            "logged-cycle sequence and normalized maximum pressure. Decimal values up to "
-            "0.5 round down, while values above 0.5 round up. No fixed attempt count is used."
+            "preference. A higher cycle number is a repeat attempt. At a 3-to-1 reset, "
+            "the app checks normalized pressure and the standard left-pushed volume, using "
+            "a +/-1.0 mL volume tolerance. Consecutive Cycle 1 attempts advance the step."
         )
         if premix_summary.empty:
             st.warning("No Premixing bidirectional volume-step analysis was generated.")
