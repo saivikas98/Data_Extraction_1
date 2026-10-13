@@ -54,7 +54,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-interactive-html-controls-v15"
+    parser_version = "2026.10.13-axis-scale-font-border-v16"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -685,10 +685,10 @@ def create_premixing_volume_step_plot(
         font={"family": "Times New Roman", "size": 12, "color": "#000000"},
         xaxis={"title": {"text": "<b>VOLUME STEP (mL)</b>", "standoff": 18},
                "range": [0, 198], "dtick": PREMIXING_VOLUME_STEP_ML,
-               "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+               "showgrid": False, },
         yaxis={"title": {"text": "<b>PRESSURE (bar)</b>", "standoff": 12},
                "range": [0, 200], "dtick": 15 if pressure_mode == "Pressure Step" else 20,
-               "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+               "showgrid": False, },
         yaxis2={"title": {"text": "<b>ATTEMPTS</b>", "standoff": 12},
                 "overlaying": "y", "side": "right",
                 "range": [0, max(4, max_attempts + 1)], "dtick": 1, "showgrid": False},
@@ -997,8 +997,8 @@ def create_blending_pressure_plot(table, extruder, phase, batch_number):
             "x": 0.5, "xanchor": "center",
         },
         xaxis_title="Cycles", yaxis_title="Maximum Pressure (bar)",
-        xaxis={"range": [0, expected_cycles + 2], "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
-        yaxis={"range": [0, y_max], "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+        xaxis={"range": [0, expected_cycles + 2], "showgrid": False, },
+        yaxis={"range": [0, y_max], "showgrid": False, },
         hovermode="closest",
         legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.20},
         height=620,
@@ -1071,8 +1071,8 @@ def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
         },
         xaxis_title="Cycles",
         yaxis_title="Maximum Pressure (bar)",
-        xaxis={"dtick": 1, "range": [0.5, max_cycle + 0.5], "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
-        yaxis={"range": [0, y_max], "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+        xaxis={"dtick": 1, "range": [0.5, max_cycle + 0.5], "showgrid": False, },
+        yaxis={"range": [0, y_max], "showgrid": False, },
         hovermode="closest",
         legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.20},
         height=620,
@@ -1154,8 +1154,8 @@ def create_wetting_rise_time_plot(table, batch_number, limit):
         title={"text": str(batch_number), "x": 0.5, "xanchor": "center"},
         xaxis_title="Time taken to reach vacuum rise (min)",
         yaxis_title="Rise time (Sec)",
-        xaxis={"range": [0, x_max], "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
-        yaxis={"range": [0, max(700.0, limit * 1.15)], "showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+        xaxis={"range": [0, x_max], "showgrid": False, },
+        yaxis={"range": [0, max(700.0, limit * 1.15)], "showgrid": False, },
         hovermode="closest",
         legend={"x": 0.72, "y": 0.45, "bgcolor": "rgba(255,255,255,0.65)"},
         height=700,
@@ -1168,50 +1168,90 @@ def figure_to_png(fig):
     buffer = io.BytesIO(); fig.savefig(buffer, format="png", dpi=200, bbox_inches="tight"); return buffer.getvalue()
 
 
-def create_editable_interactive_html(figure, x_axis_label="X-axis scale"):
-    """Export Plotly HTML with editable labels and an interactive x-axis range slider."""
+def apply_graph_style(figure, font_family="Times New Roman", font_size=12):
+    """Apply typography, remove grids, and draw the inner plot border."""
+    size = int(font_size)
+    figure.update_layout(
+        font={"family": font_family, "size": size, "color": "#000000"},
+        title_font={"family": font_family, "size": size, "color": "#000000"},
+        legend_font={"family": font_family, "size": size, "color": "#000000"},
+        paper_bgcolor="white", plot_bgcolor="white",
+    )
+    figure.update_xaxes(showgrid=False, showline=True, mirror=True, linewidth=1.5,
+        linecolor="#000000", ticks="outside",
+        tickfont={"family": font_family, "size": size, "color": "#000000"},
+        title_font={"family": font_family, "size": size, "color": "#000000"})
+    figure.update_yaxes(showgrid=False, showline=True, mirror=True, linewidth=1.5,
+        linecolor="#000000", ticks="outside",
+        tickfont={"family": font_family, "size": size, "color": "#000000"},
+        title_font={"family": font_family, "size": size, "color": "#000000"})
+    return figure
+
+
+def graph_display_controls():
+    """Sidebar font controls shared by every graph."""
+    with st.sidebar:
+        st.markdown("### Graph Controls")
+        family = st.selectbox("Graph font", ["Times New Roman", "Arial", "Calibri", "Georgia"], index=0, key="graph_font_family")
+        preset = st.selectbox("Graph font size", ["10 pt", "12 pt", "14 pt", "16 pt", "18 pt", "20 pt", "Custom"], index=1, key="graph_font_size_preset")
+        if preset == "Custom":
+            size = int(st.number_input("Custom font size", min_value=8, max_value=30, value=12, step=1, key="graph_custom_font_size"))
+        else:
+            size = int(preset.split()[0])
+    return family, size
+
+
+def create_editable_interactive_html(figure, x_axis_label="X axis"):
+    """Export HTML with movable labels and manual X/Y limits and font controls."""
     html_figure = go.Figure(figure)
-    html_figure.update_xaxes(
-        rangeslider={"visible": True, "thickness": 0.08},
-        fixedrange=False,
-    )
-    html_figure.update_layout(
-        dragmode="zoom",
-        margin={**dict(html_figure.layout.margin.to_plotly_json()), "b": 130},
-        annotations=list(html_figure.layout.annotations or ()) + [
-            {
-                "text": (
-                    "Editable HTML: drag the title, legend and annotations; "
-                    "use the range slider or zoom tools to change the x-axis scale."
-                ),
-                "xref": "paper", "yref": "paper", "x": 0, "y": -0.24,
-                "showarrow": False, "xanchor": "left",
-                "font": {"family": "Times New Roman", "size": 12, "color": "#333333"},
-            }
-        ],
-    )
+    html_figure.update_xaxes(rangeslider={"visible": False}, fixedrange=False)
+    html_figure.update_yaxes(fixedrange=False)
+    apply_graph_style(html_figure, html_figure.layout.font.family or "Times New Roman", html_figure.layout.font.size or 12)
     config = {
         "editable": True,
-        "edits": {
-            "annotationPosition": True,
-            "annotationText": True,
-            "axisTitleText": True,
-            "legendPosition": True,
-            "legendText": True,
-            "shapePosition": True,
-            "titleText": True,
-        },
-        "displaylogo": False,
-        "scrollZoom": True,
-        "responsive": True,
+        "edits": {"annotationPosition": True, "annotationText": True,
+                  "axisTitleText": True, "legendPosition": True,
+                  "legendText": True, "shapePosition": True, "titleText": True},
+        "displaylogo": False, "scrollZoom": True, "responsive": True,
         "toImageButtonOptions": {"format": "png", "scale": 2},
     }
-    return pio.to_html(
-        html_figure,
-        include_plotlyjs=True,
-        full_html=True,
-        config=config,
-    ).encode("utf-8")
+    html = pio.to_html(html_figure, include_plotlyjs=True, full_html=True,
+                       config=config, div_id="editable_plot")
+    controls = """
+<style>
+body { margin:0; background:#fff; font-family:'Times New Roman',serif; }
+#graph_editor_panel { margin:10px auto; padding:10px 12px; width:calc(100% - 44px); border:1.5px solid #000; background:#f7f7f7; box-sizing:border-box; display:flex; flex-wrap:wrap; gap:8px 12px; align-items:end; }
+#graph_editor_panel label { font-weight:bold; font-size:12px; }
+#graph_editor_panel input,#graph_editor_panel select,#graph_editor_panel button { font-family:inherit; font-size:12px; padding:4px 6px; }
+#editable_plot { margin:10px 20px 20px 20px; border:2px solid #000; box-sizing:border-box; }
+.editor_field { display:flex; flex-direction:column; gap:2px; }
+</style>
+<div id="graph_editor_panel">
+<div class="editor_field"><label>X minimum</label><input id="x_min" type="number" step="any"></div>
+<div class="editor_field"><label>X maximum</label><input id="x_max" type="number" step="any"></div>
+<div class="editor_field"><label>Y minimum</label><input id="y_min" type="number" step="any"></div>
+<div class="editor_field"><label>Y maximum</label><input id="y_max" type="number" step="any"></div>
+<div class="editor_field"><label>Font</label><select id="font_family"><option>Times New Roman</option><option>Arial</option><option>Calibri</option><option>Georgia</option></select></div>
+<div class="editor_field"><label>Font size</label><input id="font_size" type="number" min="8" max="40" value="12"></div>
+<button id="apply_graph_settings">Apply</button><button id="auto_scale">Auto scale</button>
+<span><b>Tip:</b> drag the title, legend and annotations directly in the graph.</span>
+</div>
+<script>
+window.addEventListener('load',function(){
+ const plot=document.getElementById('editable_plot'),layout=plot.layout||{};
+ const xr=layout.xaxis&&layout.xaxis.range?layout.xaxis.range:[],yr=layout.yaxis&&layout.yaxis.range?layout.yaxis.range:[];
+ if(xr.length===2){x_min.value=xr[0];x_max.value=xr[1];} if(yr.length===2){y_min.value=yr[0];y_max.value=yr[1];}
+ if(layout.font&&layout.font.family)font_family.value=layout.font.family; if(layout.font&&layout.font.size)font_size.value=layout.font.size;
+ apply_graph_settings.onclick=function(){
+  const xmin=parseFloat(x_min.value),xmax=parseFloat(x_max.value),ymin=parseFloat(y_min.value),ymax=parseFloat(y_max.value),family=font_family.value,size=parseInt(font_size.value||'12');
+  const u={'font.family':family,'font.size':size,'title.font.family':family,'title.font.size':size,'legend.font.family':family,'legend.font.size':size,'xaxis.tickfont.family':family,'xaxis.tickfont.size':size,'xaxis.title.font.family':family,'xaxis.title.font.size':size,'yaxis.tickfont.family':family,'yaxis.tickfont.size':size,'yaxis.title.font.family':family,'yaxis.title.font.size':size};
+  if(!Number.isNaN(xmin)&&!Number.isNaN(xmax)&&xmin<xmax)u['xaxis.range']=[xmin,xmax]; if(!Number.isNaN(ymin)&&!Number.isNaN(ymax)&&ymin<ymax)u['yaxis.range']=[ymin,ymax]; Plotly.relayout(plot,u);
+ };
+ auto_scale.onclick=function(){Plotly.relayout(plot,{'xaxis.autorange':true,'yaxis.autorange':true});x_min.value='';x_max.value='';y_min.value='';y_max.value='';};
+});
+</script>
+"""
+    return html.replace('<body>', '<body>'+controls).encode('utf-8')
 
 
 def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected, process_ranges, wetting_rise_table, mixing_pressure_table, blending_pressure_table, premix_prepared, premix_blocks, premix_pairs, premix_prediction, premix_summary):
@@ -1243,6 +1283,7 @@ def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejec
 def main():
     st.title("🧪 Complete Batch Process Report Extractor")
     st.caption("Extracts Process Overview, recipe settings, complete datalogs, diagnostics, and Wetting rise-time analysis.")
+    graph_font_family, graph_font_size = graph_display_controls()
     uploaded = st.file_uploader("Upload Batch Cycle Report PDF", type=["pdf"])
     if uploaded is None: st.info("Upload a batch-report PDF to begin."); st.stop()
     try:
@@ -1314,6 +1355,7 @@ def main():
             interactive_figure = create_wetting_rise_time_plot(
                 table_view, batch_number, limit
             )
+            apply_graph_style(interactive_figure, graph_font_family, graph_font_size)
             st.plotly_chart(
                 interactive_figure,
                 use_container_width=True,
@@ -1398,6 +1440,7 @@ def main():
                     orifice,
                     batch_number_for_mixing,
                 )
+                apply_graph_style(mixing_figure, graph_font_family, graph_font_size)
                 st.plotly_chart(
                     mixing_figure,
                     use_container_width=True,
@@ -1446,10 +1489,11 @@ def main():
             mixing_html_figure.update_layout(
                 title=f"{batch_number_for_mixing} | Extruder {selected_mixing_extruder} | Mixing Max Pressure",
                 xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
-                xaxis={"showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
-                yaxis={"showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+                xaxis={"showgrid": False, },
+                yaxis={"showgrid": False, },
                 hovermode="closest", height=700,
             )
+            apply_graph_style(mixing_html_figure, graph_font_family, graph_font_size)
             mixing_html = create_editable_interactive_html(
                 mixing_html_figure, "Cycles"
             )
@@ -1516,6 +1560,7 @@ def main():
                     phase,
                     batch_number_for_blending,
                 )
+                apply_graph_style(blending_figure, graph_font_family, graph_font_size)
                 st.plotly_chart(
                     blending_figure,
                     use_container_width=True,
@@ -1565,10 +1610,11 @@ def main():
                     f"{selected_blending_extruder} | Blending Max Pressure"
                 ),
                 xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
-                xaxis={"showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
-                yaxis={"showgrid": True, "gridcolor": "#7A7A7A", "gridwidth": 1.2},
+                xaxis={"showgrid": False, },
+                yaxis={"showgrid": False, },
                 hovermode="closest", height=700,
             )
+            apply_graph_style(combined_blending_figure, graph_font_family, graph_font_size)
             blending_html = create_editable_interactive_html(
                 combined_blending_figure, "Cycles"
             )
@@ -1622,6 +1668,7 @@ def main():
                 batch_number_for_premix,
                 selected_premix_pressure_mode,
             )
+            apply_graph_style(premix_figure, graph_font_family, graph_font_size)
             st.plotly_chart(
                 premix_figure,
                 use_container_width=True,
