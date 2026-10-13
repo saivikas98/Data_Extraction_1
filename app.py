@@ -545,7 +545,7 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                 if pressure_increased:
                     rule = "Same volume step: Cycle 3 to 1 pressure increase"
                 elif pushed_volume_within_target:
-                    rule = "Same volume step: L-to-R pushed volume <= target volume"
+                    rule = "Same volume step: L-to-R pushed volume <= target volume + 1"
                 else:
                     volume_step_number += 1
                     volume_step_size = volume_step_number * PREMIXING_VOLUME_STEP_ML
@@ -578,7 +578,7 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                 "Expected Left Volume (mL)": expected_left_volume,
                 "Actual Left Volume (mL)": actual_left_volume,
                 "Left Volume Difference (mL)": left_difference,
-                "L-to-R Pushed Volume <= Target Volume": (
+                "L-to-R Pushed Volume <= Target Volume + 1": (
                     "Yes" if pushed_volume_within_target else "No"
                 ),
             })
