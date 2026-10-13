@@ -52,7 +52,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-premixing-stateful-pressure-v3"
+    parser_version = "2026.10.13-premixing-attempts-cosmetic-v4"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -457,291 +457,222 @@ def predict_premixing_pressure_level(actual_pressure):
 
 
 def reverse_predict_premixing_volume_step(paired_attempts):
-    """Reconstruct volume-step size using only cycle and pressure-step changes.
+    """Reconstruct Premixing volume step from cycle and pressure escalation only.
 
-    Rule used:
-    - First attempt starts at 16.5 mL.
-    - Cycle 2 or 3 remains at the current volume step.
-    - When the logged cycle returns to 1:
-      * if the established pressure target increased, retain the same volume step;
-      * if the established pressure target did not increase, advance by 16.5 mL.
-    - The established pressure target is monotonic. It can increase in 15-bar
-      increments but cannot decrease because of a low measured peak in a repeat cycle.
-
-    Actual piston-volume achievement is retained for diagnostics only and does
-    not control the reconstructed volume-step sequence. This avoids distortion
-    caused by initial-position issues.
+    Minimal process rule:
+    - Start at 16.5 mL.
+    - Logged cycle 2 or 3 means another attempt at the same volume step.
+    - When the cycle returns to 1 without a pressure-level increase, advance
+      the cumulative volume step by 16.5 mL.
+    - When the cycle returns to 1 with a pressure-level increase, retain the
+      current volume step.
+    - The established pressure step is monotonic and cannot decrease because
+      of a lower measured pressure peak in a repeat attempt.
     """
     if paired_attempts.empty:
         return pd.DataFrame()
 
-    all_predictions = []
+    output = []
     for extruder, attempts in paired_attempts.groupby("Extruder", sort=True):
         volume_step_number = 1
         volume_step_size = PREMIXING_VOLUME_STEP_ML
-        previous_pressure_step = np.nan
-        previous_logged_cycle = np.nan
+        established_pressure_step = None
 
-        ordered_attempts = attempts.sort_values("Start Date & Time")
-        for row_index, (_, row) in enumerate(ordered_attempts.iterrows()):
-            ltr_volume = row["L-to-R Pushed Volume (mL)"]
-            rtl_volume = row["R-to-L Pushed Volume (mL)"]
-            representative = min(ltr_volume, rtl_volume)
-            actual_pressure = row["Maximum Actual Pressure (bar)"]
+        for sequence, (_, row) in enumerate(
+            attempts.sort_values("Start Date & Time").iterrows(), start=1
+        ):
             actual_cycle = row["Actual Logged Cycle"]
-            raw_pressure_step, raw_pressure_target = predict_premixing_pressure_level(
-                actual_pressure
-            )
+            actual_pressure = row["Maximum Actual Pressure (bar)"]
+            raw_pressure_step, _ = predict_premixing_pressure_level(actual_pressure)
 
-            # The active pressure target is stateful and cannot decrease within
-            # a Premixing run. A low measured peak in a repeat cycle must not be
-            # interpreted as a return to a lower recipe pressure level.
-            if pd.isna(previous_pressure_step):
-                pressure_step = raw_pressure_step
+            if established_pressure_step is None:
+                new_pressure_step = int(raw_pressure_step)
             else:
-                pressure_step = max(int(previous_pressure_step), int(raw_pressure_step))
-            pressure_target = min(
-                pressure_step * PREMIXING_PRESSURE_STEP_BAR,
-                PREMIXING_MAX_PRESSURE_BAR,
-            )
-
+                new_pressure_step = max(
+                    int(established_pressure_step), int(raw_pressure_step)
+                )
             pressure_increased = (
-                False if pd.isna(previous_pressure_step)
-                else pressure_step > previous_pressure_step
+                established_pressure_step is not None
+                and new_pressure_step > established_pressure_step
             )
-            pressure_decreased = False
 
-            # Volume-step reconstruction uses only the logged cycle and whether
-            # the pressure level increased. Piston-volume achievement is ignored.
-            if row_index == 0:
-                volume_step_status = "Initial volume step"
+            if sequence == 1:
+                rule = "Initial volume step"
             elif pd.notna(actual_cycle) and int(actual_cycle) == 1:
                 if pressure_increased:
-                    volume_step_status = (
-                        "Same volume step; cycle reset caused by pressure increment"
-                    )
+                    rule = "Same volume step: pressure increased"
                 else:
                     volume_step_number += 1
                     volume_step_size = (
                         volume_step_number * PREMIXING_VOLUME_STEP_ML
                     )
-                    volume_step_status = (
-                        "Advanced by 16.5 mL; cycle reset without pressure increment"
-                    )
+                    rule = "Advanced by 16.5 mL"
             else:
-                volume_step_status = "Same volume step; repeat cycle"
+                rule = "Same volume step: repeat attempt"
 
-            predicted_cycle = (
-                int(actual_cycle) if pd.notna(actual_cycle) else np.nan
+            established_pressure_step = new_pressure_step
+            established_pressure_target = min(
+                established_pressure_step * PREMIXING_PRESSURE_STEP_BAR,
+                PREMIXING_MAX_PRESSURE_BAR,
             )
-            threshold = (
-                volume_step_size
-                * PREMIXING_TARGET_ACHIEVEMENT_PERCENT
-                / 100
-            )
-            ltr_achieved = (
-                pd.notna(ltr_volume) and ltr_volume >= threshold
-            )
-            rtl_achieved = (
-                pd.notna(rtl_volume) and rtl_volume >= threshold
-            )
-            target_achieved = ltr_achieved and rtl_achieved
 
-            escalation_expected = (
-                pd.notna(actual_cycle)
-                and int(actual_cycle) == PREMIXING_REPEAT_CYCLES
-                and pressure_target < PREMIXING_MAX_PRESSURE_BAR
-            )
-            expected_next_pressure = (
-                min(
-                    pressure_target + PREMIXING_PRESSURE_STEP_BAR,
-                    PREMIXING_MAX_PRESSURE_BAR,
-                )
-                if escalation_expected
-                else pressure_target
-            )
-            pressure_difference = actual_pressure - pressure_target
-
-            all_predictions.append({
+            output.append({
                 **row.to_dict(),
+                "Attempt Number": sequence,
                 "Volume step size (mL)": volume_step_size,
                 "Volume Step Number": volume_step_number,
-                "Volume Step Rule": volume_step_status,
-                "Predicted Repeat Cycle": predicted_cycle,
-                "Cycle Prediction Match": (
-                    "Match" if pd.notna(actual_cycle) else "Review"
-                ),
-                "Raw Pressure Step from Actual Peak": raw_pressure_step,
-                "Raw Pressure Target from Actual Peak (bar)": raw_pressure_target,
-                "Predicted Pressure Step Number": pressure_step,
-                "Predicted Pressure Target (bar)": pressure_target,
-                "Actual-Predicted Pressure Difference (bar)": pressure_difference,
-                "Pressure Target Match": (
-                    "Match"
-                    if abs(pressure_difference)
-                    <= PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR
-                    else "Review"
-                ),
-                "Pressure Increased from Previous Attempt": (
-                    "Yes" if pressure_increased else "No"
-                ),
-                "Pressure Decreased from Previous Attempt": (
-                    "Yes" if pressure_decreased else "No"
-                ),
-                "Achievement Threshold (mL)": threshold,
-                "Actual Representative Volume (mL)": representative,
-                "Representative Volume Difference from Target (mL)": (
-                    representative - volume_step_size
-                ),
-                "L-to-R Volume Achievement (%)": (
-                    ltr_volume / volume_step_size * 100
-                ),
-                "R-to-L Volume Achievement (%)": (
-                    rtl_volume / volume_step_size * 100
-                ),
-                "Bidirectional Volume Target Achieved": (
-                    "Yes" if target_achieved else "No"
-                ),
-                "Pressure Escalation Expected": (
-                    "Yes" if escalation_expected else "No"
-                ),
-                "Expected Next Pressure Target (bar)": expected_next_pressure,
+                "Volume Step Rule": rule,
+                "Established Pressure Step": established_pressure_step,
+                "Established Pressure Target (bar)": established_pressure_target,
+                "Pressure Increased": "Yes" if pressure_increased else "No",
             })
 
-            previous_pressure_step = pressure_step
-            previous_logged_cycle = actual_cycle
-
-    prediction = pd.DataFrame(all_predictions)
-    prediction["Next Actual Pressure Target Inferred from Data (bar)"] = (
-        prediction.groupby("Extruder")[
-            "Predicted Pressure Target (bar)"
-        ].shift(-1)
-    )
-    prediction["Expected vs Actual Next Pressure Difference (bar)"] = (
-        prediction["Next Actual Pressure Target Inferred from Data (bar)"]
-        - prediction["Expected Next Pressure Target (bar)"]
-    )
-    prediction["Pressure Escalation Match"] = np.where(
-        prediction[
-            "Expected vs Actual Next Pressure Difference (bar)"
-        ].abs() <= PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR,
-        "Match",
-        "Review",
-    )
-    for _, indices in prediction.groupby("Extruder").groups.items():
-        prediction.loc[max(indices), "Pressure Escalation Match"] = (
-            "Not applicable"
-        )
-    return prediction
+    return pd.DataFrame(output)
 
 
 def build_premixing_volume_step_summary(prediction):
-    """Create one chart row for each predicted cumulative volume target."""
+    """Summarize attempts and directional maximum pressures by volume step."""
     columns = [
-        "Extruder", "Volume Step (mL)", "Cycles",
+        "Extruder", "Volume Step (mL)", "Attempts",
         "Max Loadcell Left (bar)", "Max Loadcell Right (bar)",
-        "Attempts", "Target Achieved", "First Attempt", "Last Attempt",
+        "First Attempt", "Last Attempt",
     ]
     if prediction.empty:
         return pd.DataFrame(columns=columns)
-    output = []
-    for (extruder, target), group in prediction.groupby(
+
+    rows = []
+    for (extruder, volume_step), group in prediction.groupby(
         ["Extruder", "Volume step size (mL)"], sort=True
     ):
-        output.append({
+        rows.append({
             "Extruder": int(extruder),
-            "Volume Step (mL)": float(target),
-            "Cycles": pd.to_numeric(group["Actual Logged Cycle"], errors="coerce").max(),
-            "Max Loadcell Left (bar)": group["L-to-R Maximum Push Pressure (bar)"].max(),
-            "Max Loadcell Right (bar)": group["R-to-L Maximum Push Pressure (bar)"].max(),
+            "Volume Step (mL)": float(volume_step),
             "Attempts": len(group),
-            "Target Achieved": (
-                "Yes" if group["Bidirectional Volume Target Achieved"].eq("Yes").any()
-                else "No"
-            ),
+            "Max Loadcell Left (bar)": group[
+                "L-to-R Maximum Push Pressure (bar)"
+            ].max(),
+            "Max Loadcell Right (bar)": group[
+                "R-to-L Maximum Push Pressure (bar)"
+            ].max(),
             "First Attempt": group["Start Date & Time"].min(),
             "Last Attempt": group["End Date & Time"].max(),
         })
-    return pd.DataFrame(output, columns=columns).sort_values(
+    return pd.DataFrame(rows, columns=columns).sort_values(
         ["Extruder", "Volume Step (mL)"]
     ).reset_index(drop=True)
 
 
 def create_premixing_volume_step_plot(summary, extruder, batch_number):
-    """Create the requested dual-axis Premixing pressure/cycle plot."""
+    """Create an interactive dual-axis Premixing pressure/attempt plot."""
     data = summary[summary["Extruder"].eq(extruder)].sort_values(
         "Volume Step (mL)"
     ).copy()
     figure = go.Figure()
-    hover_custom = data[["Attempts", "Target Achieved", "First Attempt", "Last Attempt"]].copy()
-    for column in ["First Attempt", "Last Attempt"]:
-        hover_custom[column] = pd.to_datetime(
-            hover_custom[column], errors="coerce"
+
+    date_details = data[["First Attempt", "Last Attempt"]].copy()
+    for column in date_details.columns:
+        date_details[column] = pd.to_datetime(
+            date_details[column], errors="coerce"
         ).dt.strftime("%d-%m-%Y %H:%M:%S")
+
     figure.add_trace(go.Bar(
-        x=data["Volume Step (mL)"], y=data["Cycles"],
-        name="Cycles", yaxis="y2",
-        marker={"color": "rgba(198, 218, 166, 0.75)"},
-        customdata=hover_custom.to_numpy(),
+        x=data["Volume Step (mL)"],
+        y=data["Attempts"],
+        name="Attempts",
+        yaxis="y2",
+        width=PREMIXING_VOLUME_STEP_ML * 0.62,
+        marker={
+            "color": "rgba(181, 211, 143, 0.55)",
+            "line": {"color": "rgba(123, 158, 83, 0.85)", "width": 1},
+        },
+        customdata=date_details.to_numpy(),
         hovertemplate=(
-            "<b>Cycles</b><br>Volume step: %{x:.1f} mL<br>"
-            "Cycle used: %{y:.0f}<br>Attempts: %{customdata[0]}<br>"
-            "Target achieved: %{customdata[1]}<br>"
-            "First attempt: %{customdata[2]}<br>Last attempt: %{customdata[3]}"
-            "<extra></extra>"
+            "<b>Attempts</b><br>Volume step: %{x:.1f} mL<br>"
+            "Number of attempts: %{y:.0f}<br>"
+            "First attempt: %{customdata[0]}<br>"
+            "Last attempt: %{customdata[1]}<extra></extra>"
         ),
     ))
     figure.add_trace(go.Scatter(
-        x=data["Volume Step (mL)"], y=data["Max Loadcell Left (bar)"],
-        mode="lines+markers", name="Max Loadcell Left (bar)",
-        line={"color": "#4F81BD", "width": 3, "shape": "hv"},
-        marker={"size": 7},
+        x=data["Volume Step (mL)"],
+        y=data["Max Loadcell Left (bar)"],
+        mode="lines+markers",
+        name="Max Loadcell Left (bar)",
+        line={"color": "#0057B8", "width": 4, "shape": "hv"},
+        marker={"size": 9, "color": "#0057B8", "symbol": "circle"},
         hovertemplate=(
             "<b>Max Loadcell Left</b><br>Volume step: %{x:.1f} mL<br>"
             "Maximum pressure: %{y:.2f} bar<extra></extra>"
         ),
     ))
     figure.add_trace(go.Scatter(
-        x=data["Volume Step (mL)"], y=data["Max Loadcell Right (bar)"],
-        mode="lines+markers", name="Max Loadcell Right (bar)",
-        line={"color": "#8064A2", "width": 3, "shape": "hv"},
-        marker={"size": 7},
+        x=data["Volume Step (mL)"],
+        y=data["Max Loadcell Right (bar)"],
+        mode="lines+markers",
+        name="Max Loadcell Right (bar)",
+        line={"color": "#D62728", "width": 4, "shape": "hv"},
+        marker={"size": 9, "color": "#D62728", "symbol": "diamond"},
         hovertemplate=(
             "<b>Max Loadcell Right</b><br>Volume step: %{x:.1f} mL<br>"
             "Maximum pressure: %{y:.2f} bar<extra></extra>"
         ),
     ))
+
     x_max = max(
-        PREMIXING_VOLUME_STEP_ML,
-        float(data["Volume Step (mL)"].max()) * 1.08 if not data.empty else 231,
+        231.0,
+        float(data["Volume Step (mL)"].max()) + PREMIXING_VOLUME_STEP_ML
+        if not data.empty else 231.0,
     )
+    max_attempts = int(data["Attempts"].max()) if not data.empty else 1
     figure.update_layout(
         title={
-            "text": f"{batch_number}<br>EXTRUDER-{int(extruder)}, PRE-MIXING",
-            "x": 0.5, "xanchor": "center",
+            "text": f"{batch_number} | EXTRUDER-{int(extruder)} PRE-MIXING",
+            "x": 0.5,
+            "xanchor": "center",
+            "y": 0.97,
+            "yanchor": "top",
+            "font": {"size": 24, "color": "#1F2937"},
         },
         xaxis={
-            "title": "VOLUME STEP (mL)",
+            "title": {"text": "VOLUME STEP (mL)", "standoff": 18},
             "range": [0, x_max],
             "dtick": PREMIXING_VOLUME_STEP_ML,
             "showgrid": True,
+            "gridcolor": "#D9E1EA",
         },
         yaxis={
-            "title": "MAX PRESSURE (bar)",
-            "range": [0, max(200, PREMIXING_MAX_PRESSURE_BAR)],
+            "title": {"text": "MAX PRESSURE (bar)", "standoff": 12},
+            "range": [0, 200],
+            "dtick": 20,
             "showgrid": True,
+            "gridcolor": "#D9E1EA",
         },
         yaxis2={
-            "title": "CYCLES", "overlaying": "y", "side": "right",
-            "range": [0, 3.5], "dtick": 0.5, "showgrid": False,
+            "title": {"text": "ATTEMPTS", "standoff": 12},
+            "overlaying": "y",
+            "side": "right",
+            "range": [0, max(4, max_attempts + 1)],
+            "dtick": 1,
+            "showgrid": False,
         },
         barmode="overlay",
         hovermode="x unified",
-        legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": 1.12},
-        height=700,
-        margin={"l": 80, "r": 80, "t": 120, "b": 80},
+        legend={
+            "orientation": "h",
+            "x": 0.5,
+            "xanchor": "center",
+            "y": 1.03,
+            "yanchor": "bottom",
+            "font": {"size": 13},
+            "bgcolor": "rgba(255,255,255,0.9)",
+        },
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=720,
+        margin={"l": 90, "r": 90, "t": 150, "b": 90},
     )
     return figure
+
 
 def build_wetting_rise_time_table(wetting_data):
     columns = ["Extruder", "Date & Time", "Step Name", "Time taken to reach vacuum rise (min)", "Rise time (Sec)", "Vacuum Timer Start", "Source Page"]
