@@ -1,6 +1,7 @@
 import io
 import math
 import re
+import zipfile
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -53,7 +54,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.13-pushed-volume-target-plus-one-v20"
+    parser_version = "2026.10.19-multiple-pdf-batches-v21"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -1293,44 +1294,230 @@ def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejec
     return output.getvalue()
 
 
+
+@st.cache_data(show_spinner=False)
+def process_uploaded_report(file_name, pdf_bytes):
+    """Extract and calculate all report outputs for one uploaded PDF."""
+    pages = extract_pages(pdf_bytes)
+    batch = parse_batch_details(pages)
+    overview = parse_process_overview(pages)
+    summaries = parse_process_summaries(pages)
+    settings = parse_recipe_settings(pages, summaries)
+    datalog, diagnostics, rejected_rows, process_ranges = parse_datalogs(
+        pages, summaries
+    )
+
+    wetting_data = (
+        datalog[datalog["Stage"].eq("WETTING")].copy()
+        if not datalog.empty else pd.DataFrame()
+    )
+    wetting_rise_table = build_wetting_rise_time_table(wetting_data)
+
+    mixing_data = (
+        datalog[datalog["Stage"].eq("MIXING")].copy()
+        if not datalog.empty else pd.DataFrame()
+    )
+    mixing_pressure_table = build_mixing_max_pressure_table(mixing_data)
+
+    blending_data = (
+        datalog[datalog["Stage"].eq("BLENDING")].copy()
+        if not datalog.empty else pd.DataFrame()
+    )
+    blending_pressure_table = build_blending_max_pressure_table(blending_data)
+
+    premixing_data = (
+        datalog[datalog["Stage"].eq("PREMIXING")].copy()
+        if not datalog.empty else pd.DataFrame()
+    )
+    premix_prepared = prepare_premixing_engineering_data(premixing_data)
+    premix_blocks = summarize_premixing_directional_blocks(premix_prepared)
+    premix_pairs = pair_premixing_bidirectional_attempts(premix_blocks)
+    premix_prediction = reverse_predict_premixing_volume_step(premix_pairs)
+
+    if not premix_pairs.empty and not premix_prediction.empty:
+        volume_step_map = premix_prediction[[
+            "Extruder", "Bidirectional Attempt ID",
+            "Volume step size (mL)", "Volume Step Rule",
+        ]].drop_duplicates(["Extruder", "Bidirectional Attempt ID"])
+        premix_pairs = premix_pairs.merge(
+            volume_step_map,
+            on=["Extruder", "Bidirectional Attempt ID"],
+            how="left",
+        )
+
+    premix_summary = build_premixing_volume_step_summary(premix_prediction)
+
+    return {
+        "file_name": file_name,
+        "pages": pages,
+        "batch": batch,
+        "overview": overview,
+        "summaries": summaries,
+        "settings": settings,
+        "datalog": datalog,
+        "diagnostics": diagnostics,
+        "rejected_rows": rejected_rows,
+        "process_ranges": process_ranges,
+        "wetting_rise_table": wetting_rise_table,
+        "mixing_pressure_table": mixing_pressure_table,
+        "blending_pressure_table": blending_pressure_table,
+        "premix_prepared": premix_prepared,
+        "premix_blocks": premix_blocks,
+        "premix_pairs": premix_pairs,
+        "premix_prediction": premix_prediction,
+        "premix_summary": premix_summary,
+    }
+
+
+def result_to_excel(result):
+    """Create the complete Excel workbook for one processed report."""
+    return make_excel(
+        result["batch"], result["overview"], result["summaries"],
+        result["settings"], result["datalog"], result["diagnostics"],
+        result["rejected_rows"], result["process_ranges"],
+        result["wetting_rise_table"], result["mixing_pressure_table"],
+        result["blending_pressure_table"], result["premix_prepared"],
+        result["premix_blocks"], result["premix_pairs"],
+        result["premix_prediction"], result["premix_summary"],
+    )
+
+
+def safe_output_name(value):
+    """Create a filesystem-safe output name."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._")
+    return cleaned or "batch"
+
+
+def build_all_batches_zip(results, errors):
+    """Package one complete Excel workbook per successful PDF into one ZIP."""
+    output = io.BytesIO()
+    used_names = set()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for result_key, result in results.items():
+            batch_number = result["batch"].get("Batch no.") or Path(
+                result["file_name"]
+            ).stem
+            base_name = safe_output_name(batch_number)
+            candidate = f"{base_name}_complete_process_extraction.xlsx"
+            suffix = 2
+            while candidate.casefold() in used_names:
+                candidate = (
+                    f"{base_name}_{suffix}_complete_process_extraction.xlsx"
+                )
+                suffix += 1
+            used_names.add(candidate.casefold())
+            archive.writestr(candidate, result_to_excel(result))
+
+        if errors:
+            error_lines = [
+                f"{file_name}: {message}"
+                for file_name, message in errors.items()
+            ]
+            archive.writestr(
+                "extraction_errors.txt",
+                "\n".join(error_lines).encode("utf-8"),
+            )
+    return output.getvalue()
+
 def main():
     st.title("🧪 Complete Batch Process Report Extractor")
-    st.caption("Extracts Process Overview, recipe settings, complete datalogs, diagnostics, and Wetting rise-time analysis.")
+    st.caption(
+        "Upload and analyze one or more batch-cycle PDF reports. Each file is "
+        "processed independently so a failure in one report does not stop the others."
+    )
     graph_font_family, graph_font_size = graph_display_controls()
-    uploaded = st.file_uploader("Upload Batch Cycle Report PDF", type=["pdf"])
-    if uploaded is None: st.info("Upload a batch-report PDF to begin."); st.stop()
-    try:
-        with st.status("Scanning the complete document...", expanded=True) as status:
-            pages = extract_pages(uploaded.getvalue()); batch = parse_batch_details(pages); overview = parse_process_overview(pages)
-            summaries = parse_process_summaries(pages); settings = parse_recipe_settings(pages, summaries)
-            datalog, diagnostics, rejected_rows, process_ranges = parse_datalogs(pages, summaries)
-            wetting_data = datalog[datalog["Stage"].eq("WETTING")].copy() if not datalog.empty else pd.DataFrame()
-            wetting_rise_table = build_wetting_rise_time_table(wetting_data)
-            mixing_data = datalog[datalog["Stage"].eq("MIXING")].copy() if not datalog.empty else pd.DataFrame()
-            mixing_pressure_table = build_mixing_max_pressure_table(mixing_data)
-            blending_data = datalog[datalog["Stage"].eq("BLENDING")].copy() if not datalog.empty else pd.DataFrame()
-            blending_pressure_table = build_blending_max_pressure_table(blending_data)
-            premixing_data = datalog[datalog["Stage"].eq("PREMIXING")].copy() if not datalog.empty else pd.DataFrame()
-            premix_prepared = prepare_premixing_engineering_data(premixing_data)
-            premix_blocks = summarize_premixing_directional_blocks(premix_prepared)
-            premix_pairs = pair_premixing_bidirectional_attempts(premix_blocks)
-            premix_prediction = reverse_predict_premixing_volume_step(premix_pairs)
-            if not premix_pairs.empty and not premix_prediction.empty:
-                volume_step_map = premix_prediction[[
-                    "Extruder", "Bidirectional Attempt ID",
-                    "Volume step size (mL)", "Volume Step Rule",
-                ]].drop_duplicates([
-                    "Extruder", "Bidirectional Attempt ID"
-                ])
-                premix_pairs = premix_pairs.merge(
-                    volume_step_map,
-                    on=["Extruder", "Bidirectional Attempt ID"],
-                    how="left",
-                )
-            premix_summary = build_premixing_volume_step_summary(premix_prediction)
-            status.update(label="Extraction completed", state="complete", expanded=False)
-    except Exception as error: st.exception(error); st.stop()
 
+    uploaded_files = st.file_uploader(
+        "Upload Batch Cycle Report PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Select one or more PDF batch reports.",
+    )
+    if not uploaded_files:
+        st.info("Upload one or more batch-report PDFs to begin.")
+        st.stop()
+
+    processed_results = {}
+    extraction_errors = {}
+    progress = st.progress(0, text="Preparing report extraction...")
+
+    for file_index, uploaded_file in enumerate(uploaded_files, start=1):
+        unique_key = f"{file_index:03d}_{uploaded_file.name}"
+        progress.progress(
+            (file_index - 1) / len(uploaded_files),
+            text=f"Processing {file_index}/{len(uploaded_files)}: {uploaded_file.name}",
+        )
+        try:
+            processed_results[unique_key] = process_uploaded_report(
+                uploaded_file.name,
+                uploaded_file.getvalue(),
+            )
+        except Exception as error:
+            extraction_errors[uploaded_file.name] = str(error)
+
+    progress.progress(1.0, text="All uploaded reports have been processed.")
+
+    if extraction_errors:
+        with st.expander(
+            f"Files requiring review ({len(extraction_errors)})",
+            expanded=True,
+        ):
+            for file_name, message in extraction_errors.items():
+                st.error(f"{file_name}: {message}")
+
+    if not processed_results:
+        st.error("None of the uploaded PDF reports could be processed.")
+        st.stop()
+
+    summary_rows = []
+    selector_labels = {}
+    for result_key, result in processed_results.items():
+        batch_number = result["batch"].get("Batch no.") or "Batch number not found"
+        selector_label = f"{batch_number} | {result['file_name']}"
+        selector_labels[selector_label] = result_key
+        summary_rows.append({
+            "File Name": result["file_name"],
+            "Batch No.": batch_number,
+            "PDF Pages": len(result["pages"]),
+            "Process Runs": len(result["summaries"]),
+            "Datalog Rows": len(result["datalog"]),
+            "Rejected Rows": len(result["rejected_rows"]),
+            "Status": "Processed",
+        })
+
+    st.markdown("### Uploaded report summary")
+    st.dataframe(
+        pd.DataFrame(summary_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    selected_label = st.selectbox(
+        "Select report to review",
+        options=list(selector_labels),
+        key="selected_batch_report",
+    )
+    selected_result = processed_results[selector_labels[selected_label]]
+
+    pages = selected_result["pages"]
+    batch = selected_result["batch"]
+    overview = selected_result["overview"]
+    summaries = selected_result["summaries"]
+    settings = selected_result["settings"]
+    datalog = selected_result["datalog"]
+    diagnostics = selected_result["diagnostics"]
+    rejected_rows = selected_result["rejected_rows"]
+    process_ranges = selected_result["process_ranges"]
+    wetting_rise_table = selected_result["wetting_rise_table"]
+    mixing_pressure_table = selected_result["mixing_pressure_table"]
+    blending_pressure_table = selected_result["blending_pressure_table"]
+    premix_prepared = selected_result["premix_prepared"]
+    premix_blocks = selected_result["premix_blocks"]
+    premix_pairs = selected_result["premix_pairs"]
+    premix_prediction = selected_result["premix_prediction"]
+    premix_summary = selected_result["premix_summary"]
+
+    st.markdown(f"### Selected report: {selected_result['file_name']}")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("PDF pages", f"{len(pages):,}"); c2.metric("Overview operations", f"{len(overview):,}")
     c3.metric("Target process runs", f"{len(summaries):,}"); c4.metric("Datalog rows", f"{len(datalog):,}")
@@ -1750,9 +1937,31 @@ def main():
         if rejected_rows.empty: st.success("No timestamp rows were rejected.")
         else: st.dataframe(rejected_rows, use_container_width=True, hide_index=True, height=400)
 
-    excel = make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected_rows, process_ranges, wetting_rise_table, mixing_pressure_table, blending_pressure_table, premix_prepared, premix_blocks, premix_pairs, premix_prediction, premix_summary)
-    batch_number = batch.get("Batch no.") or "batch"
-    st.download_button("⬇️ Download Complete Excel Extraction", excel, f"{batch_number}_complete_process_extraction.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+    excel = result_to_excel(selected_result)
+    batch_number = batch.get("Batch no.") or Path(
+        selected_result["file_name"]
+    ).stem
+    safe_batch_number = safe_output_name(batch_number)
+
+    download_col1, download_col2 = st.columns(2)
+    download_col1.download_button(
+        "⬇️ Download Selected Batch Excel",
+        excel,
+        f"{safe_batch_number}_complete_process_extraction.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+
+    all_batches_zip = build_all_batches_zip(
+        processed_results,
+        extraction_errors,
+    )
+    download_col2.download_button(
+        "⬇️ Download All Batch Excel Files (ZIP)",
+        all_batches_zip,
+        "all_batch_process_extractions.zip",
+        "application/zip",
+    )
 
 
 if __name__ == "__main__":
