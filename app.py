@@ -1,3 +1,5 @@
+import gc
+import hashlib
 import io
 import math
 import re
@@ -16,8 +18,7 @@ st.set_page_config(page_title="Batch Process Data Extractor", page_icon="🧪", 
 STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
-CACHE_MAX_PAGES = 5
-CACHE_MAX_REPORTS = 3
+CACHE_MAX_REPORTS = 20
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -56,13 +57,8 @@ def duration_text(start, end):
     return f"{days}.{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-@st.cache_data(
-    show_spinner=False,
-    ttl=CACHE_TTL_SECONDS,
-    max_entries=CACHE_MAX_PAGES,
-)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.23-20-files-no-size-limit-v24"
+    parser_version = "2026.10.23-final-deploy-stable-v25"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -1219,6 +1215,8 @@ def graph_display_controls():
             for state_key in list(st.session_state):
                 if state_key.startswith(generated_prefixes):
                     del st.session_state[state_key]
+            st.session_state.pop("active_upload_signature", None)
+            gc.collect()
             st.rerun()
         st.caption(
             "Use this before uploading a completely new report set if the app "
@@ -1454,6 +1452,12 @@ def build_all_batches_zip(results, errors):
             )
     return output.getvalue()
 
+
+def uploaded_report_fingerprint(file_name, pdf_bytes):
+    """Stable identifier used to prevent stale exports for replaced PDFs."""
+    digest = hashlib.sha256(pdf_bytes).hexdigest()[:16]
+    return f"{safe_output_name(Path(file_name).stem)}_{digest}"
+
 def main():
     st.title("🧪 Complete Batch Process Report Extractor")
     st.caption(
@@ -1503,24 +1507,46 @@ def main():
         f"Maximum allowed per processing run: {MAX_UPLOAD_FILES} files."
     )
 
+    uploaded_payloads = []
+    for file_index, uploaded_file in enumerate(uploaded_files, start=1):
+        pdf_bytes = uploaded_file.getvalue()
+        fingerprint = uploaded_report_fingerprint(uploaded_file.name, pdf_bytes)
+        uploaded_payloads.append((file_index, uploaded_file.name, pdf_bytes, fingerprint))
+
+    active_upload_signature = hashlib.sha256(
+        "|".join(
+            f"{fingerprint}:{premixing_step_volume_ml:g}"
+            for _, _, _, fingerprint in uploaded_payloads
+        ).encode("utf-8")
+    ).hexdigest()[:20]
+
+    if st.session_state.get("active_upload_signature") != active_upload_signature:
+        for state_key in list(st.session_state):
+            if state_key.startswith(("generated_excel_", "generated_zip_", "generated_html_")):
+                del st.session_state[state_key]
+        st.session_state["active_upload_signature"] = active_upload_signature
+        gc.collect()
+
     processed_results = {}
     extraction_errors = {}
     progress = st.progress(0, text="Preparing report extraction...")
 
-    for file_index, uploaded_file in enumerate(uploaded_files, start=1):
-        unique_key = f"{file_index:03d}_{uploaded_file.name}"
+    for file_index, file_name, pdf_bytes, fingerprint in uploaded_payloads:
+        unique_key = f"{file_index:03d}_{fingerprint}"
         progress.progress(
-            (file_index - 1) / len(uploaded_files),
-            text=f"Processing {file_index}/{len(uploaded_files)}: {uploaded_file.name}",
+            (file_index - 1) / len(uploaded_payloads),
+            text=f"Processing {file_index}/{len(uploaded_payloads)}: {file_name}",
         )
         try:
             processed_results[unique_key] = process_uploaded_report(
-                uploaded_file.name,
-                uploaded_file.getvalue(),
+                file_name,
+                pdf_bytes,
                 premixing_step_volume_ml,
             )
         except Exception as error:
-            extraction_errors[uploaded_file.name] = str(error)
+            extraction_errors[file_name] = f"{type(error).__name__}: {error}"
+        finally:
+            gc.collect()
 
     progress.progress(1.0, text="All uploaded reports have been processed.")
 
@@ -1540,7 +1566,9 @@ def main():
     selector_labels = {}
     for result_key, result in processed_results.items():
         batch_number = result["batch"].get("Batch no.") or "Batch number not found"
-        selector_label = f"{batch_number} | {result['file_name']}"
+        selector_label = (
+            f"{batch_number} | {result['file_name']} | {result_key[:3]}"
+        )
         selector_labels[selector_label] = result_key
         summary_rows.append({
             "File Name": result["file_name"],
@@ -2068,9 +2096,8 @@ def main():
             use_container_width=True,
         )
 
-    uploaded_signature = "_".join(sorted(processed_results.keys()))
     all_batches_zip_key = (
-        f"generated_zip_{hash(uploaded_signature)}_{premixing_step_volume_ml}"
+        f"generated_zip_{active_upload_signature}_{premixing_step_volume_ml:g}"
     )
     if export_col2.button(
         "Prepare All Batch Excel Files",
