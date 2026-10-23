@@ -14,6 +14,10 @@ from pypdf import PdfReader
 st.set_page_config(page_title="Batch Process Data Extractor", page_icon="🧪", layout="wide")
 
 STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
+MAX_UPLOAD_FILES = 20
+CACHE_TTL_SECONDS = 1800
+CACHE_MAX_PAGES = 5
+CACHE_MAX_REPORTS = 3
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -52,9 +56,13 @@ def duration_text(start, end):
     return f"{days}.{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(
+    show_spinner=False,
+    ttl=CACHE_TTL_SECONDS,
+    max_entries=CACHE_MAX_PAGES,
+)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.19-selectable-premixing-step-v22"
+    parser_version = "2026.10.23-20-files-no-size-limit-v24"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -468,8 +476,8 @@ def normalize_premixing_pressure(actual_pressure):
 
 
 def expected_premixing_left_volume(volume_step_ml, step_volume_ml):
-    """Standard left-pushed volume for the selected Premixing step size."""
-    if pd.isna(volume_step_ml) or pd.isna(step_volume_ml):
+    """Standard left-pushed volume for a cumulative Premixing volume step."""
+    if pd.isna(volume_step_ml):
         return np.nan
     return 2 * float(volume_step_ml) - float(step_volume_ml)
 
@@ -554,11 +562,11 @@ def reverse_predict_premixing_volume_step(paired_attempts, step_volume_ml=PREMIX
                 else:
                     volume_step_number += 1
                     volume_step_size = volume_step_number * step_volume_ml
-                    rule = f"Advanced by {step_volume_ml:g} mL: no pressure increase and L-to-R pushed volume > target volume + 1"
+                    rule = "Advanced by 16.5 mL: no pressure increase and L-to-R pushed volume > target volume + 1"
             elif current_cycle == 1:
                 volume_step_number += 1
                 volume_step_size = volume_step_number * step_volume_ml
-                rule = f"Advanced by {step_volume_ml:g} mL: Cycle 1 did not increase"
+                rule = "Advanced by 16.5 mL: Cycle 1 did not increase"
             else:
                 rule = "Same volume step: cycle sequence review"
 
@@ -1202,6 +1210,20 @@ def apply_graph_style(figure, font_family="Times New Roman", font_size=12):
 def graph_display_controls():
     """Sidebar font controls shared by every graph."""
     with st.sidebar:
+        st.markdown("### Application Controls")
+        if st.button("Clear processed reports and cache", use_container_width=True):
+            st.cache_data.clear()
+            generated_prefixes = (
+                "generated_excel_", "generated_zip_", "generated_html_"
+            )
+            for state_key in list(st.session_state):
+                if state_key.startswith(generated_prefixes):
+                    del st.session_state[state_key]
+            st.rerun()
+        st.caption(
+            "Use this before uploading a completely new report set if the app "
+            "becomes slow."
+        )
         st.markdown("### Graph Controls")
         family = st.selectbox("Graph font", ["Times New Roman", "Arial", "Calibri", "Georgia"], index=0, key="graph_font_family")
         preset = st.selectbox("Graph font size", ["10 pt", "12 pt", "14 pt", "16 pt", "18 pt", "20 pt", "Custom"], index=1, key="graph_font_size_preset")
@@ -1301,7 +1323,11 @@ def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejec
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(
+    show_spinner=False,
+    ttl=CACHE_TTL_SECONDS,
+    max_entries=CACHE_MAX_REPORTS,
+)
 def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml):
     """Extract and calculate all report outputs for one uploaded PDF."""
     pages = extract_pages(pdf_bytes)
@@ -1439,12 +1465,8 @@ def main():
     st.markdown("### Premixing batch configuration")
     premixing_batch_size = st.selectbox(
         "Premixing batch size / step volume",
-        options=["1 kg batch - 16.5 mL", "1.5 kg batch - 25.0 mL", "Custom"],
+        ["1 kg batch - 16.5 mL", "1.5 kg batch - 25.0 mL", "Custom"],
         index=0,
-        help=(
-            "The selected step volume controls the initial Premixing volume, every "
-            "subsequent increment, target-volume calculation, plot spacing, and exports."
-        ),
     )
     if premixing_batch_size == "1 kg batch - 16.5 mL":
         premixing_step_volume_ml = 16.5
@@ -1452,12 +1474,8 @@ def main():
         premixing_step_volume_ml = 25.0
     else:
         premixing_step_volume_ml = float(st.number_input(
-            "Custom Premixing step volume (mL)",
-            min_value=0.1,
-            max_value=100.0,
-            value=16.5,
-            step=0.5,
-            format="%.1f",
+            "Custom Premixing step volume (mL)", min_value=0.1,
+            max_value=100.0, value=16.5, step=0.5, format="%.1f"
         ))
     st.info(
         f"Selected Premixing step volume: {premixing_step_volume_ml:g} mL | "
@@ -1473,6 +1491,17 @@ def main():
     if not uploaded_files:
         st.info("Upload one or more batch-report PDFs to begin.")
         st.stop()
+
+    if len(uploaded_files) > MAX_UPLOAD_FILES:
+        st.error(
+            f"Upload a maximum of {MAX_UPLOAD_FILES} PDF reports per processing run."
+        )
+        st.stop()
+
+    st.caption(
+        f"Selected {len(uploaded_files)} file(s). "
+        f"Maximum allowed per processing run: {MAX_UPLOAD_FILES} files."
+    )
 
     processed_results = {}
     extraction_errors = {}
@@ -1617,9 +1646,6 @@ def main():
                 "elapsed time, rise time, paired Vacuum Timer timestamp, and source page. "
                 "Use the chart toolbar to zoom, pan, reset, or download a PNG."
             )
-            interactive_html = create_editable_interactive_html(
-                interactive_figure, "Elapsed time"
-            )
             x1, x2 = st.columns(2)
             x1.download_button(
                 "Download Rise-Time Table CSV",
@@ -1627,12 +1653,22 @@ def main():
                 f"{batch_number}_wetting_rise_time.csv",
                 "text/csv",
             )
-            x2.download_button(
-                "Download Interactive Plot HTML",
-                interactive_html,
-                f"{batch_number}_wetting_rise_time_interactive.html",
-                "text/html",
+            wetting_html_key = (
+                f"generated_html_wetting_{selected_label}_{','.join(map(str, selected))}"
             )
+            if x2.button("Prepare Interactive Plot HTML", key=f"prepare_{wetting_html_key}"):
+                with st.spinner("Preparing interactive Wetting HTML..."):
+                    st.session_state[wetting_html_key] = create_editable_interactive_html(
+                        interactive_figure, "Elapsed time"
+                    )
+            if wetting_html_key in st.session_state:
+                x2.download_button(
+                    "Download Interactive Plot HTML",
+                    st.session_state[wetting_html_key],
+                    f"{batch_number}_wetting_rise_time_interactive.html",
+                    "text/html",
+                    key=f"download_{wetting_html_key}",
+                )
     with mixing_tab:
         st.markdown("#### Mixing Maximum Pressure by Extrusion Cycle")
         st.caption(
@@ -1734,9 +1770,6 @@ def main():
                 hovermode="closest", height=700,
             )
             apply_graph_style(mixing_html_figure, graph_font_family, graph_font_size)
-            mixing_html = create_editable_interactive_html(
-                mixing_html_figure, "Cycles"
-            )
             m1, m2 = st.columns(2)
             m1.download_button(
                 "Download Mixing Max-Pressure Table CSV",
@@ -1744,12 +1777,23 @@ def main():
                 f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_mixing_max_pressure.csv",
                 "text/csv",
             )
-            m2.download_button(
-                "Download Interactive Mixing Plot HTML",
-                mixing_html,
-                f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_mixing_max_pressure.html",
-                "text/html",
+            mixing_html_key = (
+                f"generated_html_mixing_{selected_label}_{selected_mixing_extruder}_"
+                f"{'_'.join(selected_orifices)}"
             )
+            if m2.button("Prepare Interactive Mixing HTML", key=f"prepare_{mixing_html_key}"):
+                with st.spinner("Preparing interactive Mixing HTML..."):
+                    st.session_state[mixing_html_key] = create_editable_interactive_html(
+                        mixing_html_figure, "Cycles"
+                    )
+            if mixing_html_key in st.session_state:
+                m2.download_button(
+                    "Download Interactive Mixing Plot HTML",
+                    st.session_state[mixing_html_key],
+                    f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_mixing_max_pressure.html",
+                    "text/html",
+                    key=f"download_{mixing_html_key}",
+                )
 
     with blending_tab:
         st.markdown("#### Blending Maximum Pressure by Cycle")
@@ -1855,9 +1899,6 @@ def main():
                 hovermode="closest", height=700,
             )
             apply_graph_style(combined_blending_figure, graph_font_family, graph_font_size)
-            blending_html = create_editable_interactive_html(
-                combined_blending_figure, "Cycles"
-            )
             b1, b2 = st.columns(2)
             b1.download_button(
                 "Download Blending Max-Pressure Table CSV",
@@ -1865,12 +1906,23 @@ def main():
                 f"{batch_number_for_blending}_extruder_{selected_blending_extruder}_blending_max_pressure.csv",
                 "text/csv",
             )
-            b2.download_button(
-                "Download Interactive Blending Plot HTML",
-                blending_html,
-                f"{batch_number_for_blending}_extruder_{selected_blending_extruder}_blending_max_pressure.html",
-                "text/html",
+            blending_html_key = (
+                f"generated_html_blending_{selected_label}_{selected_blending_extruder}_"
+                f"{'_'.join(selected_phases)}"
             )
+            if b2.button("Prepare Interactive Blending HTML", key=f"prepare_{blending_html_key}"):
+                with st.spinner("Preparing interactive Blending HTML..."):
+                    st.session_state[blending_html_key] = create_editable_interactive_html(
+                        combined_blending_figure, "Cycles"
+                    )
+            if blending_html_key in st.session_state:
+                b2.download_button(
+                    "Download Interactive Blending Plot HTML",
+                    st.session_state[blending_html_key],
+                    f"{batch_number_for_blending}_extruder_{selected_blending_extruder}_blending_max_pressure.html",
+                    "text/html",
+                    key=f"download_{blending_html_key}",
+                )
 
     with premixing_tab:
         st.markdown("#### Premixing Predicted Volume-Step Analysis")
@@ -1907,6 +1959,7 @@ def main():
                 selected_premix_extruder,
                 batch_number_for_premix,
                 selected_premix_pressure_mode,
+                selected_premixing_step_volume_ml,
             )
             apply_graph_style(premix_figure, graph_font_family, graph_font_size)
             st.plotly_chart(
@@ -1953,9 +2006,6 @@ def main():
                     use_container_width=True, hide_index=True, height=450,
                 )
 
-            premix_html = create_editable_interactive_html(
-                premix_figure, "Volume step"
-            )
             p1, p2 = st.columns(2)
             p1.download_button(
                 "Download Premixing Volume-Step Summary CSV",
@@ -1963,12 +2013,23 @@ def main():
                 f"{batch_number_for_premix}_extruder_{selected_premix_extruder}_premixing_summary.csv",
                 "text/csv",
             )
-            p2.download_button(
-                "Download Interactive Premixing Plot HTML",
-                premix_html,
-                f"{batch_number_for_premix}_extruder_{selected_premix_extruder}_premixing_plot.html",
-                "text/html",
+            premix_html_key = (
+                f"generated_html_premix_{selected_label}_{selected_premix_extruder}_"
+                f"{selected_premix_pressure_mode}_{selected_premixing_step_volume_ml}"
             )
+            if p2.button("Prepare Interactive Premixing HTML", key=f"prepare_{premix_html_key}"):
+                with st.spinner("Preparing interactive Premixing HTML..."):
+                    st.session_state[premix_html_key] = create_editable_interactive_html(
+                        premix_figure, "Volume step"
+                    )
+            if premix_html_key in st.session_state:
+                p2.download_button(
+                    "Download Interactive Premixing Plot HTML",
+                    st.session_state[premix_html_key],
+                    f"{batch_number_for_premix}_extruder_{selected_premix_extruder}_premixing_plot.html",
+                    "text/html",
+                    key=f"download_{premix_html_key}",
+                )
 
     with diagnostics_tab:
         st.markdown("#### Assigned process page ranges"); st.dataframe(process_ranges, use_container_width=True, hide_index=True)
@@ -1977,31 +2038,59 @@ def main():
         if rejected_rows.empty: st.success("No timestamp rows were rejected.")
         else: st.dataframe(rejected_rows, use_container_width=True, hide_index=True, height=400)
 
-    excel = result_to_excel(selected_result)
     batch_number = batch.get("Batch no.") or Path(
         selected_result["file_name"]
     ).stem
     safe_batch_number = safe_output_name(batch_number)
+    selected_result_key = selector_labels[selected_label]
 
-    download_col1, download_col2 = st.columns(2)
-    download_col1.download_button(
-        "⬇️ Download Selected Batch Excel",
-        excel,
-        f"{safe_batch_number}_complete_process_extraction.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
+    st.markdown("### Export files")
+    export_col1, export_col2 = st.columns(2)
 
-    all_batches_zip = build_all_batches_zip(
-        processed_results,
-        extraction_errors,
+    selected_excel_key = (
+        f"generated_excel_{selected_result_key}_{selected_premixing_step_volume_ml}"
     )
-    download_col2.download_button(
-        "⬇️ Download All Batch Excel Files (ZIP)",
-        all_batches_zip,
-        "all_batch_process_extractions.zip",
-        "application/zip",
+    if export_col1.button(
+        "Prepare Selected Batch Excel",
+        key=f"prepare_{selected_excel_key}",
+        use_container_width=True,
+    ):
+        with st.spinner("Preparing selected batch Excel workbook..."):
+            st.session_state[selected_excel_key] = result_to_excel(selected_result)
+    if selected_excel_key in st.session_state:
+        export_col1.download_button(
+            "⬇️ Download Selected Batch Excel",
+            st.session_state[selected_excel_key],
+            f"{safe_batch_number}_complete_process_extraction.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"download_{selected_excel_key}",
+            type="primary",
+            use_container_width=True,
+        )
+
+    uploaded_signature = "_".join(sorted(processed_results.keys()))
+    all_batches_zip_key = (
+        f"generated_zip_{hash(uploaded_signature)}_{premixing_step_volume_ml}"
     )
+    if export_col2.button(
+        "Prepare All Batch Excel Files",
+        key=f"prepare_{all_batches_zip_key}",
+        use_container_width=True,
+    ):
+        with st.spinner("Preparing Excel workbooks and ZIP package..."):
+            st.session_state[all_batches_zip_key] = build_all_batches_zip(
+                processed_results,
+                extraction_errors,
+            )
+    if all_batches_zip_key in st.session_state:
+        export_col2.download_button(
+            "⬇️ Download All Batch Excel Files (ZIP)",
+            st.session_state[all_batches_zip_key],
+            "all_batch_process_extractions.zip",
+            "application/zip",
+            key=f"download_{all_batches_zip_key}",
+            use_container_width=True,
+        )
 
 
 if __name__ == "__main__":
