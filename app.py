@@ -54,7 +54,7 @@ def duration_text(start, end):
 
 @st.cache_data(show_spinner=False)
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.19-multiple-pdf-batches-v21"
+    parser_version = "2026.10.19-selectable-premixing-step-v22"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -467,11 +467,11 @@ def normalize_premixing_pressure(actual_pressure):
     return int(lower_bar if pressure - lower_bar <= 0.5 else lower_bar + 1)
 
 
-def expected_premixing_left_volume(volume_step_ml):
-    """Standard left-pushed volume for a cumulative Premixing volume step."""
-    if pd.isna(volume_step_ml):
+def expected_premixing_left_volume(volume_step_ml, step_volume_ml):
+    """Standard left-pushed volume for the selected Premixing step size."""
+    if pd.isna(volume_step_ml) or pd.isna(step_volume_ml):
         return np.nan
-    return 2 * float(volume_step_ml) - PREMIXING_VOLUME_STEP_ML
+    return 2 * float(volume_step_ml) - float(step_volume_ml)
 
 
 def premixing_recipe_pressure_step(actual_pressure):
@@ -491,15 +491,19 @@ def premixing_recipe_pressure_step(actual_pressure):
     ))
 
 
-def reverse_predict_premixing_volume_step(paired_attempts):
+def reverse_predict_premixing_volume_step(paired_attempts, step_volume_ml=PREMIXING_VOLUME_STEP_ML):
     """Reconstruct volume step using cycle, normalized pressure, and left volume."""
     if paired_attempts.empty:
         return pd.DataFrame()
 
+    step_volume_ml = float(step_volume_ml)
+    if step_volume_ml <= 0:
+        raise ValueError("Premixing step volume must be greater than 0 mL.")
+
     output = []
     for extruder, attempts in paired_attempts.groupby("Extruder", sort=True):
         volume_step_number = 1
-        volume_step_size = PREMIXING_VOLUME_STEP_ML
+        volume_step_size = step_volume_ml
         highest_normalized_pressure = int(PREMIXING_PRESSURE_STEP_BAR)
         established_recipe_pressure = PREMIXING_PRESSURE_STEP_BAR
         previous_cycle = None
@@ -526,7 +530,7 @@ def reverse_predict_premixing_volume_step(paired_attempts):
             actual_left_volume = pd.to_numeric(
                 row["L-to-R Pushed Volume (mL)"], errors="coerce"
             )
-            expected_left_volume = expected_premixing_left_volume(volume_step_size)
+            expected_left_volume = expected_premixing_left_volume(volume_step_size, step_volume_ml)
             left_difference = (
                 actual_left_volume - expected_left_volume
                 if pd.notna(actual_left_volume) and pd.notna(expected_left_volume)
@@ -549,12 +553,12 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                     rule = "Same volume step: L-to-R pushed volume <= target volume + 1"
                 else:
                     volume_step_number += 1
-                    volume_step_size = volume_step_number * PREMIXING_VOLUME_STEP_ML
-                    rule = "Advanced by 16.5 mL: no pressure increase and L-to-R pushed volume > target volume + 1"
+                    volume_step_size = volume_step_number * step_volume_ml
+                    rule = f"Advanced by {step_volume_ml:g} mL: no pressure increase and L-to-R pushed volume > target volume + 1"
             elif current_cycle == 1:
                 volume_step_number += 1
-                volume_step_size = volume_step_number * PREMIXING_VOLUME_STEP_ML
-                rule = "Advanced by 16.5 mL: Cycle 1 did not increase"
+                volume_step_size = volume_step_number * step_volume_ml
+                rule = f"Advanced by {step_volume_ml:g} mL: Cycle 1 did not increase"
             else:
                 rule = "Same volume step: cycle sequence review"
 
@@ -569,6 +573,7 @@ def reverse_predict_premixing_volume_step(paired_attempts):
                 "Previous Logged Cycle": previous_cycle,
                 "Volume step size (mL)": volume_step_size,
                 "Volume Step Number": volume_step_number,
+                "Selected Premixing Step Volume (mL)": step_volume_ml,
                 "Volume Step Rule": rule,
                 "Actual Maximum Pressure (bar)": actual_pressure,
                 "Normalized Maximum Pressure (bar)": normalized_pressure,
@@ -619,7 +624,8 @@ def build_premixing_volume_step_summary(prediction):
 
 
 def create_premixing_volume_step_plot(
-    summary, extruder, batch_number, pressure_mode="Actual Max Pressure"
+    summary, extruder, batch_number, pressure_mode="Actual Max Pressure",
+    step_volume_ml=PREMIXING_VOLUME_STEP_ML,
 ):
     """Create Premixing pressure/attempt plot with fixed 0-198 mL x-axis."""
     data = summary[summary["Extruder"].eq(extruder)].sort_values(
@@ -636,7 +642,7 @@ def create_premixing_volume_step_plot(
     figure.add_trace(go.Bar(
         x=data["Volume Step (mL)"], y=data["Attempts"],
         name="Attempts", yaxis="y2",
-        width=PREMIXING_VOLUME_STEP_ML * 0.62,
+        width=float(step_volume_ml) * 0.62,
         marker={"color": "rgba(181, 211, 143, 0.55)",
                 "line": {"color": "rgba(123, 158, 83, 0.85)", "width": 1}},
         customdata=date_details.to_numpy(),
@@ -687,7 +693,7 @@ def create_premixing_volume_step_plot(
                "font": {"family": "Times New Roman", "size": 12, "color": "#000000"}},
         font={"family": "Times New Roman", "size": 12, "color": "#000000"},
         xaxis={"title": {"text": "<b>VOLUME STEP (mL)</b>", "standoff": 18},
-               "range": [0, 198], "dtick": PREMIXING_VOLUME_STEP_ML,
+               "range": [0, float(step_volume_ml) * 12], "dtick": float(step_volume_ml),
                "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
         yaxis={"title": {"text": "<b>PRESSURE (bar)</b>", "standoff": 12},
                "range": [0, 200], "dtick": 15 if pressure_mode == "Pressure Step" else 20,
@@ -1296,7 +1302,7 @@ def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejec
 
 
 @st.cache_data(show_spinner=False)
-def process_uploaded_report(file_name, pdf_bytes):
+def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml):
     """Extract and calculate all report outputs for one uploaded PDF."""
     pages = extract_pages(pdf_bytes)
     batch = parse_batch_details(pages)
@@ -1332,7 +1338,9 @@ def process_uploaded_report(file_name, pdf_bytes):
     premix_prepared = prepare_premixing_engineering_data(premixing_data)
     premix_blocks = summarize_premixing_directional_blocks(premix_prepared)
     premix_pairs = pair_premixing_bidirectional_attempts(premix_blocks)
-    premix_prediction = reverse_predict_premixing_volume_step(premix_pairs)
+    premix_prediction = reverse_predict_premixing_volume_step(
+        premix_pairs, premixing_step_volume_ml
+    )
 
     if not premix_pairs.empty and not premix_prediction.empty:
         volume_step_map = premix_prediction[[
@@ -1366,6 +1374,7 @@ def process_uploaded_report(file_name, pdf_bytes):
         "premix_pairs": premix_pairs,
         "premix_prediction": premix_prediction,
         "premix_summary": premix_summary,
+        "premixing_step_volume_ml": float(premixing_step_volume_ml),
     }
 
 
@@ -1427,6 +1436,34 @@ def main():
     )
     graph_font_family, graph_font_size = graph_display_controls()
 
+    st.markdown("### Premixing batch configuration")
+    premixing_batch_size = st.selectbox(
+        "Premixing batch size / step volume",
+        options=["1 kg batch - 16.5 mL", "1.5 kg batch - 25.0 mL", "Custom"],
+        index=0,
+        help=(
+            "The selected step volume controls the initial Premixing volume, every "
+            "subsequent increment, target-volume calculation, plot spacing, and exports."
+        ),
+    )
+    if premixing_batch_size == "1 kg batch - 16.5 mL":
+        premixing_step_volume_ml = 16.5
+    elif premixing_batch_size == "1.5 kg batch - 25.0 mL":
+        premixing_step_volume_ml = 25.0
+    else:
+        premixing_step_volume_ml = float(st.number_input(
+            "Custom Premixing step volume (mL)",
+            min_value=0.1,
+            max_value=100.0,
+            value=16.5,
+            step=0.5,
+            format="%.1f",
+        ))
+    st.info(
+        f"Selected Premixing step volume: {premixing_step_volume_ml:g} mL | "
+        f"Plot range: 0 to {premixing_step_volume_ml * 12:g} mL"
+    )
+
     uploaded_files = st.file_uploader(
         "Upload Batch Cycle Report PDFs",
         type=["pdf"],
@@ -1451,6 +1488,7 @@ def main():
             processed_results[unique_key] = process_uploaded_report(
                 uploaded_file.name,
                 uploaded_file.getvalue(),
+                premixing_step_volume_ml,
             )
         except Exception as error:
             extraction_errors[uploaded_file.name] = str(error)
@@ -1482,6 +1520,7 @@ def main():
             "Process Runs": len(result["summaries"]),
             "Datalog Rows": len(result["datalog"]),
             "Rejected Rows": len(result["rejected_rows"]),
+            "Premixing Step (mL)": result["premixing_step_volume_ml"],
             "Status": "Processed",
         })
 
@@ -1516,6 +1555,7 @@ def main():
     premix_pairs = selected_result["premix_pairs"]
     premix_prediction = selected_result["premix_prediction"]
     premix_summary = selected_result["premix_summary"]
+    selected_premixing_step_volume_ml = selected_result["premixing_step_volume_ml"]
 
     st.markdown(f"### Selected report: {selected_result['file_name']}")
     c1, c2, c3, c4 = st.columns(4)
