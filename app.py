@@ -59,7 +59,7 @@ def duration_text(start, end):
 
 
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.23-final-deploy-path-fix-v26"
+    parser_version = "2026.10.23-progress-status-retry-v28"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -1217,6 +1217,10 @@ def graph_display_controls():
                 if state_key.startswith(generated_prefixes):
                     del st.session_state[state_key]
             st.session_state.pop("active_upload_signature", None)
+            st.session_state.pop("pdf_processing_status", None)
+            st.session_state.pop("pdf_processing_errors", None)
+            st.session_state.pop("processed_selected_pdf_key", None)
+            st.session_state.pop("selected_pdf_signature", None)
             gc.collect()
             st.rerun()
         st.caption(
@@ -1508,94 +1512,206 @@ def main():
         f"Maximum allowed per processing run: {MAX_UPLOAD_FILES} files."
     )
 
-    uploaded_payloads = []
+    # Build a lightweight inventory and preserve processing status per file.
+    if "pdf_processing_status" not in st.session_state:
+        st.session_state["pdf_processing_status"] = {}
+    if "pdf_processing_errors" not in st.session_state:
+        st.session_state["pdf_processing_errors"] = {}
+
+    inventory_rows = []
+    file_options = {}
+    file_status_keys = {}
     for file_index, uploaded_file in enumerate(uploaded_files, start=1):
-        pdf_bytes = uploaded_file.getvalue()
-        fingerprint = uploaded_report_fingerprint(uploaded_file.name, pdf_bytes)
-        uploaded_payloads.append((file_index, uploaded_file.name, pdf_bytes, fingerprint))
-
-    active_upload_signature = hashlib.sha256(
-        "|".join(
-            f"{fingerprint}:{premixing_step_volume_ml:g}"
-            for _, _, _, fingerprint in uploaded_payloads
-        ).encode("utf-8")
-    ).hexdigest()[:20]
-
-    if st.session_state.get("active_upload_signature") != active_upload_signature:
-        for state_key in list(st.session_state):
-            if state_key.startswith(("generated_excel_", "generated_zip_", "generated_html_")):
-                del st.session_state[state_key]
-        st.session_state["active_upload_signature"] = active_upload_signature
-        gc.collect()
-
-    processed_results = {}
-    extraction_errors = {}
-    progress = st.progress(0, text="Preparing report extraction...")
-
-    for file_index, file_name, pdf_bytes, fingerprint in uploaded_payloads:
-        unique_key = f"{file_index:03d}_{fingerprint}"
-        progress.progress(
-            (file_index - 1) / len(uploaded_payloads),
-            text=f"Processing {file_index}/{len(uploaded_payloads)}: {file_name}",
+        display_label = f"{file_index:02d}. {uploaded_file.name}"
+        status_key = (
+            f"{uploaded_file.name}|{uploaded_file.size}|"
+            f"{premixing_step_volume_ml:g}"
         )
-        try:
-            processed_results[unique_key] = process_uploaded_report(
-                file_name,
-                pdf_bytes,
-                premixing_step_volume_ml,
-            )
-        except Exception as error:
-            extraction_errors[file_name] = f"{type(error).__name__}: {error}"
-        finally:
-            gc.collect()
-
-    progress.progress(1.0, text="All uploaded reports have been processed.")
-
-    if extraction_errors:
-        with st.expander(
-            f"Files requiring review ({len(extraction_errors)})",
-            expanded=True,
-        ):
-            for file_name, message in extraction_errors.items():
-                st.error(f"{file_name}: {message}")
-
-    if not processed_results:
-        st.error("None of the uploaded PDF reports could be processed.")
-        st.stop()
-
-    summary_rows = []
-    selector_labels = {}
-    for result_key, result in processed_results.items():
-        batch_number = result["batch"].get("Batch no.") or "Batch number not found"
-        selector_label = (
-            f"{batch_number} | {result['file_name']} | {result_key[:3]}"
+        file_options[display_label] = uploaded_file
+        file_status_keys[display_label] = status_key
+        current_status = st.session_state["pdf_processing_status"].get(
+            status_key, "Ready to process"
         )
-        selector_labels[selector_label] = result_key
-        summary_rows.append({
-            "File Name": result["file_name"],
-            "Batch No.": batch_number,
-            "PDF Pages": len(result["pages"]),
-            "Process Runs": len(result["summaries"]),
-            "Datalog Rows": len(result["datalog"]),
-            "Rejected Rows": len(result["rejected_rows"]),
-            "Premixing Step (mL)": result["premixing_step_volume_ml"],
-            "Status": "Processed",
+        inventory_rows.append({
+            "No.": file_index,
+            "File Name": uploaded_file.name,
+            "File Size (MB)": round(uploaded_file.size / (1024 * 1024), 2),
+            "Status": current_status,
         })
 
-    st.markdown("### Uploaded report summary")
+    st.markdown("### Uploaded file inventory")
     st.dataframe(
-        pd.DataFrame(summary_rows),
+        pd.DataFrame(inventory_rows),
         use_container_width=True,
         hide_index=True,
     )
 
     selected_label = st.selectbox(
-        "Select report to review",
-        options=list(selector_labels),
-        key="selected_batch_report",
+        "Select one PDF to process",
+        options=list(file_options),
+        key="selected_pdf_to_process",
     )
-    selected_result = processed_results[selector_labels[selected_label]]
+    selected_upload = file_options[selected_label]
+    selected_status_key = file_status_keys[selected_label]
+    selected_status = st.session_state["pdf_processing_status"].get(
+        selected_status_key, "Ready to process"
+    )
 
+    current_selection_signature = selected_status_key
+    if st.session_state.get("selected_pdf_signature") != current_selection_signature:
+        st.session_state.pop("processed_selected_pdf_key", None)
+        st.session_state.pop("selected_pdf_signature", None)
+
+    status_col, action_col, guidance_col = st.columns([1.1, 1.1, 2.2])
+    if selected_status == "Processed":
+        status_col.success("Status: Processed")
+    elif selected_status == "Failed":
+        status_col.error("Status: Failed")
+    elif selected_status == "Processing":
+        status_col.warning("Status: Processing")
+    else:
+        status_col.info("Status: Ready")
+
+    process_requested = False
+    retry_requested = False
+    if selected_status == "Failed":
+        retry_requested = action_col.button(
+            "Retry Failed PDF",
+            type="primary",
+            use_container_width=True,
+            key=f"retry_{hashlib.sha256(selected_status_key.encode()).hexdigest()[:12]}",
+        )
+    else:
+        process_requested = action_col.button(
+            "Process Selected Report",
+            type="primary",
+            use_container_width=True,
+            key=f"process_{hashlib.sha256(selected_status_key.encode()).hexdigest()[:12]}",
+        )
+
+    guidance_col.info(
+        "Only the selected PDF is processed. Failed files can be retried without "
+        "re-uploading the complete set."
+    )
+
+    selected_error = st.session_state["pdf_processing_errors"].get(
+        selected_status_key
+    )
+    if selected_status == "Failed" and selected_error:
+        st.error(f"Previous failure: {selected_error}")
+
+    should_process = process_requested or retry_requested
+    if should_process:
+        st.session_state["pdf_processing_status"][selected_status_key] = "Processing"
+        st.session_state["pdf_processing_errors"].pop(selected_status_key, None)
+        processing_progress = st.progress(
+            5,
+            text=f"Preparing {selected_upload.name}...",
+        )
+        pdf_bytes = selected_upload.getvalue()
+        processing_progress.progress(
+            15,
+            text="Reading PDF and validating the selected report...",
+        )
+        fingerprint = uploaded_report_fingerprint(selected_upload.name, pdf_bytes)
+        selected_result_key = f"{fingerprint}_{premixing_step_volume_ml:g}"
+
+        with st.status(
+            f"Processing {selected_upload.name}...",
+            expanded=True,
+        ) as status:
+            try:
+                processing_progress.progress(
+                    30,
+                    text="Extracting pages, process summaries, and datalogs...",
+                )
+                selected_result = process_uploaded_report(
+                    selected_upload.name,
+                    pdf_bytes,
+                    premixing_step_volume_ml,
+                )
+                processing_progress.progress(
+                    90,
+                    text="Finalizing calculations and report status...",
+                )
+                st.session_state["processed_selected_pdf_key"] = selected_result_key
+                st.session_state["selected_pdf_signature"] = current_selection_signature
+                st.session_state["pdf_processing_status"][selected_status_key] = "Processed"
+                st.session_state["pdf_processing_errors"].pop(selected_status_key, None)
+                processing_progress.progress(
+                    100,
+                    text=f"Completed: {selected_upload.name}",
+                )
+                status.update(
+                    label=f"Completed: {selected_upload.name}",
+                    state="complete",
+                    expanded=False,
+                )
+            except Exception as error:
+                error_message = f"{type(error).__name__}: {error}"
+                st.session_state["pdf_processing_status"][selected_status_key] = "Failed"
+                st.session_state["pdf_processing_errors"][selected_status_key] = error_message
+                st.session_state.pop("processed_selected_pdf_key", None)
+                processing_progress.progress(
+                    100,
+                    text=f"Failed: {selected_upload.name}",
+                )
+                status.update(
+                    label=f"Failed: {selected_upload.name}",
+                    state="error",
+                    expanded=True,
+                )
+                st.error(error_message)
+                st.info("Use **Retry Failed PDF** to run this file again.")
+                gc.collect()
+                st.stop()
+            finally:
+                gc.collect()
+    else:
+        processed_key = st.session_state.get("processed_selected_pdf_key")
+        expected_prefix = None
+        if (
+            processed_key
+            and selected_status == "Processed"
+            and st.session_state.get("selected_pdf_signature")
+            == current_selection_signature
+        ):
+            pdf_bytes = selected_upload.getvalue()
+            fingerprint = uploaded_report_fingerprint(selected_upload.name, pdf_bytes)
+            expected_prefix = f"{fingerprint}_{premixing_step_volume_ml:g}"
+        if processed_key and processed_key == expected_prefix:
+            selected_result = process_uploaded_report(
+                selected_upload.name,
+                pdf_bytes,
+                premixing_step_volume_ml,
+            )
+        else:
+            if selected_status == "Failed":
+                st.info("Click **Retry Failed PDF** to process this report again.")
+            else:
+                st.info("Select a PDF and click **Process Selected Report**.")
+            st.stop()
+
+    st.markdown("### Processed report summary")
+    batch_number_summary = (
+        selected_result["batch"].get("Batch no.") or "Batch number not found"
+    )
+    st.dataframe(
+        pd.DataFrame([{
+            "File Name": selected_result["file_name"],
+            "Batch No.": batch_number_summary,
+            "PDF Pages": len(selected_result["pages"]),
+            "Process Runs": len(selected_result["summaries"]),
+            "Datalog Rows": len(selected_result["datalog"]),
+            "Rejected Rows": len(selected_result["rejected_rows"]),
+            "Premixing Step (mL)": selected_result["premixing_step_volume_ml"],
+            "Status": "Processed",
+        }]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    selected_result_key = st.session_state["processed_selected_pdf_key"]
     pages = selected_result["pages"]
     batch = selected_result["batch"]
     overview = selected_result["overview"]
@@ -2071,13 +2187,13 @@ def main():
         selected_result["file_name"]
     ).stem
     safe_batch_number = safe_output_name(batch_number)
-    selected_result_key = selector_labels[selected_label]
+    selected_result_key = selected_result_key
 
     st.markdown("### Export files")
     export_col1, export_col2 = st.columns(2)
 
     selected_excel_key = (
-        f"generated_excel_{selected_result_key}_{selected_premixing_step_volume_ml}"
+        f"generated_excel_{selected_result_key}"
     )
     if export_col1.button(
         "Prepare Selected Batch Excel",
@@ -2097,28 +2213,10 @@ def main():
             use_container_width=True,
         )
 
-    all_batches_zip_key = (
-        f"generated_zip_{active_upload_signature}_{premixing_step_volume_ml:g}"
+    export_col2.info(
+        "To process the next PDF, select another file in the inventory and click "
+        "**Process Selected Report**. This avoids CPU throttling."
     )
-    if export_col2.button(
-        "Prepare All Batch Excel Files",
-        key=f"prepare_{all_batches_zip_key}",
-        use_container_width=True,
-    ):
-        with st.spinner("Preparing Excel workbooks and ZIP package..."):
-            st.session_state[all_batches_zip_key] = build_all_batches_zip(
-                processed_results,
-                extraction_errors,
-            )
-    if all_batches_zip_key in st.session_state:
-        export_col2.download_button(
-            "⬇️ Download All Batch Excel Files (ZIP)",
-            st.session_state[all_batches_zip_key],
-            "all_batch_process_extractions.zip",
-            "application/zip",
-            key=f"download_{all_batches_zip_key}",
-            use_container_width=True,
-        )
 
 
 if __name__ == "__main__":
