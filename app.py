@@ -4,6 +4,7 @@ import io
 import math
 import re
 import zipfile
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -58,7 +59,7 @@ def duration_text(start, end):
 
 
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.23-final-deploy-stable-v25"
+    parser_version = "2026.10.23-final-deploy-path-fix-v26"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
