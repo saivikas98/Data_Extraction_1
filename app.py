@@ -59,7 +59,7 @@ def duration_text(start, end):
 
 
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.23-progress-status-retry-v28"
+    parser_version = "2026.10.30-mixing-1.5mm-extruder1-v29"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -151,8 +151,10 @@ def parse_recipe_settings(pages, summaries):
 
 
 def normalize_mixing_step_name(step_name):
-    """Correct report typo 3,8 mm/3,8mm to 3.8mm in Mixing Step Name."""
-    text = re.sub(r"(?i)3\s*,\s*8\s*mm", "3.8mm", str(step_name))
+    """Normalize decimal-comma and spacing variations in Mixing step names."""
+    text = str(step_name)
+    text = re.sub(r"(?i)3\s*[,.]\s*8\s*mm", "3.8mm", text)
+    text = re.sub(r"(?i)1\s*[,.]\s*5\s*mm", "1.5mm", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -750,7 +752,7 @@ def build_mixing_max_pressure_table(mixing_data):
     - Movement to accumulator RIGHT: maximum Loadcell LEFT pressure.
     - Movement to accumulator LEFT: maximum Loadcell RIGHT pressure.
 
-    Separate results are generated for 5 mm, 3.8 mm and 2 mm extrusion steps.
+    Separate results are generated for 5 mm, 3.8 mm, 2 mm and 1.5 mm extrusion steps.
     Cycle 0 is excluded because it represents initialization rather than a completed cycle.
     """
     columns = [
@@ -778,8 +780,9 @@ def build_mixing_max_pressure_table(mixing_data):
 
     patterns = {
         "5 mm": r"extrusion\s*:?\s*5\s*mm\s+to\s+accumulator\s+(?:right|left)",
-        "3.8 mm": r"extrusion\s*:?\s*3[\.,]8\s*mm\s+to\s+accumulator\s+(?:right|left)",
+        "3.8 mm": r"extrusion\s*:?\s*3[.,]8\s*mm\s+to\s+accumulator\s+(?:right|left)",
         "2 mm": r"extrusion\s*:?\s*2\s*mm\s+to\s+accumulator\s+(?:right|left)",
+        "1.5 mm": r"extrusion\s*:?\s*1[.,]5\s*mm\s+to\s+accumulator\s+(?:right|left)",
     }
     output = []
 
@@ -1829,7 +1832,7 @@ def main():
                 "Mixing extruder", mixing_extruders, key="mixing_plot_extruder"
             )
             available_orifices = [
-                item for item in ["5 mm", "3.8 mm", "2 mm"]
+                item for item in ["5 mm", "3.8 mm", "2 mm", "1.5 mm"]
                 if item in set(
                     mixing_pressure_table.loc[
                         mixing_pressure_table["Extruder"].eq(selected_mixing_extruder),
@@ -2221,4 +2224,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
