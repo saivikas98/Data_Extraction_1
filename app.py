@@ -1,3 +1,4 @@
+import bisect
 import gc
 import hashlib
 import io
@@ -22,7 +23,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.10.30-stage-timings-v40"
+APP_SCHEMA_VERSION = "2026.10.30-indexed-parser-ultrafast-v41"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -94,10 +95,18 @@ def extract_page_layout_pymupdf(page):
 
 def extract_pages(pdf_bytes, extraction_engine="Fast - PyMuPDF"):
     """Extract all PDF pages using a fast engine with safe fallback."""
-    if extraction_engine == "Fast - PyMuPDF":
+    if extraction_engine in {
+        "Ultra Fast - PyMuPDF text",
+        "Layout - PyMuPDF words",
+    }:
         try:
             document = fitz.open(stream=pdf_bytes, filetype="pdf")
             try:
+                if extraction_engine == "Ultra Fast - PyMuPDF text":
+                    return [
+                        document.load_page(page_index).get_text("text", sort=True)
+                        for page_index in range(document.page_count)
+                    ]
                 return [
                     extract_page_layout_pymupdf(document.load_page(page_index))
                     for page_index in range(document.page_count)
@@ -105,8 +114,6 @@ def extract_pages(pdf_bytes, extraction_engine="Fast - PyMuPDF"):
             finally:
                 document.close()
         except Exception:
-            # Preserve report availability if a PDF contains an unsupported
-            # object or malformed page that PyMuPDF cannot read.
             pass
 
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
@@ -213,66 +220,218 @@ def normalize_mixing_step_name(step_name):
 
 
 def parse_datalogs(pages, summaries):
-    extracted_frames, diagnostic_rows, rejected_rows, process_ranges = [], [], [], []
+    """Parse datalogs using a pre-built page index instead of repeated PDF scans."""
+    extracted_frames = []
+    diagnostic_rows = []
+    rejected_rows = []
+    process_ranges = []
     timestamp_start = re.compile(rf"^\s*({DATE})\s+({TIME})\s+")
+
+    # Index page headings once. The previous implementation repeatedly scanned
+    # forward through the full report for every process run, which was costly for
+    # 1,000-2,000 page PDFs and repeated Extruder runs.
+    datalog_pages_by_stage = {stage: [] for stage in STAGES}
+    process_heading_pages = []
+    for page_number, text in enumerate(pages, start=1):
+        for stage in STAGES:
+            if re.search(rf"(?mi)^\s*{stage}\s+DATALOG\s*$", text):
+                datalog_pages_by_stage[stage].append(page_number)
+                break
+        if identify_stage(text, "PROCESS"):
+            process_heading_pages.append(page_number)
+
     ordered_summaries = summaries.sort_values("Source Page").reset_index(drop=True).copy()
     if not ordered_summaries.empty:
         ordered_summaries["Run Number"] = (
             ordered_summaries.groupby(["Stage", "Extruder"], dropna=False).cumcount() + 1
         )
+
     for _, summary in ordered_summaries.iterrows():
-        stage, machine, extruder = summary["Stage"], summary["Machine"], summary["Extruder"]
+        stage = summary["Stage"]
+        machine = summary["Machine"]
+        extruder = summary["Extruder"]
         run_number = int(summary.get("Run Number", 1))
         process_start = summary.get("Process start")
-        summary_page, expected = int(summary["Source Page"]), len(DATALOG_COLUMNS[stage])
-        row_pattern = re.compile(rf"^\s*({DATE})\s+({TIME})\s+(.+?)\s+((?:\S+\s+){{{expected - 1}}}\S+)\s*$")
-        started = False; first_page = None; last_page = None; run_frames = []
-        terminal_found = False; terminal_name = None
-        for page_number in range(summary_page, len(pages) + 1):
+        summary_page = int(summary["Source Page"])
+        expected = len(DATALOG_COLUMNS[stage])
+        row_pattern = re.compile(
+            rf"^\s*({DATE})\s+({TIME})\s+(.+?)\s+"
+            rf"((?:\S+\s+){{{expected - 1}}}\S+)\s*$"
+        )
+
+        # The current run must end before the next PROCESS heading.
+        process_position = bisect.bisect_right(process_heading_pages, summary_page)
+        next_process_page = (
+            process_heading_pages[process_position]
+            if process_position < len(process_heading_pages)
+            else len(pages) + 1
+        )
+
+        stage_datalog_pages = datalog_pages_by_stage.get(stage, [])
+        first_position = bisect.bisect_left(stage_datalog_pages, summary_page)
+        candidate_pages = []
+        if first_position < len(stage_datalog_pages):
+            first_candidate = stage_datalog_pages[first_position]
+            if first_candidate < next_process_page:
+                candidate_pages.append(first_candidate)
+                previous_page = first_candidate
+                for page_number in stage_datalog_pages[first_position + 1:]:
+                    if page_number >= next_process_page or page_number != previous_page + 1:
+                        break
+                    candidate_pages.append(page_number)
+                    previous_page = page_number
+
+        first_page = candidate_pages[0] if candidate_pages else None
+        last_page = candidate_pages[-1] if candidate_pages else None
+        terminal_found = False
+        terminal_name = None
+        run_frames = []
+
+        for page_number in candidate_pages:
             text = pages[page_number - 1]
-            heading = bool(re.search(rf"(?mi)^\s*{stage}\s+DATALOG\s*$", text))
-            if not started:
-                if not heading:
-                    if page_number > summary_page and identify_stage(text, "PROCESS"): break
+            records = []
+            candidates = 0
+            rejected = 0
+
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                if not timestamp_start.match(line):
                     continue
-                started = True; first_page = page_number
-            elif not heading: break
-            last_page = page_number; records = []; candidates = 0; rejected = 0
-            for line_number, line in enumerate(text.splitlines(), 1):
-                if not timestamp_start.match(line): continue
-                candidates += 1; match = row_pattern.match(line)
+                candidates += 1
+                match = row_pattern.match(line)
                 if not match:
-                    rejected += 1; rejected_rows.append({"Stage": stage, "Machine": machine, "Extruder": extruder, "Source Page": page_number, "Line Number": line_number, "Reason": f"Could not isolate {expected} trailing fields", "Raw Line": line.strip()}); continue
+                    rejected += 1
+                    rejected_rows.append({
+                        "Stage": stage,
+                        "Machine": machine,
+                        "Extruder": extruder,
+                        "Run Number": run_number,
+                        "Source Page": page_number,
+                        "Line Number": line_number,
+                        "Reason": f"Could not isolate {expected} trailing fields",
+                        "Raw Line": line.strip(),
+                    })
+                    continue
+
                 raw = match.group(4).split()
                 if len(raw) != expected:
-                    rejected += 1; continue
+                    rejected += 1
+                    continue
+
                 values = []
                 for value in raw:
-                    if value.upper() == "NA": values.append(None)
+                    if value.upper() == "NA":
+                        values.append(None)
                     else:
-                        try: values.append(float(value))
-                        except ValueError: values.append(value)
+                        try:
+                            values.append(float(value))
+                        except ValueError:
+                            values.append(value)
+
                 raw_step_name = match.group(3).strip()
                 corrected_step_name = (
                     normalize_mixing_step_name(raw_step_name)
                     if stage == "MIXING" else raw_step_name
                 )
-                record = {"Stage": stage, "Machine": machine, "Extruder": extruder, "Run Number": run_number, "Process Start": process_start, "Date & Time": parse_dt(f"{match.group(1)} {match.group(2)}"), "Step Name": corrected_step_name, "Source Page": page_number, "Source Line": line_number}
-                record.update(dict(zip(DATALOG_COLUMNS[stage], values))); records.append(record)
-                normalized = re.sub(r"\s+", " ", record["Step Name"]).strip().casefold()
-                if stage == "BLENDING" and normalized in {"blending is done", "blending is completed", "blending completed"}:
-                    terminal_found = True; terminal_name = record["Step Name"]; break
-            diagnostic_rows.append({"Stage": stage, "Machine": machine, "Extruder": extruder, "Summary Page": summary_page, "Source Page": page_number, "Expected Fields": expected, "Candidate Timestamp Rows": candidates, "Extracted Rows": len(records), "Rejected/Missing Rows": rejected, "Extraction Rate (%)": round(100 * len(records) / candidates, 2) if candidates else 100.0, "Status": "OK" if rejected == 0 else "REVIEW"})
-            if records: run_frames.append(pd.DataFrame(records))
-            if terminal_found: break
-        process_ranges.append({"Stage": stage, "Machine": machine, "Extruder": extruder, "Summary Page": summary_page, "First Datalog Page": first_page, "Last Datalog Page": last_page, "Datalog Pages": last_page - first_page + 1 if first_page and last_page else 0, "Terminal Step Found": terminal_found, "Terminal Step Name": terminal_name, "Status": "OK" if first_page and (stage != "BLENDING" or terminal_found) else "DATALOG NOT FOUND" if not first_page else "TERMINAL STEP NOT FOUND"})
-        if run_frames: extracted_frames.append(pd.concat(run_frames, ignore_index=True))
-    datalog = pd.concat(extracted_frames, ignore_index=True).drop_duplicates().sort_values(["Stage", "Extruder", "Source Page", "Source Line"], kind="stable").reset_index(drop=True) if extracted_frames else pd.DataFrame()
-    if not datalog.empty:
-        preferred = ["Stage", "Machine", "Extruder", "Run Number", "Process Start", "Date & Time", "Step Name", "Source Page", "Source Line"]
-        datalog = datalog[preferred + [c for c in datalog.columns if c not in preferred]]
-    return datalog, pd.DataFrame(diagnostic_rows), pd.DataFrame(rejected_rows), pd.DataFrame(process_ranges)
+                record = {
+                    "Stage": stage,
+                    "Machine": machine,
+                    "Extruder": extruder,
+                    "Run Number": run_number,
+                    "Process Start": process_start,
+                    "Date & Time": parse_dt(
+                        f"{match.group(1)} {match.group(2)}"
+                    ),
+                    "Step Name": corrected_step_name,
+                    "Source Page": page_number,
+                    "Source Line": line_number,
+                }
+                record.update(dict(zip(DATALOG_COLUMNS[stage], values)))
+                records.append(record)
 
+                normalized = re.sub(
+                    r"\s+", " ", record["Step Name"]
+                ).strip().casefold()
+                if stage == "BLENDING" and normalized in {
+                    "blending is done",
+                    "blending is completed",
+                    "blending completed",
+                }:
+                    terminal_found = True
+                    terminal_name = record["Step Name"]
+                    break
+
+            diagnostic_rows.append({
+                "Stage": stage,
+                "Machine": machine,
+                "Extruder": extruder,
+                "Run Number": run_number,
+                "Summary Page": summary_page,
+                "Source Page": page_number,
+                "Expected Fields": expected,
+                "Candidate Timestamp Rows": candidates,
+                "Extracted Rows": len(records),
+                "Rejected/Missing Rows": rejected,
+                "Extraction Rate (%)": (
+                    round(100 * len(records) / candidates, 2)
+                    if candidates else 100.0
+                ),
+                "Status": "OK" if rejected == 0 else "REVIEW",
+            })
+            if records:
+                run_frames.append(pd.DataFrame(records))
+            if terminal_found:
+                last_page = page_number
+                break
+
+        process_ranges.append({
+            "Stage": stage,
+            "Machine": machine,
+            "Extruder": extruder,
+            "Run Number": run_number,
+            "Summary Page": summary_page,
+            "First Datalog Page": first_page,
+            "Last Datalog Page": last_page,
+            "Datalog Pages": (
+                last_page - first_page + 1
+                if first_page and last_page else 0
+            ),
+            "Terminal Step Found": terminal_found,
+            "Terminal Step Name": terminal_name,
+            "Status": (
+                "OK"
+                if first_page and (stage != "BLENDING" or terminal_found)
+                else "DATALOG NOT FOUND"
+                if not first_page
+                else "TERMINAL STEP NOT FOUND"
+            ),
+        })
+        if run_frames:
+            extracted_frames.append(pd.concat(run_frames, ignore_index=True))
+
+    datalog = (
+        pd.concat(extracted_frames, ignore_index=True)
+        .drop_duplicates()
+        .sort_values(
+            ["Stage", "Extruder", "Run Number", "Source Page", "Source Line"],
+            kind="stable",
+        )
+        .reset_index(drop=True)
+        if extracted_frames else pd.DataFrame()
+    )
+    if not datalog.empty:
+        preferred = [
+            "Stage", "Machine", "Extruder", "Run Number", "Process Start",
+            "Date & Time", "Step Name", "Source Page", "Source Line",
+        ]
+        datalog = datalog[
+            preferred + [column for column in datalog.columns if column not in preferred]
+        ]
+    return (
+        datalog,
+        pd.DataFrame(diagnostic_rows),
+        pd.DataFrame(rejected_rows),
+        pd.DataFrame(process_ranges),
+    )
 
 
 def premixing_movement_direction(left_speed, right_speed):
@@ -1731,11 +1890,16 @@ def main():
 
     extraction_engine = st.selectbox(
         "PDF extraction engine",
-        options=["Fast - PyMuPDF", "Compatibility - pypdf"],
+        options=[
+            "Ultra Fast - PyMuPDF text",
+            "Layout - PyMuPDF words",
+            "Compatibility - pypdf",
+        ],
         index=0,
         help=(
-            "Fast PyMuPDF is recommended for large batch reports. Use Compatibility "
-            "mode only if a specific report does not parse correctly."
+            "Ultra Fast is recommended for large batch reports. Use Layout mode "
+            "only if column alignment is not parsed correctly, and pypdf only as "
+            "a final compatibility fallback."
         ),
     )
 
