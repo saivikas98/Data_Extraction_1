@@ -1,2338 +1,2223 @@
+import gc
+import hashlib
+import io
+import math
 import re
 import zipfile
-import gc
-import math
-from io import BytesIO
+from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import plotly.io as pio
 import streamlit as st
+from pypdf import PdfReader
 
-try:
-    import pymupdf as fitz
-except ImportError:
-    import fitz
+st.set_page_config(page_title="Batch Process Data Extractor", page_icon="🧪", layout="wide")
 
-
-# =====================================================
-# PAGE CONFIGURATION
-# =====================================================
-st.set_page_config(
-    page_title="Batch Report Analyzer",
-    layout="wide",
-)
-
-PUMP_COLOR_MAP = {
-    "Pump 1": "#1f77b4",
-    "Pump 2": "#ff7f0e",
-    "Pump 3": "#2ca02c",
-    "Pump 4": "#d62728",
+STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
+MAX_UPLOAD_FILES = 20
+CACHE_TTL_SECONDS = 1800
+CACHE_MAX_REPORTS = 20
+DATE = r"\d{2}/\d{2}/\d{4}"
+TIME = r"\d{2}:\d{2}:\d{2}"
+DATALOG_COLUMNS = {
+    "WETTING": ["Vacuum Left (mbar)", "Vacuum Right (mbar)", "Loadcell Left (bar)", "Loadcell Right (bar)", "Servo Position Left (mm)", "Servo Position Right (mm)", "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)"],
+    "PREMIXING": ["Current Cycle", "Loadcell Left (bar)", "Loadcell Right (bar)", "Servo Position Left (mm)", "Servo Position Right (mm)", "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)"],
+    "MIXING": ["Current Cycle", "Orifice 3.8 Status", "Orifice 2 Status", "Orifice 1.5 Status", "Loadcell Left (bar)", "Loadcell Right (bar)", "Servo Position Left (mm)", "Servo Position Right (mm)", "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)"],
+    "BLENDING": ["Current Cycle", "Vacuum Left (mbar)", "Vacuum Right (mbar)", "Loadcell Left (bar)", "Loadcell Right (bar)", "Servo Position Left (mm)", "Servo Position Right (mm)", "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)", "Measured pH", "Added Water (mL)"],
 }
-FONT_OPTIONS = ["Times New Roman", "Arial", "Calibri", "Georgia", "Verdana"]
+
+# Premixing engineering constants
+PREMIXING_VOLUME_STEP_ML = 16.5
+PREMIXING_PRESSURE_STEP_BAR = 15.0
+PREMIXING_REPEAT_CYCLES = 3
+PREMIXING_MAX_PRESSURE_BAR = 190.0
+PREMIXING_CYLINDER_DIAMETER_MM = 80.1
+PREMIXING_CYLINDER_AREA_MM2 = (
+    np.pi * PREMIXING_CYLINDER_DIAMETER_MM ** 2 / 4
+)
+PREMIXING_VOLUME_PER_MM_ML = PREMIXING_CYLINDER_AREA_MM2 / 1000
+PREMIXING_TARGET_ACHIEVEMENT_PERCENT = 95.0
+PREMIXING_PRESSURE_MATCH_TOLERANCE_BAR = 0.5
+PREMIXING_SPEED_DIRECTION_TOLERANCE = 0.005
 
 
-# =====================================================
-# HELPERS
-# =====================================================
-def normalize_space(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+def parse_dt(value):
+    return pd.to_datetime(value, format="%d/%m/%Y %H:%M:%S", errors="coerce")
 
 
-def empty_dataframe(columns):
-    return pd.DataFrame(columns=columns)
+def duration_text(start, end):
+    if pd.isna(start) or pd.isna(end):
+        return None
+    seconds = max(0, int((end - start).total_seconds()))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{days}.{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def find_first(text, patterns, default=""):
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            return normalize_space(match.group(1))
-    return default
-
-
-def find_section_bounds(pages, include_terms, stop_terms=None):
-    """Return pages belonging to a report section based on page headers."""
-    selected = []
-    collecting = False
-    stop_terms = stop_terms or []
-
-    for page in pages:
-        page_text = page["Text"]
-        lower = page_text.lower()
-
-        if any(term.lower() in lower for term in include_terms):
-            collecting = True
-
-        if collecting and selected and any(term.lower() in lower for term in stop_terms):
-            break
-
-        if collecting:
-            selected.append(page)
-
-    return selected
-
-
-# =====================================================
-# PDF TEXT EXTRACTION
-# =====================================================
-def extract_pdf_pages(pdf_bytes, parser_version="2026-10-26-v13-memory-safe"):
-    document = fitz.open(stream=pdf_bytes, filetype="pdf")
+def extract_pages(pdf_bytes):
+    parser_version = "2026.10.23-progress-status-retry-v28"
+    _ = parser_version
+    reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
-    raw_parts = []
-    sorted_parts = []
-    audit_section_active = False
-
-    try:
-        for page_number, page in enumerate(document, start=1):
-            raw_text = page.get_text("text", sort=False) or ""
-            sorted_text = page.get_text("text", sort=True) or ""
-            raw_parts.append(raw_text)
-            sorted_parts.append(sorted_text)
-            lower_text = raw_text.lower()
-
-            # Word coordinates are memory-heavy. Keep them only on possible
-            # fill-weight pages where coordinate reconstruction may be needed.
-            fill_candidate = any(
-                marker in lower_text
-                for marker in [
-                    "nett weight", "net weight", "gross weight",
-                    "tare weight", "weight passed",
-                ]
-            )
-            words = page.get_text("words", sort=True) if fill_candidate else []
-
-            audit_rows = []
-            has_audit_header = (
-                "userid" in lower_text
-                and "description" in lower_text
-                and "category" in lower_text
-            )
-            if "audit trail" in lower_text or has_audit_header:
-                audit_section_active = True
-            if audit_section_active and any(
-                marker in lower_text
-                for marker in [
-                    "accumulator pressure", "heater temperature",
-                    "load cell trend", "weight trend",
-                ]
-            ):
-                audit_section_active = False
-
-            if audit_section_active:
-                try:
-                    for table in page.find_tables().tables:
-                        extracted = table.extract() or []
-                        if not extracted:
-                            continue
-                        first_row = [normalize_space(cell) for cell in extracted[0]]
-                        expected = {
-                            "Timestamp", "State", "UserID",
-                            "Description", "Comment", "Category",
-                        }
-                        if expected.issubset(set(first_row)):
-                            audit_rows.extend(extracted[1:])
-                        elif (
-                            len(first_row) >= 6
-                            and re.search(r"\d{2}/\d{2}/\d{4}", str(first_row[0]))
-                        ):
-                            audit_rows.extend(extracted)
-                except Exception:
-                    audit_rows = []
-
-            # Sorted Text is not retained per page because sorted_full_text below
-            # already contains it. This removes a large duplicate string copy.
-            pages.append(
-                {
-                    "Page": page_number,
-                    "Text": raw_text,
-                    "Words": words,
-                    "Audit Rows": audit_rows,
-                }
-            )
-    finally:
-        document.close()
-
-    full_text = "\n".join(raw_parts)
-    sorted_full_text = "\n".join(sorted_parts)
-    del raw_parts, sorted_parts
-    return full_text, sorted_full_text, pages
-
-
-# =====================================================
-# BATCH SUMMARY
-# =====================================================
-def extract_batch_summary(text):
-    summary = {
-        "Batch Number": find_first(
-            text,
-            [
-                r"Batch\s*No\.?\s*:\s*(.*?)\s*Batch\s*Start\s*Time",
-                r"Batch\s*Number\s*:\s*(.*?)\s*(?:\n|$)",
-            ],
-        ),
-        "Batch Start": find_first(
-            text,
-            [r"Batch\s*Start\s*Time\s*:\s*(.*?)\s*Batch\s*End\s*Time"],
-        ),
-        "Batch End": find_first(
-            text,
-            [r"Batch\s*End\s*Time\s*:\s*(.*?)\s*Batch\s*Running\s*Time"],
-        ),
-        "Runtime": find_first(
-            text,
-            [r"Batch\s*Running\s*Time(?:\s*\([^)]*\))?\s*:\s*(.*?)\s*Batch\s*Size"],
-        ),
-        "Batch Size": find_first(
-            text,
-            [r"Batch\s*Size\s*:\s*(.*?)\s*(?:Product\s*Name|Recipe|\n)"],
-        ),
-        "Product Name": find_first(
-            text,
-            [r"Product\s*Name\s*:\s*(.*?)\s*(?:Batch\s*No|Recipe|\n)"],
-        ),
-        "Recipe Name": find_first(
-            text,
-            [
-                r"Filling\s*Skid\s*Recipe\s*Name\s*:?\s*(.*?)\s*(?:\n|$)",
-                r"Recipe\s*Name\s*:\s*(.*?)\s*(?:\n|$)",
-            ],
-        ),
-    }
-    return pd.DataFrame([summary])
-
-
-# =====================================================
-# PRODUCTION COUNTERS
-# =====================================================
-def extract_production_counters(text, sorted_text=""):
-    columns = ["Counter Group", "Counter", "Value"]
-    combined = f"{text}\n{sorted_text}"
-    rows = []
-
-    # The report stores labels first and their values below them, for example:
-    # Infeed (pcs), Outfeed (pcs), Reject (pcs), followed by 1640, 1523, 117.
-    section_patterns = [
-        (
-            "Production Counters",
-            r"Production\s*Counters?\s*:\s*(.*?)\s*Check\s*Weigh\s*Reject\s*Counters?\s*:",
-            ["Infeed (pcs)", "Outfeed (pcs)", "Reject (pcs)"],
-        ),
-        (
-            "Check Weigh Reject Counters",
-            r"Check\s*Weigh\s*Reject\s*Counters?\s*:\s*(.*?)\s*Air\s*Bubble\s*Reject\s*Counters?\s*:",
-            ["Weigh Cell 1", "Weigh Cell 2", "Weigh Cell 3", "Weigh Cell 4", "Total"],
-        ),
-        (
-            "Air Bubble Reject Counters",
-            r"Air\s*Bubble\s*Reject\s*Counters?\s*:\s*(.*?)\s*Needle\s*Bonding\s*Reject\s*Counters?\s*:",
-            ["Position 1", "Position 2", "Position 3", "Position 4", "Total"],
-        ),
-        (
-            "Needle Bonding Reject Counters",
-            r"Needle\s*Bonding\s*Reject\s*Counters?\s*:\s*(.*?)\s*Assembly\s*Reject\s*Counters?\s*:",
-            ["Position 1", "Position 2", "Position 3", "Position 4", "Total"],
-        ),
-        (
-            "Assembly Reject Counters",
-            r"Assembly\s*Reject\s*Counters?\s*:\s*(.*?)\s*Filling\s*speed\s*:",
-            ["Position 1", "Position 2", "Position 3", "Position 4", "Total"],
-        ),
-    ]
-
-    for group, pattern, expected_labels in section_patterns:
-        match = re.search(pattern, combined, flags=re.IGNORECASE | re.DOTALL)
-        if not match:
-            continue
-        section = match.group(1)
-        values = [int(x.replace(",", "")) for x in re.findall(r"(?m)^\s*(\d[\d,]*)\s*$", section)]
-        if len(values) >= len(expected_labels):
-            values = values[-len(expected_labels):]
-            for label, value in zip(expected_labels, values):
-                rows.append({"Counter Group": group, "Counter": label, "Value": value})
-
-    # Direct inline fallback for other report versions.
-    if not any(row["Counter Group"] == "Production Counters" for row in rows):
-        inline = re.search(
-            r"Infeed\s*(?:\(pcs\))?\s*[:=-]?\s*(\d+)\s+"
-            r"Outfeed\s*(?:\(pcs\))?\s*[:=-]?\s*(\d+)\s+"
-            r"Reject\s*(?:\(pcs\))?\s*[:=-]?\s*(\d+)",
-            combined,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if inline:
-            for label, value in zip(
-                ["Infeed (pcs)", "Outfeed (pcs)", "Reject (pcs)"],
-                inline.groups(),
-            ):
-                rows.append(
-                    {
-                        "Counter Group": "Production Counters",
-                        "Counter": label,
-                        "Value": int(value),
-                    }
-                )
-
-    frame = pd.DataFrame(rows, columns=columns)
-    if not frame.empty:
-        frame = frame.drop_duplicates(
-            subset=["Counter Group", "Counter"], keep="first"
-        ).reset_index(drop=True)
-    return frame
-
-
-def extract_filling_speed(text, sorted_text=""):
-    combined = f"{text}\n{sorted_text}"
-    match = re.search(
-        r"Filling\s*speed\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*([^\n]*)",
-        combined,
-        flags=re.IGNORECASE,
-    )
-    if not match:
-        return pd.DataFrame(columns=["Parameter", "Value", "Unit"])
-
-    value = float(match.group(1).replace(",", "."))
-    unit = normalize_space(match.group(2)) or "syringes/min"
-    return pd.DataFrame(
-        [{"Parameter": "Filling Speed", "Value": value, "Unit": unit}]
-    )
-
-
-# =====================================================
-# FILL WEIGHT TABLE
-# =====================================================
-def _parse_fill_weight_stream(text):
-    """Parse both standard and manual-assembly fill-weight row formats.
-
-    Standard format:
-        Date Time Nett Gross Tare Passed AirBubble NeedleBonding Assembly Position
-
-    Manual-assembly format:
-        Date Time Nett Gross Tare Passed Position
-    """
-    rows = []
-
-    common_prefix = (
-        r"(\d{2}/\d{2}/\d{4})\s+"
-        r"(\d{2}:\d{2}:\d{2})\s+"
-        r"(-?\d+(?:[.,]\d+)?)\s+"
-        r"(-?\d+(?:[.,]\d+)?)\s+"
-        r"(-?\d+(?:[.,]\d+)?)\s+"
-        r"([01])\s+"
-    )
-
-    # Parse the longer standard format first so it cannot be partially consumed
-    # by the shorter manual-assembly pattern.
-    standard_pattern = re.compile(
-        common_prefix
-        + r"([01-])\s+"
-        + r"([01-])\s+"
-        + r"([01-])\s+"
-        + r"([1-4])(?=\s|$)",
-        flags=re.MULTILINE,
-    )
-
-    manual_pattern = re.compile(
-        common_prefix
-        + r"([1-4])(?=\s|$)",
-        flags=re.MULTILINE,
-    )
-
-    occupied_spans = []
-
-    def append_row(match, air_bubble="-", needle_bonding="-", assembly="-", position_group=7):
-        values = [match.group(i).replace(",", ".") for i in (3, 4, 5)]
-        rows.append(
-            {
-                "Timestamp": f"{match.group(1)} {match.group(2)}",
-                "Nett Weight": float(values[0]),
-                "Gross Weight": float(values[1]),
-                "Tare Weight": float(values[2]),
-                "Weight Passed": int(match.group(6)),
-                "Air Bubble": air_bubble,
-                "Needle Bonding": needle_bonding,
-                "Assembly": assembly,
-                "Position": int(match.group(position_group)),
-            }
-        )
-
-    for match in standard_pattern.finditer(text):
-        append_row(
-            match,
-            air_bubble=match.group(7),
-            needle_bonding=match.group(8),
-            assembly=match.group(9),
-            position_group=10,
-        )
-        occupied_spans.append(match.span())
-
-    def overlaps_standard(span):
-        return any(span[0] < end and span[1] > start for start, end in occupied_spans)
-
-    for match in manual_pattern.finditer(text):
-        if overlaps_standard(match.span()):
-            continue
-        append_row(match, position_group=7)
-
-    return rows
-
-
-def _words_to_visual_lines(words, y_tolerance=2.5):
-    """Rebuild visual rows from PyMuPDF words using y coordinates."""
-    if not words:
-        return []
-    ordered = sorted(words, key=lambda w: (round(w[1] / y_tolerance), w[0]))
-    lines = []
-    current = []
-    current_y = None
-    for word in ordered:
-        y = float(word[1])
-        if current_y is None or abs(y - current_y) <= y_tolerance:
-            current.append(word)
-            current_y = y if current_y is None else (current_y + y) / 2
-        else:
-            lines.append(" ".join(str(w[4]) for w in sorted(current, key=lambda x: x[0])))
-            current = [word]
-            current_y = y
-    if current:
-        lines.append(" ".join(str(w[4]) for w in sorted(current, key=lambda x: x[0])))
-    return lines
-
-
-def extract_fill_weights(text, sorted_text="", pages=None):
-    columns = [
-        "Timestamp", "Nett Weight", "Gross Weight", "Tare Weight",
-        "Weight Passed", "Air Bubble", "Needle Bonding", "Assembly", "Position",
-    ]
-    rows = []
-
-    # Try both native PDF reading orders first.
-    rows.extend(_parse_fill_weight_stream(text))
-    rows.extend(_parse_fill_weight_stream(sorted_text))
-
-    # Reconstruct visual lines from word coordinates when plain text order is column-wise.
-    if pages:
-        for page in pages:
-            lower = f"{page.get('Text', '')} {page.get('Sorted Text', '')}".lower()
-            is_candidate = any(
-                key in lower
-                for key in ["nett weight", "net weight", "gross weight", "tare weight", "weight passed", "processed items"]
-            )
-            if not is_candidate:
-                continue
-            visual_text = "\n".join(_words_to_visual_lines(page.get("Words", [])))
-            rows.extend(_parse_fill_weight_stream(visual_text))
-
-    frame = pd.DataFrame(rows, columns=columns)
-    if not frame.empty:
-        frame["Timestamp"] = pd.to_datetime(frame["Timestamp"], dayfirst=True, errors="coerce")
-        frame = (
-            frame.dropna(subset=["Timestamp"])
-            .drop_duplicates()
-            .sort_values("Timestamp")
-            .reset_index(drop=True)
-        )
-    return frame
-
-
-# =====================================================
-# ALARM EXTRACTION
-# =====================================================
-def clean_alarm_chunk(text):
-    """Remove repeating column headers and page footers before parsing alarms."""
-    # The footer begins with Batch Number on every alarm page. Anything after that
-    # is report metadata and must never become part of an alarm message.
-    # Alarm data must end before the legend or Audit Trail, even when both
-    # sections occur on the same PDF page as the final alarm record.
-    text = re.split(
-        r"(?im)^\s*(?:Alarm\s+State\s+Legend|Audit\s+Trail)\s*$",
-        text,
-        maxsplit=1,
-    )[0]
-    text = re.split(r"(?im)^\s*Batch\s+Number\s*:", text, maxsplit=1)[0]
-    text = re.sub(r"(?im)^\s*(Timestamp|State|MsgText|Code)\s*$", "", text)
-    text = re.sub(r"(?im)^\s*Page\s+\d+\s+of\s+\d+\s*$", "", text)
-    return text.strip()
-
-
-def parse_alarm_records(section_text, alarm_type):
-    columns = ["Timestamp", "State", "Message", "Code", "Alarm Type"]
-    rows = []
-    section_text = clean_alarm_chunk(section_text)
-    if not section_text:
-        return pd.DataFrame(columns=columns)
-
-    # A record is exactly: timestamp, state, message, integer code. The lookahead
-    # constrains the message to end before the next timestamp or end of clean chunk.
-    record_pattern = re.compile(
-        r"(\d{2}/\d{2}/\d{4})\s+"
-        r"(\d{2}:\d{2}:\d{2})\s+"
-        r"([+*\-])\s+"
-        r"(.+?)\s+"
-        r"(\d{1,5})\s*"
-        r"(?=(?:\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\s+[+*\-])|$)",
-        flags=re.DOTALL,
-    )
-
-    for match in record_pattern.finditer(section_text):
-        message = normalize_space(match.group(4))
-        # Defensive removal of any metadata if a report variant puts footer text inline.
-        message = re.split(
-            r"\b(?:Batch Number|Product Name|Report Generated|Printed by|Page \d+ of \d+)\s*:",
-            message,
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )[0]
-        message = normalize_space(message)
-        if not message:
-            continue
-        rows.append(
-            {
-                "Timestamp": f"{match.group(1)} {match.group(2)}",
-                "State": match.group(3),
-                "Message": message,
-                "Code": match.group(5),
-                "Alarm Type": alarm_type,
-            }
-        )
-
-    frame = pd.DataFrame(rows, columns=columns)
-    if not frame.empty:
-        frame["Timestamp"] = pd.to_datetime(
-            frame["Timestamp"], dayfirst=True, errors="coerce"
-        )
-        frame = (
-            frame.dropna(subset=["Timestamp"])
-            .drop_duplicates()
-            .sort_values("Timestamp")
-            .reset_index(drop=True)
-        )
-    return frame
-
-
-def extract_alarm_tables(pages):
-    """Parse Safety, GMP and Equipment sections page-by-page with header state."""
-    category_aliases = [
-        ("Safety", re.compile(r"(?im)^\s*(?:Alarms?\s+Safety|Safety\s+Alarms?)\s*$")),
-        ("GMP", re.compile(r"(?im)^\s*(?:Alarms?\s+GMP|GMP\s+Alarms?)\s*$")),
-        ("Equipment", re.compile(r"(?im)^\s*(?:Equipment\s+Alarms?|Alarms?\s+Equipment)\s*$")),
-    ]
-    chunks = {"Safety": [], "GMP": [], "Equipment": []}
-    current_category = None
-
-    for page in pages:
-        page_text = page.get("Text", "") or ""
-        # Remove the footer separately on every page. This fixes the observed case
-        # where "Batch Number: ..." was appended to the final message on a page.
-        page_text = re.split(
-            r"(?im)^\s*Batch\s+Number\s*:", page_text, maxsplit=1
-        )[0]
-
-        # A page can contain the final alarm, the Alarm State Legend and the
-        # beginning of Audit Trail. Truncate before the legend/audit header so
-        # audit descriptions can never be appended to the final alarm message.
-        boundary = re.search(
-            r"(?im)^\s*(?:Alarm\s+State\s+Legend|Audit\s+Trail)\s*$",
-            page_text,
-        )
-        reached_audit_boundary = boundary is not None
-        if boundary:
-            page_text = page_text[: boundary.start()]
-
-        # A page can contain the end of one category and the beginning of another.
-        header_hits = []
-        for category, header_pattern in category_aliases:
-            for hit in header_pattern.finditer(page_text):
-                header_hits.append((hit.start(), hit.end(), category))
-        header_hits.sort(key=lambda item: item[0])
-
-        cursor = 0
-        for hit_start, hit_end, new_category in header_hits:
-            if current_category and hit_start > cursor:
-                chunks[current_category].append(page_text[cursor:hit_start])
-            current_category = new_category
-            cursor = hit_end
-        if current_category and cursor < len(page_text):
-            chunks[current_category].append(page_text[cursor:])
-
-        # Stop carrying alarm state after the legend/audit boundary.
-        if reached_audit_boundary:
-            current_category = None
-
-    outputs = {}
-    for category in ["Safety", "GMP", "Equipment"]:
-        category_frames = []
-        for chunk in chunks[category]:
-            parsed = parse_alarm_records(chunk, category)
-            if not parsed.empty:
-                category_frames.append(parsed)
-        if category_frames:
-            outputs[category] = (
-                pd.concat(category_frames, ignore_index=True)
-                .drop_duplicates()
-                .sort_values("Timestamp")
-                .reset_index(drop=True)
-            )
-        else:
-            outputs[category] = empty_dataframe(
-                ["Timestamp", "State", "Message", "Code", "Alarm Type"]
-            )
-    return outputs["Safety"], outputs["GMP"], outputs["Equipment"]
-
-
-def extract_safety_alarms(pages):
-    return extract_alarm_tables(pages)[0]
-
-
-def extract_gmp_alarms(pages):
-    return extract_alarm_tables(pages)[1]
-
-
-def extract_equipment_alarms(pages):
-    return extract_alarm_tables(pages)[2]
-
-
-# =====================================================
-# AUDIT TRAIL EXTRACTION
-# =====================================================
-def extract_audit_trail(pages):
-    columns = [
-        "Page",
-        "Timestamp",
-        "State",
-        "User",
-        "Description",
-        "Comment",
-        "Category",
-        "Action",
-        "Audit Record",
-    ]
-    rows = []
-
-    def clean_cell(value):
-        value = str(value or "").replace("\n", " ")
-        value = normalize_space(value)
-        # Remove isolated layout underscores introduced by PDF cell extraction.
-        value = re.sub(r"(?<!\w)_+(?!\w)", " ", value)
-        return normalize_space(value)
-
-    def refine_audit_text(value):
-        """Repair words split by narrow PDF table cells without changing meaning."""
-        value = clean_cell(value)
-        if not value:
-            return ""
-
-        # Exact fragment repairs observed in this report and common HMI audit text.
-        replacements = {
-            r"\bN\s+ot\b": "Not",
-            r"\bH\s+MI\b": "HMI",
-            r"\bP\s+LC\b": "PLC",
-            r"\bCon\s+nection\b": "Connection",
-            r"\bConn\s+ection\b": "Connection",
-            r"\bPowere\s+d\b": "Powered",
-            r"\blogg\s+ed\b": "logged",
-            r"\bM\s+anager\b": "Manager",
-            r"\bv\s+alue\b": "value",
-            r"\bBat\s+ch\b": "Batch",
-            r"\bR\s+obot\b": "Robot",
-            r"\bG\s+eneral\b": "General",
-            r"\bU\s+nit\b": "Unit",
-            r"\bG\s+uarding\b": "Guarding",
-            r"\bD\s+oors\b": "Doors",
-            r"\badministr\s+ation\b": "administration",
-            r"\bAcknowledge\s+ment\b": "Acknowledgment",
-            r"\bdescrip\s+tion\b": "description",
-            r"\bproduc\s+tion\b": "production",
-            r"\binter\s+face\b": "interface",
-            r"\bInterface\s+PMQ\b": "Interface PMQ",
-        }
-        for pattern, replacement in replacements.items():
-            value = re.sub(pattern, replacement, value, flags=re.IGNORECASE)
-
-        # Repair known technical identifiers split by the narrow UserID column.
-        value = re.sub(r"\bINF11DP\s+R-E(\d+)\b", r"INF11DPR-E\1", value)
-        value = re.sub(r"/P\s+(\d{5,})\b", r"/P\1", value)
-        value = re.sub(r"\bHMI[_ ]?Con\s*nection[_ ]?(\d+)\b", r"HMI_Connection_\1", value, flags=re.IGNORECASE)
-        value = re.sub(r"\bHMI\s+Connection\s+(\d+)\b", r"HMI Connection \1", value, flags=re.IGNORECASE)
-
-        # Repair a single trailing letter split from a sufficiently long word,
-        # but only for endings commonly produced by column wrapping.
-        value = re.sub(
-            r"\b([A-Za-z]{4,})([ ]+)([dgry])\b",
-            lambda m: m.group(1) + m.group(3)
-            if (m.group(1) + m.group(3)).lower() in {
-                "powered", "logged", "manager", "empty", "running",
-                "stopped", "started", "changed", "closed", "opened",
-            }
-            else m.group(0),
-            value,
-            flags=re.IGNORECASE,
-        )
-        return normalize_space(value)
-
-    def normalize_audit_timestamp(value):
-        value = clean_cell(value)
-        # The narrow timestamp column wraps the hour, e.g.
-        # "02/08/2026 2\n2:32:01". After newline removal this becomes
-        # "02/08/2026 2 2:32:01" and must be rejoined to 22:32:01.
-        value = re.sub(
-            r"(\d{2}/\d{2}/\d{4})\s+(\d)\s+(\d:\d{2}:\d{2})",
-            r"\1 \2\3",
-            value,
-        )
-        value = re.sub(
-            r"(\d{2}/\d{2}/\d{4})\s+(\d{2})\s+(\d:\d{2}:\d{2})",
-            r"\1 \2\3",
-            value,
-        )
-        match = re.search(
-            r"\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}",
-            value,
-        )
-        return match.group(0) if match else ""
-
-    for page in pages:
-        page_number = page.get("Page", "")
-        for raw_row in page.get("Audit Rows", []) or []:
-            if not raw_row or len(raw_row) < 6:
-                continue
-            timestamp_text = normalize_audit_timestamp(raw_row[0])
-            if not timestamp_text:
-                continue
-
-            state = clean_cell(raw_row[1])
-            user = refine_audit_text(raw_row[2])
-            description = refine_audit_text(raw_row[3])
-            comment = refine_audit_text(raw_row[4])
-            category = refine_audit_text(raw_row[5])
-
-            # Category sometimes contains an alarm number such as "Alarm: 525".
-            # Preserve it exactly rather than discarding the field.
-            action = description
-            audit_record = " | ".join(
-                part
-                for part in [state, user, description, comment, category]
-                if part
-            )
-            rows.append(
-                {
-                    "Page": page_number,
-                    "Timestamp": timestamp_text,
-                    "State": state,
-                    "User": user,
-                    "Description": description,
-                    "Comment": comment,
-                    "Category": category,
-                    "Action": action,
-                    "Audit Record": audit_record,
-                }
-            )
-
-    frame = pd.DataFrame(rows, columns=columns)
-    if not frame.empty:
-        frame["Timestamp"] = pd.to_datetime(
-            frame["Timestamp"], dayfirst=True, errors="coerce"
-        )
-        frame = frame.dropna(subset=["Timestamp"]).reset_index(drop=True)
-        # Do not drop duplicates. Some audit events genuinely repeat at the same
-        # second and every printed table row must be retained.
-    return frame
-
-
-# =====================================================
-# FINAL ALARM MESSAGE SANITIZATION
-# =====================================================
-def sanitize_alarm_messages(alarm_df):
-    """Final guard against legend, audit-trail, and footer text entering alarms."""
-    if alarm_df is None or alarm_df.empty:
-        return alarm_df
-
-    cleaned = alarm_df.copy()
-    stop_pattern = re.compile(
-        r"\s*(?:"
-        r"Alarm\s+State\s+Legend|"
-        r"Audit\s+Trail|"
-        r"UserID\s+Description\s+Comment\s+Category|"
-        r"Timestamp\s+State\s+UserID|"
-        r"\+\s+Incoming\s+Alarm|"
-        r"-\s+Outgoing\s+Alarm|"
-        r"\*\s+Acknowledge\s+Alarm|"
-        r"Batch\s+Number\s*:|"
-        r"Product\s+Name\s*:|"
-        r"Report\s+Generated\s*:|"
-        r"Printed\s+by\s*:|"
-        r"Page\s+\d+\s+of\s+\d+"
-        r")",
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    def clean_message(value):
-        message = normalize_space(value)
-        return normalize_space(stop_pattern.split(message, maxsplit=1)[0])
-
-    cleaned["Message"] = cleaned["Message"].map(clean_message)
-    cleaned = cleaned[cleaned["Message"].str.len().gt(0)].copy()
-    return cleaned.drop_duplicates().reset_index(drop=True)
-
-
-# =====================================================
-# FILL-WEIGHT STATISTICS
-# =====================================================
-def create_fill_weight_statistics(fill_pass_df, batch_label=""):
-    columns = ["Batch", "Pump", "Sample Count", "Average", "Standard Deviation",
-               "Relative Standard Deviation (%)", "Minimum", "Maximum", "Range"]
-    if fill_pass_df is None or fill_pass_df.empty:
-        return pd.DataFrame(columns=columns)
-    rows = []
-    def add_row(label, series):
-        values = pd.to_numeric(series, errors="coerce").dropna()
-        n = int(values.count())
-        if not n:
-            return
-        avg = float(values.mean())
-        sd = float(values.std(ddof=1)) if n > 1 else 0.0
-        rows.append({"Batch": batch_label, "Pump": label, "Sample Count": n,
-                     "Average": avg, "Standard Deviation": sd,
-                     "Relative Standard Deviation (%)": (sd / avg * 100) if avg else 0.0,
-                     "Minimum": float(values.min()), "Maximum": float(values.max()),
-                     "Range": float(values.max() - values.min())})
-    for position in sorted(fill_pass_df["Position"].dropna().unique().tolist()):
-        add_row(f"Pump {int(position)}", fill_pass_df.loc[fill_pass_df["Position"].eq(position), "Nett Weight"])
-    add_row("All Pumps Combined", fill_pass_df["Nett Weight"])
-    out = pd.DataFrame(rows, columns=columns)
-    for col in columns[3:]:
-        out[col] = out[col].round(3)
-    return out
-
-
-def create_uploaded_batches_statistics(results):
-    batch_tables = []
-    all_passed = []
-    for result in results:
-        passed = result.get("fill_pass", pd.DataFrame())
-        if passed.empty:
-            continue
-        batch_tables.append(create_fill_weight_statistics(passed, result["batch_label"]))
-        all_passed.append(passed)
-    batch_stats = pd.concat(batch_tables, ignore_index=True) if batch_tables else create_fill_weight_statistics(pd.DataFrame())
-    combined_stats = create_fill_weight_statistics(
-        pd.concat(all_passed, ignore_index=True) if all_passed else pd.DataFrame(),
-        "All Uploaded Batches Combined",
-    )
-    return batch_stats, combined_stats
-
-
-# =====================================================
-# CROSS-BATCH STRENGTH COMPARISON
-# =====================================================
-def extract_strength_mg(summary_df):
-    """Extract product strength in mg from Product Name / Recipe Name / Batch Size."""
-    if summary_df is None or summary_df.empty:
-        return None
-    row = summary_df.iloc[0]
-    searchable = " ".join(
-        normalize_space(row.get(column, ""))
-        for column in ["Product Name", "Recipe Name", "Batch Size"]
-    )
-    match = re.search(r"(?i)(\d+(?:\.\d+)?)\s*mg\b", searchable)
-    if not match:
-        return None
-    value = float(match.group(1))
-    return int(value) if value.is_integer() else value
-
-
-def create_batch_pump_statistics_for_charts(results):
-    """Create one row per batch/pump plus an all-pumps row for comparison charts."""
-    rows = []
-    for result in results:
-        passed = result.get("fill_pass", pd.DataFrame())
-        if passed is None or passed.empty:
-            continue
-        strength = extract_strength_mg(result.get("summary", pd.DataFrame()))
-        if strength is None:
-            continue
-        batch = normalize_space(result.get("batch_label", ""))
-
-        def append_statistics(pump_label, values):
-            values = pd.to_numeric(values, errors="coerce").dropna()
-            count = int(values.count())
-            if count == 0:
-                return
-            mean_value = float(values.mean())
-            sd_value = float(values.std(ddof=1)) if count > 1 else 0.0
-            rsd_value = (sd_value / mean_value * 100.0) if mean_value else 0.0
-            rows.append(
-                {
-                    "Batch": batch,
-                    "Strength": strength,
-                    "Pump": pump_label,
-                    "Sample Count": count,
-                    "Average": mean_value,
-                    "Standard Deviation": sd_value,
-                    "RSD (%)": rsd_value,
-                }
-            )
-
-        for position in sorted(passed["Position"].dropna().unique().tolist()):
-            append_statistics(
-                f"Pump {int(position)}",
-                passed.loc[passed["Position"].eq(position), "Nett Weight"],
-            )
-        append_statistics("All Pumps Combined", passed["Nett Weight"])
-
+    for page in reader.pages:
+        try:
+            text = page.extract_text(extraction_mode="layout")
+        except TypeError:
+            text = page.extract_text()
+        pages.append(text or "")
+    return pages
+
+
+def value_after_label(text, label):
+    match = re.search(rf"(?mi)^\s*{re.escape(label)}\s+(.+?)\s*$", text)
+    return match.group(1).strip() if match else None
+
+
+def identify_stage(text, suffix):
+    for stage in STAGES:
+        if re.search(rf"(?mi)^\s*{stage}\s+{suffix}\s*$", text):
+            return stage
+    return None
+
+
+def extruder_number(machine):
+    match = re.search(r"Extruder\s*(\d+)", str(machine), re.I)
+    return int(match.group(1)) if match else None
+
+
+def parse_batch_details(pages):
+    text = "\n".join(pages[:5])
+    labels = ["Product name", "Batch no.", "Batch started by", "Batch ended by", "Batch start date & time", "Batch end date & time", "Duration (D.HH:MM:SS)"]
+    return {label: value_after_label(text, label) for label in labels}
+
+
+def parse_process_overview(pages):
+    rows, active, empty_pages = [], False, 0
+    pattern = re.compile(rf"^\s*(.*?)\s{{2,}}(.*?)\s{{2,}}({DATE}\s+{TIME})\s+({DATE}\s+{TIME})\s+(\d+)\s+(\d+)\s*$")
+    for page_number, text in enumerate(pages, 1):
+        if "PROCESS OVERVIEW" in text.upper(): active = True
+        if not active: continue
+        before = len(rows)
+        for line in text.splitlines():
+            match = pattern.match(line)
+            if not match: continue
+            start, end = parse_dt(match.group(3)), parse_dt(match.group(4))
+            rows.append({"Process Name": match.group(1).strip(), "Machine Name": match.group(2).strip(), "Process Start": start, "Process End": end, "Duration": duration_text(start, end), "Index": int(match.group(5)), "Total": int(match.group(6)), "Source Page": page_number})
+        empty_pages = empty_pages + 1 if len(rows) == before else 0
+        if rows and empty_pages >= 2: break
     return pd.DataFrame(rows)
 
 
-def make_strength_comparison_chart(
-    chart_df,
-    metric,
-    title,
-    y_axis_title,
-    font_family="Times New Roman",
-    font_size=12,
-):
-    """Create interactive vertically stacked strength subplots."""
-    if chart_df is None or chart_df.empty or metric not in chart_df.columns:
-        return None
+def parse_process_summaries(pages):
+    labels = ["Recipe name", "Machine", "Process start", "Process end", "Duration (D.HH:MM:SS)", "Process started by", "Process ended by", "API accumulator ID Left", "API accumulator ID Right", "Water accumulator ID Left", "Water accumulatorID Right", "Ph accumulator ID"]
+    rows = []
+    for page_number, text in enumerate(pages, 1):
+        stage = identify_stage(text, "PROCESS")
+        if not stage or "BATCH CYCLE REPORT" not in text.upper(): continue
+        row = {"Stage": stage, "Source Page": page_number}
+        row.update({label: value_after_label(text, label) for label in labels})
+        if row.get("Machine") and row.get("Process start"):
+            row["Extruder"] = extruder_number(row["Machine"]); rows.append(row)
+    frame = pd.DataFrame(rows)
+    if frame.empty: return frame
+    frame["Process start"] = frame["Process start"].map(parse_dt)
+    frame["Process end"] = frame["Process end"].map(parse_dt)
+    return frame.drop_duplicates(["Stage", "Machine", "Process start", "Process end"]).sort_values("Source Page").reset_index(drop=True)
 
-    strengths = sorted(chart_df["Strength"].dropna().unique().tolist(), reverse=True)
-    if not strengths:
-        return None
 
-    pump_order = [
-        "Pump 1", "Pump 2", "Pump 3", "Pump 4", "All Pumps Combined"
+def parse_recipe_settings(pages, summaries):
+    rows = []
+    pattern = re.compile(r"^\s*(.*?)\s{2,}(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(\S+)\s*$")
+    for _, summary in summaries.iterrows():
+        stage, first, active = summary["Stage"], int(summary["Source Page"]) - 1, False
+        for page_index in range(first, min(first + 5, len(pages))):
+            text = pages[page_index]
+            if re.search(rf"(?mi)^\s*{stage}\s+RECIPE SETTINGS\s*$", text): active = True
+            if not active: continue
+            for line in text.splitlines():
+                if "RECIPE SETTINGS" in line.upper(): continue
+                match = pattern.match(line)
+                if not match: continue
+                parameter = match.group(1).strip()
+                if not parameter or parameter.lower() == "name": continue
+                rows.append({"Stage": stage, "Extruder": summary["Extruder"], "Machine": summary["Machine"], "Parameter": parameter, "Minimum": float(match.group(2)), "Set Value": float(match.group(3)), "Maximum": float(match.group(4)), "Unit": match.group(5), "Source Page": page_index + 1})
+            if re.search(rf"(?mi)^\s*{stage}\s+DATALOG\s*$", text): break
+    columns = ["Stage", "Extruder", "Machine", "Parameter", "Minimum", "Set Value", "Maximum", "Unit", "Source Page"]
+    return pd.DataFrame(rows).drop_duplicates(["Stage", "Extruder", "Machine", "Parameter", "Source Page"]).reset_index(drop=True) if rows else pd.DataFrame(columns=columns)
+
+
+def normalize_mixing_step_name(step_name):
+    """Correct report typo 3,8 mm/3,8mm to 3.8mm in Mixing Step Name."""
+    text = re.sub(r"(?i)3\s*,\s*8\s*mm", "3.8mm", str(step_name))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def parse_datalogs(pages, summaries):
+    extracted_frames, diagnostic_rows, rejected_rows, process_ranges = [], [], [], []
+    timestamp_start = re.compile(rf"^\s*({DATE})\s+({TIME})\s+")
+    for _, summary in summaries.sort_values("Source Page").reset_index(drop=True).iterrows():
+        stage, machine, extruder = summary["Stage"], summary["Machine"], summary["Extruder"]
+        summary_page, expected = int(summary["Source Page"]), len(DATALOG_COLUMNS[stage])
+        row_pattern = re.compile(rf"^\s*({DATE})\s+({TIME})\s+(.+?)\s+((?:\S+\s+){{{expected - 1}}}\S+)\s*$")
+        started = False; first_page = None; last_page = None; run_frames = []
+        terminal_found = False; terminal_name = None
+        for page_number in range(summary_page, len(pages) + 1):
+            text = pages[page_number - 1]
+            heading = bool(re.search(rf"(?mi)^\s*{stage}\s+DATALOG\s*$", text))
+            if not started:
+                if not heading:
+                    if page_number > summary_page and identify_stage(text, "PROCESS"): break
+                    continue
+                started = True; first_page = page_number
+            elif not heading: break
+            last_page = page_number; records = []; candidates = 0; rejected = 0
+            for line_number, line in enumerate(text.splitlines(), 1):
+                if not timestamp_start.match(line): continue
+                candidates += 1; match = row_pattern.match(line)
+                if not match:
+                    rejected += 1; rejected_rows.append({"Stage": stage, "Machine": machine, "Extruder": extruder, "Source Page": page_number, "Line Number": line_number, "Reason": f"Could not isolate {expected} trailing fields", "Raw Line": line.strip()}); continue
+                raw = match.group(4).split()
+                if len(raw) != expected:
+                    rejected += 1; continue
+                values = []
+                for value in raw:
+                    if value.upper() == "NA": values.append(None)
+                    else:
+                        try: values.append(float(value))
+                        except ValueError: values.append(value)
+                raw_step_name = match.group(3).strip()
+                corrected_step_name = (
+                    normalize_mixing_step_name(raw_step_name)
+                    if stage == "MIXING" else raw_step_name
+                )
+                record = {"Stage": stage, "Machine": machine, "Extruder": extruder, "Date & Time": parse_dt(f"{match.group(1)} {match.group(2)}"), "Step Name": corrected_step_name, "Source Page": page_number, "Source Line": line_number}
+                record.update(dict(zip(DATALOG_COLUMNS[stage], values))); records.append(record)
+                normalized = re.sub(r"\s+", " ", record["Step Name"]).strip().casefold()
+                if stage == "BLENDING" and normalized in {"blending is done", "blending is completed", "blending completed"}:
+                    terminal_found = True; terminal_name = record["Step Name"]; break
+            diagnostic_rows.append({"Stage": stage, "Machine": machine, "Extruder": extruder, "Summary Page": summary_page, "Source Page": page_number, "Expected Fields": expected, "Candidate Timestamp Rows": candidates, "Extracted Rows": len(records), "Rejected/Missing Rows": rejected, "Extraction Rate (%)": round(100 * len(records) / candidates, 2) if candidates else 100.0, "Status": "OK" if rejected == 0 else "REVIEW"})
+            if records: run_frames.append(pd.DataFrame(records))
+            if terminal_found: break
+        process_ranges.append({"Stage": stage, "Machine": machine, "Extruder": extruder, "Summary Page": summary_page, "First Datalog Page": first_page, "Last Datalog Page": last_page, "Datalog Pages": last_page - first_page + 1 if first_page and last_page else 0, "Terminal Step Found": terminal_found, "Terminal Step Name": terminal_name, "Status": "OK" if first_page and (stage != "BLENDING" or terminal_found) else "DATALOG NOT FOUND" if not first_page else "TERMINAL STEP NOT FOUND"})
+        if run_frames: extracted_frames.append(pd.concat(run_frames, ignore_index=True))
+    datalog = pd.concat(extracted_frames, ignore_index=True).drop_duplicates().sort_values(["Stage", "Extruder", "Source Page", "Source Line"], kind="stable").reset_index(drop=True) if extracted_frames else pd.DataFrame()
+    if not datalog.empty:
+        preferred = ["Stage", "Machine", "Extruder", "Date & Time", "Step Name", "Source Page", "Source Line"]
+        datalog = datalog[preferred + [c for c in datalog.columns if c not in preferred]]
+    return datalog, pd.DataFrame(diagnostic_rows), pd.DataFrame(rejected_rows), pd.DataFrame(process_ranges)
+
+
+
+def premixing_movement_direction(left_speed, right_speed):
+    """Infer direction from the two servo-speed signs."""
+    if pd.isna(left_speed) or pd.isna(right_speed):
+        return ""
+    left_speed = float(left_speed)
+    right_speed = float(right_speed)
+    tolerance = PREMIXING_SPEED_DIRECTION_TOLERANCE
+    if left_speed > tolerance and right_speed < -tolerance:
+        return "L-to-R"
+    if left_speed < -tolerance and right_speed > tolerance:
+        return "R-to-L"
+    return ""
+
+
+def prepare_premixing_engineering_data(premixing_data):
+    """Prepare Premixing datalog for movement-block analysis."""
+    if premixing_data.empty:
+        return pd.DataFrame()
+    data = premixing_data.copy()
+    numeric_columns = [
+        "Current Cycle", "Loadcell Left (bar)", "Loadcell Right (bar)",
+        "Servo Position Left (mm)", "Servo Position Right (mm)",
+        "Servo Speed Left (mm/s)", "Servo Speed Right (mm/s)",
     ]
-    color_map = {
-        "Pump 1": "#0072BD",
-        "Pump 2": "#E69F00",
-        "Pump 3": "#009E73",
-        "Pump 4": "#CC79A7",
-        "All Pumps Combined": "#000000",
-    }
-    dash_map = {
-        "Pump 1": "solid",
-        "Pump 2": "solid",
-        "Pump 3": "solid",
-        "Pump 4": "solid",
-        "All Pumps Combined": "dash",
-    }
-    symbol_map = {
-        "Pump 1": "circle",
-        "Pump 2": "circle",
-        "Pump 3": "circle",
-        "Pump 4": "circle",
-        "All Pumps Combined": "diamond",
-    }
-
-    figure = make_subplots(
-        rows=len(strengths),
-        cols=1,
-        shared_xaxes=False,
-        vertical_spacing=0.10 if len(strengths) <= 3 else 0.07,
-        subplot_titles=[f"{strength:g} mg" for strength in strengths],
+    for column in numeric_columns:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = data.sort_values(
+        ["Extruder", "Source Page", "Source Line"], kind="stable"
+    ).reset_index(drop=True)
+    data["Elapsed Time (min)"] = data.groupby("Extruder")["Date & Time"].transform(
+        lambda values: (values - values.min()).dt.total_seconds() / 60
     )
+    data["Direction"] = [
+        premixing_movement_direction(left, right)
+        for left, right in zip(
+            data["Servo Speed Left (mm/s)"],
+            data["Servo Speed Right (mm/s)"],
+        )
+    ]
+    context = (
+        data["Step Name"].fillna("").astype(str).str.casefold()
+        .str.contains(r"premix|accumulator|void reduction", regex=True)
+    )
+    data.loc[~context, "Direction"] = ""
 
-    legend_seen = set()
-    for row_number, strength in enumerate(strengths, start=1):
-        strength_df = chart_df[chart_df["Strength"].eq(strength)].copy()
-        batch_order = strength_df["Batch"].drop_duplicates().tolist()
-        for pump in pump_order:
-            pump_df = strength_df[strength_df["Pump"].eq(pump)].copy()
-            if pump_df.empty:
-                continue
-            pump_df["Batch"] = pd.Categorical(
-                pump_df["Batch"], categories=batch_order, ordered=True
+    all_ids = []
+    for _, group in data.groupby("Extruder", sort=False):
+        block_id = 0
+        prior_direction = ""
+        active = False
+        for direction in group["Direction"]:
+            if direction:
+                if not active or direction != prior_direction:
+                    block_id += 1
+                all_ids.append(block_id)
+                active = True
+                prior_direction = direction
+            else:
+                all_ids.append(pd.NA)
+                active = False
+                prior_direction = ""
+    data["Directional Block ID"] = pd.array(all_ids, dtype="Int64")
+    return data
+
+
+def summarize_premixing_directional_blocks(prepared_data):
+    """Summarize every continuous directional Premixing movement."""
+    columns = [
+        "Extruder", "Directional Block ID", "Logged Cycle", "Direction",
+        "Start Date & Time", "End Date & Time", "Duration (s)",
+        "Start Source Page", "End Source Page", "Start Source Line", "End Source Line",
+        "Left Start Position (mm)", "Left End Position (mm)",
+        "Right Start Position (mm)", "Right End Position (mm)",
+        "Left Movement (mm)", "Right Movement (mm)",
+        "Left Volume (mL)", "Right Volume (mL)",
+        "Pushed Volume (mL)", "Received Volume (mL)",
+        "Volume Difference (mL)", "Average Actual Speed (mL/min)",
+        "Maximum Push Pressure (bar)", "Maximum Receiving Pressure (bar)",
+    ]
+    if prepared_data.empty:
+        return pd.DataFrame(columns=columns)
+
+    output = []
+    for extruder, extruder_data in prepared_data.groupby("Extruder", sort=True):
+        moving = extruder_data.dropna(subset=["Directional Block ID"])
+        for block_id, group in moving.groupby("Directional Block ID", sort=True):
+            group = group.sort_values(["Source Page", "Source Line"], kind="stable")
+            direction = group["Direction"].iloc[0]
+            first_index = group.index[0]
+            previous_index = extruder_data.index[extruder_data.index < first_index]
+            start = (
+                extruder_data.loc[previous_index[-1]]
+                if len(previous_index) else group.iloc[0]
             )
-            pump_df = pump_df.sort_values("Batch")
-            show_legend = pump not in legend_seen
-            legend_seen.add(pump)
-            is_combined = pump == "All Pumps Combined"
-            figure.add_trace(
-                go.Scatter(
-                    x=pump_df["Batch"].astype(str),
-                    y=pump_df[metric],
-                    mode="lines+markers+text" if is_combined else "lines+markers",
-                    name=pump,
-                    legendgroup=pump,
-                    showlegend=show_legend,
-                    line=dict(
-                        color=color_map[pump],
-                        width=2.2 if is_combined else 2.0,
-                        dash=dash_map[pump],
-                    ),
-                    marker=dict(
-                        color=color_map[pump],
-                        size=8 if is_combined else 7,
-                        symbol=symbol_map[pump],
-                    ),
-                    text=[f"{value:.2f}" for value in pump_df[metric]] if is_combined else None,
-                    textposition="top center",
-                    customdata=np.column_stack(
-                        [pump_df["Sample Count"], pump_df["Strength"]]
-                    ),
-                    hovertemplate=(
-                        "Batch: %{x}<br>"
-                        + f"{y_axis_title}: %{{y:.3f}}<br>"
-                        + "Samples: %{customdata[0]}<br>"
-                        + "Strength: %{customdata[1]:g} mg<extra>"
-                        + pump
-                        + "</extra>"
-                    ),
+            end = group.iloc[-1]
+            left_delta = float(end["Servo Position Left (mm)"] - start["Servo Position Left (mm)"])
+            right_delta = float(end["Servo Position Right (mm)"] - start["Servo Position Right (mm)"])
+            left_volume = abs(left_delta) * PREMIXING_VOLUME_PER_MM_ML
+            right_volume = abs(right_delta) * PREMIXING_VOLUME_PER_MM_ML
+            if direction == "L-to-R":
+                pushed, received = left_volume, right_volume
+                max_push = group["Loadcell Left (bar)"].max()
+                max_receive = group["Loadcell Right (bar)"].max()
+            else:
+                pushed, received = right_volume, left_volume
+                max_push = group["Loadcell Right (bar)"].max()
+                max_receive = group["Loadcell Left (bar)"].max()
+            duration = (end["Date & Time"] - start["Date & Time"]).total_seconds()
+            cycles = group["Current Cycle"].dropna()
+            logged_cycle = int(cycles.mode().iloc[0]) if not cycles.empty else pd.NA
+            output.append({
+                "Extruder": int(extruder),
+                "Directional Block ID": int(block_id),
+                "Logged Cycle": logged_cycle,
+                "Direction": direction,
+                "Start Date & Time": start["Date & Time"],
+                "End Date & Time": end["Date & Time"],
+                "Duration (s)": duration,
+                "Start Source Page": int(group["Source Page"].iloc[0]),
+                "End Source Page": int(group["Source Page"].iloc[-1]),
+                "Start Source Line": int(group["Source Line"].iloc[0]),
+                "End Source Line": int(group["Source Line"].iloc[-1]),
+                "Left Start Position (mm)": start["Servo Position Left (mm)"],
+                "Left End Position (mm)": end["Servo Position Left (mm)"],
+                "Right Start Position (mm)": start["Servo Position Right (mm)"],
+                "Right End Position (mm)": end["Servo Position Right (mm)"],
+                "Left Movement (mm)": left_delta,
+                "Right Movement (mm)": right_delta,
+                "Left Volume (mL)": left_volume,
+                "Right Volume (mL)": right_volume,
+                "Pushed Volume (mL)": pushed,
+                "Received Volume (mL)": received,
+                "Volume Difference (mL)": abs(pushed - received),
+                "Average Actual Speed (mL/min)": (
+                    pushed / duration * 60 if duration > 0 else np.nan
                 ),
-                row=row_number,
-                col=1,
+                "Maximum Push Pressure (bar)": max_push,
+                "Maximum Receiving Pressure (bar)": max_receive,
+            })
+    return pd.DataFrame(output, columns=columns)
+
+
+def pair_premixing_bidirectional_attempts(directional):
+    """Pair adjacent opposite-direction blocks with cycle-aware scoring.
+
+    Either L-to-R/R-to-L or R-to-L/L-to-R order is accepted. A same-cycle
+    opposite-direction block is preferred; otherwise the nearest immediately
+    following opposite-direction block is used and marked for review.
+    """
+    columns = [
+        "Extruder", "Bidirectional Attempt ID", "Pairing Status",
+        "Start Date & Time", "End Date & Time",
+        "First Direction", "Second Direction", "First Block ID", "Second Block ID",
+        "Logged Cycle First", "Logged Cycle Second", "Actual Logged Cycle",
+        "L-to-R Pushed Volume (mL)", "R-to-L Pushed Volume (mL)",
+        "Representative Achieved Volume (mL)",
+        "L-to-R Maximum Push Pressure (bar)",
+        "R-to-L Maximum Push Pressure (bar)",
+        "Maximum Actual Pressure (bar)",
+        "L-to-R Average Speed (mL/min)", "R-to-L Average Speed (mL/min)",
+    ]
+    if directional.empty:
+        return pd.DataFrame(columns=columns)
+    output = []
+    for extruder, group in directional.groupby("Extruder", sort=True):
+        data = group.sort_values("Start Date & Time").reset_index(drop=True)
+        used = set()
+        attempt_id = 0
+        for i in range(len(data)):
+            if i in used:
+                continue
+            first = data.iloc[i]
+            candidates = []
+            for j in range(i + 1, min(i + 4, len(data))):
+                if j in used or data.iloc[j]["Direction"] == first["Direction"]:
+                    continue
+                second = data.iloc[j]
+                same_cycle = (
+                    pd.notna(first["Logged Cycle"])
+                    and pd.notna(second["Logged Cycle"])
+                    and int(first["Logged Cycle"]) == int(second["Logged Cycle"])
+                )
+                candidates.append((0 if same_cycle else 1, j, second))
+            if not candidates:
+                continue
+            _, j, second = sorted(candidates, key=lambda item: (item[0], item[1]))[0]
+            used.update({i, j})
+            attempt_id += 1
+            blocks = {first["Direction"]: first, second["Direction"]: second}
+            ltr = blocks.get("L-to-R")
+            rtl = blocks.get("R-to-L")
+            same_cycle = (
+                pd.notna(first["Logged Cycle"])
+                and pd.notna(second["Logged Cycle"])
+                and int(first["Logged Cycle"]) == int(second["Logged Cycle"])
+            )
+            actual_cycle = (
+                int(first["Logged Cycle"])
+                if same_cycle else
+                int(first["Logged Cycle"]) if pd.notna(first["Logged Cycle"])
+                else int(second["Logged Cycle"]) if pd.notna(second["Logged Cycle"])
+                else pd.NA
+            )
+            output.append({
+                "Extruder": int(extruder),
+                "Bidirectional Attempt ID": attempt_id,
+                "Pairing Status": "Same logged cycle" if same_cycle else "Nearest opposite block - review",
+                "Start Date & Time": min(first["Start Date & Time"], second["Start Date & Time"]),
+                "End Date & Time": max(first["End Date & Time"], second["End Date & Time"]),
+                "First Direction": first["Direction"],
+                "Second Direction": second["Direction"],
+                "First Block ID": int(first["Directional Block ID"]),
+                "Second Block ID": int(second["Directional Block ID"]),
+                "Logged Cycle First": first["Logged Cycle"],
+                "Logged Cycle Second": second["Logged Cycle"],
+                "Actual Logged Cycle": actual_cycle,
+                "L-to-R Pushed Volume (mL)": ltr["Pushed Volume (mL)"],
+                "R-to-L Pushed Volume (mL)": rtl["Pushed Volume (mL)"],
+                "Representative Achieved Volume (mL)": min(
+                    ltr["Pushed Volume (mL)"], rtl["Pushed Volume (mL)"]
+                ),
+                "L-to-R Maximum Push Pressure (bar)": ltr["Maximum Push Pressure (bar)"],
+                "R-to-L Maximum Push Pressure (bar)": rtl["Maximum Push Pressure (bar)"],
+                "Maximum Actual Pressure (bar)": max(
+                    ltr["Maximum Push Pressure (bar)"], rtl["Maximum Push Pressure (bar)"]
+                ),
+                "L-to-R Average Speed (mL/min)": ltr["Average Actual Speed (mL/min)"],
+                "R-to-L Average Speed (mL/min)": rtl["Average Actual Speed (mL/min)"],
+            })
+    return pd.DataFrame(output, columns=columns)
+
+
+def predict_premixing_pressure_level(actual_pressure):
+    if pd.isna(actual_pressure):
+        return np.nan, np.nan
+    actual_pressure = float(actual_pressure)
+    if actual_pressure <= 0:
+        return 0, 0.0
+    step_number = max(
+        1,
+        int(np.floor((actual_pressure + PREMIXING_PRESSURE_STEP_BAR / 2)
+                     / PREMIXING_PRESSURE_STEP_BAR)),
+    )
+    target = min(
+        step_number * PREMIXING_PRESSURE_STEP_BAR,
+        PREMIXING_MAX_PRESSURE_BAR,
+    )
+    return step_number, target
+
+
+def normalize_premixing_pressure(actual_pressure):
+    """Normalize pressure: decimal <= 0.5 rounds down; > 0.5 rounds up."""
+    if pd.isna(actual_pressure):
+        return np.nan
+    pressure = float(actual_pressure)
+    lower_bar = math.floor(pressure)
+    return int(lower_bar if pressure - lower_bar <= 0.5 else lower_bar + 1)
+
+
+def expected_premixing_left_volume(volume_step_ml, step_volume_ml):
+    """Standard left-pushed volume for a cumulative Premixing volume step."""
+    if pd.isna(volume_step_ml):
+        return np.nan
+    return 2 * float(volume_step_ml) - float(step_volume_ml)
+
+
+def premixing_recipe_pressure_step(actual_pressure):
+    """Map the actual maximum pressure to the nearest 15-bar recipe step."""
+    if pd.isna(actual_pressure):
+        return np.nan
+    normalized = normalize_premixing_pressure(actual_pressure)
+    if normalized <= 0:
+        return 0.0
+    step_number = max(1, int(np.floor(
+        (normalized + PREMIXING_PRESSURE_STEP_BAR / 2)
+        / PREMIXING_PRESSURE_STEP_BAR
+    )))
+    return float(min(
+        step_number * PREMIXING_PRESSURE_STEP_BAR,
+        PREMIXING_MAX_PRESSURE_BAR,
+    ))
+
+
+def reverse_predict_premixing_volume_step(paired_attempts, step_volume_ml=PREMIXING_VOLUME_STEP_ML):
+    """Reconstruct volume step using cycle, normalized pressure, and left volume."""
+    if paired_attempts.empty:
+        return pd.DataFrame()
+
+    step_volume_ml = float(step_volume_ml)
+    if step_volume_ml <= 0:
+        raise ValueError("Premixing step volume must be greater than 0 mL.")
+
+    output = []
+    for extruder, attempts in paired_attempts.groupby("Extruder", sort=True):
+        volume_step_number = 1
+        volume_step_size = step_volume_ml
+        highest_normalized_pressure = int(PREMIXING_PRESSURE_STEP_BAR)
+        established_recipe_pressure = PREMIXING_PRESSURE_STEP_BAR
+        previous_cycle = None
+
+        ordered = attempts.sort_values("Start Date & Time", kind="stable")
+        for attempt_number, (_, row) in enumerate(ordered.iterrows(), start=1):
+            actual_cycle = row["Actual Logged Cycle"]
+            current_cycle = int(actual_cycle) if pd.notna(actual_cycle) else None
+            actual_pressure = pd.to_numeric(
+                row["Maximum Actual Pressure (bar)"], errors="coerce"
+            )
+            normalized_pressure = normalize_premixing_pressure(actual_pressure)
+            previous_highest = highest_normalized_pressure
+            pressure_increased = (
+                pd.notna(normalized_pressure)
+                and normalized_pressure > previous_highest
+            )
+            inferred_recipe_pressure = premixing_recipe_pressure_step(actual_pressure)
+            if pd.notna(inferred_recipe_pressure):
+                established_recipe_pressure = max(
+                    established_recipe_pressure, inferred_recipe_pressure
+                )
+
+            actual_left_volume = pd.to_numeric(
+                row["L-to-R Pushed Volume (mL)"], errors="coerce"
+            )
+            expected_left_volume = expected_premixing_left_volume(volume_step_size, step_volume_ml)
+            left_difference = (
+                actual_left_volume - expected_left_volume
+                if pd.notna(actual_left_volume) and pd.notna(expected_left_volume)
+                else np.nan
+            )
+            pushed_volume_within_target = (
+                pd.notna(actual_left_volume)
+                and pd.notna(expected_left_volume)
+                and actual_left_volume <= expected_left_volume + 1.0
             )
 
-    figure.update_layout(
-        title=dict(
-            text=title,
-            x=0.5,
-            xanchor="center",
-            font=dict(
-                family=font_family,
-                size=max(int(font_size) + 8, 18),
-                color="#000000",
+            if attempt_number == 1:
+                rule = "Initial volume step"
+            elif current_cycle is not None and previous_cycle is not None and current_cycle > previous_cycle:
+                rule = "Same volume step: higher cycle repeat attempt"
+            elif previous_cycle == PREMIXING_REPEAT_CYCLES and current_cycle == 1:
+                if pressure_increased:
+                    rule = "Same volume step: Cycle 3 to 1 pressure increase"
+                elif pushed_volume_within_target:
+                    rule = "Same volume step: L-to-R pushed volume <= target volume + 1"
+                else:
+                    volume_step_number += 1
+                    volume_step_size = volume_step_number * step_volume_ml
+                    rule = "Advanced by 16.5 mL: no pressure increase and L-to-R pushed volume > target volume + 1"
+            elif current_cycle == 1:
+                volume_step_number += 1
+                volume_step_size = volume_step_number * step_volume_ml
+                rule = "Advanced by 16.5 mL: Cycle 1 did not increase"
+            else:
+                rule = "Same volume step: cycle sequence review"
+
+            if pd.notna(normalized_pressure):
+                highest_normalized_pressure = max(
+                    highest_normalized_pressure, normalized_pressure
+                )
+
+            output.append({
+                **row.to_dict(),
+                "Attempt Number": attempt_number,
+                "Previous Logged Cycle": previous_cycle,
+                "Volume step size (mL)": volume_step_size,
+                "Volume Step Number": volume_step_number,
+                "Selected Premixing Step Volume (mL)": step_volume_ml,
+                "Volume Step Rule": rule,
+                "Actual Maximum Pressure (bar)": actual_pressure,
+                "Normalized Maximum Pressure (bar)": normalized_pressure,
+                "Pressure Step (bar)": established_recipe_pressure,
+                "Previous Highest Normalized Pressure (bar)": previous_highest,
+                "Highest Normalized Pressure Seen (bar)": highest_normalized_pressure,
+                "Pressure Increased": "Yes" if pressure_increased else "No",
+                "Expected Left Volume (mL)": expected_left_volume,
+                "Actual Left Volume (mL)": actual_left_volume,
+                "Left Volume Difference (mL)": left_difference,
+                "L-to-R Pushed Volume <= Target Volume + 1": (
+                    "Yes" if pushed_volume_within_target else "No"
+                ),
+            })
+            if current_cycle is not None:
+                previous_cycle = current_cycle
+
+    return pd.DataFrame(output)
+
+
+def build_premixing_volume_step_summary(prediction):
+    """Summarize attempts, actual pressures, and recipe pressure step by volume step."""
+    columns = [
+        "Extruder", "Volume Step (mL)", "Attempts",
+        "Max Loadcell Left (bar)", "Max Loadcell Right (bar)",
+        "Pressure Step (bar)", "First Attempt", "Last Attempt",
+    ]
+    if prediction.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    for (extruder, volume_step), group in prediction.groupby(
+        ["Extruder", "Volume step size (mL)"], sort=True
+    ):
+        rows.append({
+            "Extruder": int(extruder),
+            "Volume Step (mL)": float(volume_step),
+            "Attempts": len(group),
+            "Max Loadcell Left (bar)": group["L-to-R Maximum Push Pressure (bar)"].max(),
+            "Max Loadcell Right (bar)": group["R-to-L Maximum Push Pressure (bar)"].max(),
+            "Pressure Step (bar)": group["Pressure Step (bar)"].max(),
+            "First Attempt": group["Start Date & Time"].min(),
+            "Last Attempt": group["End Date & Time"].max(),
+        })
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["Extruder", "Volume Step (mL)"]
+    ).reset_index(drop=True)
+
+
+def create_premixing_volume_step_plot(
+    summary, extruder, batch_number, pressure_mode="Actual Max Pressure",
+    step_volume_ml=PREMIXING_VOLUME_STEP_ML,
+):
+    """Create Premixing pressure/attempt plot with fixed 0-198 mL x-axis."""
+    data = summary[summary["Extruder"].eq(extruder)].sort_values(
+        "Volume Step (mL)"
+    ).copy()
+    figure = go.Figure()
+
+    date_details = data[["First Attempt", "Last Attempt"]].copy()
+    for column in date_details.columns:
+        date_details[column] = pd.to_datetime(
+            date_details[column], errors="coerce"
+        ).dt.strftime("%d-%m-%Y %H:%M:%S")
+
+    figure.add_trace(go.Bar(
+        x=data["Volume Step (mL)"], y=data["Attempts"],
+        name="Attempts", yaxis="y2",
+        width=float(step_volume_ml) * 0.62,
+        marker={"color": "rgba(181, 211, 143, 0.55)",
+                "line": {"color": "rgba(123, 158, 83, 0.85)", "width": 1}},
+        customdata=date_details.to_numpy(),
+        hovertemplate=(
+            "<b>Attempts</b><br>Volume step: %{x:.1f} mL<br>"
+            "Number of attempts: %{y:.0f}<br>First attempt: %{customdata[0]}<br>"
+            "Last attempt: %{customdata[1]}<extra></extra>"
+        ),
+    ))
+
+    if pressure_mode == "Pressure Step":
+        figure.add_trace(go.Scatter(
+            x=data["Volume Step (mL)"], y=data["Pressure Step (bar)"],
+            mode="lines+markers", name="Pressure Step (bar)",
+            line={"color": "#7030A0", "width": 4, "shape": "hv"},
+            marker={"size": 9, "color": "#7030A0", "symbol": "square"},
+            hovertemplate=(
+                "<b>Pressure Step</b><br>Volume step: %{x:.1f} mL<br>"
+                "Recipe pressure step: %{y:.0f} bar<extra></extra>"
             ),
-        ),
-        legend=dict(
-            orientation="h",
-            x=0.5,
-            xanchor="center",
-            y=1.04,
-            yanchor="bottom",
-            font=dict(family=font_family, size=font_size, color="#000000"),
-        ),
-        template="plotly_white",
-        height=max(360 * len(strengths), 520),
-        margin=dict(l=80, r=40, t=140, b=70),
-        hovermode="closest",
-        paper_bgcolor="#ffffff",
-        plot_bgcolor="#ffffff",
-        font=dict(family=font_family, size=font_size, color="#000000"),
+        ))
+    else:
+        figure.add_trace(go.Scatter(
+            x=data["Volume Step (mL)"], y=data["Max Loadcell Left (bar)"],
+            mode="lines+markers", name="Max Loadcell Left (bar)",
+            line={"color": "#0057B8", "width": 4, "shape": "hv"},
+            marker={"size": 9, "color": "#0057B8", "symbol": "circle"},
+            hovertemplate=(
+                "<b>Max Loadcell Left</b><br>Volume step: %{x:.1f} mL<br>"
+                "Maximum pressure: %{y:.2f} bar<extra></extra>"
+            ),
+        ))
+        figure.add_trace(go.Scatter(
+            x=data["Volume Step (mL)"], y=data["Max Loadcell Right (bar)"],
+            mode="lines+markers", name="Max Loadcell Right (bar)",
+            line={"color": "#D62728", "width": 4, "shape": "hv"},
+            marker={"size": 9, "color": "#D62728", "symbol": "diamond"},
+            hovertemplate=(
+                "<b>Max Loadcell Right</b><br>Volume step: %{x:.1f} mL<br>"
+                "Maximum pressure: %{y:.2f} bar<extra></extra>"
+            ),
+        ))
+
+    max_attempts = int(data["Attempts"].max()) if not data.empty else 1
+    figure.update_layout(
+        title={"text": f"{batch_number} | EXTRUDER-{int(extruder)} PRE-MIXING",
+               "x": 0.5, "xanchor": "center", "y": 0.97, "yanchor": "top",
+               "font": {"family": "Times New Roman", "size": 12, "color": "#000000"}},
+        font={"family": "Times New Roman", "size": 12, "color": "#000000"},
+        xaxis={"title": {"text": "<b>VOLUME STEP (mL)</b>", "standoff": 18},
+               "range": [0, float(step_volume_ml) * 12], "dtick": float(step_volume_ml),
+               "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+        yaxis={"title": {"text": "<b>PRESSURE (bar)</b>", "standoff": 12},
+               "range": [0, 200], "dtick": 15 if pressure_mode == "Pressure Step" else 20,
+               "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+        yaxis2={"title": {"text": "<b>ATTEMPTS</b>", "standoff": 12},
+                "overlaying": "y", "side": "right",
+                "range": [0, max(4, max_attempts + 1)], "dtick": 1, "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1},
+        barmode="overlay", hovermode="x unified",
+        legend={"orientation": "h", "x": 0.5, "xanchor": "center",
+                "y": 1.03, "yanchor": "bottom",
+                "font": {"family": "Times New Roman", "size": 12},
+                "bgcolor": "rgba(255,255,255,0.9)"},
+        plot_bgcolor="white", paper_bgcolor="white", height=720,
+        margin={"l": 90, "r": 90, "t": 150, "b": 90},
     )
-
-    for row_number in range(1, len(strengths) + 1):
-        figure.update_xaxes(
-            title_text="Batch Number" if row_number == len(strengths) else "",
-            showgrid=True,
-            gridcolor="#e0e0e0",
-            linecolor="#000000",
-            linewidth=1.5,
-            mirror=True,
-            tickfont=dict(family=font_family, size=font_size, color="#000000"),
-            title_font=dict(family=font_family, size=font_size, color="#000000"),
-            row=row_number,
-            col=1,
-        )
-        figure.update_yaxes(
-            title_text=y_axis_title,
-            showgrid=True,
-            gridcolor="#e0e0e0",
-            linecolor="#000000",
-            linewidth=1.5,
-            mirror=True,
-            tickfont=dict(family=font_family, size=font_size, color="#000000"),
-            title_font=dict(family=font_family, size=font_size, color="#000000"),
-            row=row_number,
-            col=1,
-        )
-
-    for annotation in figure.layout.annotations:
-        annotation.font = dict(
-            family=font_family,
-            size=max(int(font_size) + 2, 14),
-            color="#000000",
-        )
     return figure
 
 
-# =====================================================
-# SUMMARIES
-# =====================================================
-def create_alarm_summary(alarm_df):
-    columns = ["Code", "Message", "Occurrences"]
-    if alarm_df.empty:
-        return empty_dataframe(columns)
-
-    summary = (
-        alarm_df.groupby(["Code", "Message"], dropna=False)
-        .size()
-        .reset_index(name="Occurrences")
-        .sort_values(["Occurrences", "Message"], ascending=[False, True])
-        .reset_index(drop=True)
-    )
-    return summary
-
-
-def create_audit_action_summary(audit_df):
-    columns = ["Action", "Occurrences"]
-    if audit_df.empty:
-        return empty_dataframe(columns)
-
-    summary = (
-        audit_df.assign(Action=audit_df["Action"].fillna("").map(normalize_space))
-        .query("Action != ''")
-        .groupby("Action", dropna=False)
-        .size()
-        .reset_index(name="Occurrences")
-        .sort_values(["Occurrences", "Action"], ascending=[False, True])
-        .reset_index(drop=True)
-    )
-    return summary
+def build_wetting_rise_time_table(wetting_data):
+    columns = ["Extruder", "Date & Time", "Step Name", "Time taken to reach vacuum rise (min)", "Rise time (Sec)", "Vacuum Timer Start", "Source Page"]
+    if wetting_data.empty: return pd.DataFrame(columns=columns)
+    work = wetting_data.copy()
+    work["Normalized Step"] = work["Step Name"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip().str.casefold()
+    work = work[work["Normalized Step"].isin({"start timeout timer", "vacuum timers", "stop vacuum timer", "revacuum"})]
+    work = work.sort_values(["Extruder", "Source Page", "Source Line"], kind="stable").drop_duplicates(["Extruder", "Date & Time", "Normalized Step"])
+    output = []
+    for extruder, group in work.groupby("Extruder", sort=True):
+        starts = group[group["Normalized Step"].eq("start timeout timer")]
+        if starts.empty: continue
+        time_zero = starts.iloc[0]["Date & Time"]; last_timer = None
+        for _, row in group.iterrows():
+            event_time, step = row["Date & Time"], row["Normalized Step"]
+            if pd.isna(event_time) or event_time < time_zero: continue
+            rise, paired_start = pd.NA, pd.NaT
+            if step == "vacuum timers": last_timer = event_time
+            elif step == "stop vacuum timer" and last_timer is not None and last_timer <= event_time:
+                rise = (event_time - last_timer).total_seconds(); paired_start = last_timer
+            output.append({"Extruder": int(extruder), "Date & Time": event_time, "Step Name": row["Step Name"], "Time taken to reach vacuum rise (min)": (event_time - time_zero).total_seconds() / 60, "Rise time (Sec)": rise, "Vacuum Timer Start": paired_start, "Source Page": row["Source Page"]})
+    result = pd.DataFrame(output, columns=columns)
+    if not result.empty: result["Rise time (Sec)"] = pd.to_numeric(result["Rise time (Sec)"], errors="coerce")
+    return result
 
 
-def create_audit_user_summary(audit_df):
-    columns = ["User", "Occurrences"]
-    if audit_df.empty or "User" not in audit_df.columns:
-        return empty_dataframe(columns)
 
-    user_data = audit_df[audit_df["User"].fillna("").str.strip().ne("")]
-    if user_data.empty:
-        return empty_dataframe(columns)
+def build_mixing_max_pressure_table(mixing_data):
+    """Calculate directional maximum pressure for each extrusion cycle.
 
-    return (
-        user_data.groupby("User")
-        .size()
-        .reset_index(name="Occurrences")
-        .sort_values("Occurrences", ascending=False)
-        .reset_index(drop=True)
-    )
+    Physical direction mapping:
+    - Movement to accumulator RIGHT: maximum Loadcell LEFT pressure.
+    - Movement to accumulator LEFT: maximum Loadcell RIGHT pressure.
 
-
-# =====================================================
-# PFS QUANTITY SUMMARY
-# =====================================================
-def get_pfs_quantity_summary(production_df, fill_df):
-    """Return total filled, rejected, and accepted PFS quantities.
-
-    Production counters are the primary source. Extracted fill-weight counts are
-    used only as a fallback when production counters are unavailable.
+    Separate results are generated for 5 mm, 3.8 mm and 2 mm extrusion steps.
+    Cycle 0 is excluded because it represents initialization rather than a completed cycle.
     """
-    total_filled = None
-    total_accepted = None
-    total_rejected = None
+    columns = [
+        "Extruder", "Orifice", "Cycle",
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+        "Move Right Start", "Move Right End",
+        "Move Left Start", "Move Left End",
+        "Move Right Source Pages", "Move Left Source Pages",
+    ]
+    if mixing_data.empty:
+        return pd.DataFrame(columns=columns)
 
-    if production_df is not None and not production_df.empty:
-        counters = production_df[
-            production_df["Counter Group"].eq("Production Counters")
-        ].copy()
-        if not counters.empty:
-            counter_values = {
-                normalize_space(row["Counter"]).lower(): int(row["Value"])
-                for _, row in counters.iterrows()
-            }
-            total_filled = counter_values.get("infeed (pcs)")
-            total_accepted = counter_values.get("outfeed (pcs)")
-            total_rejected = counter_values.get("reject (pcs)")
+    work = mixing_data.copy()
+    work["Current Cycle"] = pd.to_numeric(work["Current Cycle"], errors="coerce")
+    work["Loadcell Left (bar)"] = pd.to_numeric(work["Loadcell Left (bar)"], errors="coerce")
+    work["Loadcell Right (bar)"] = pd.to_numeric(work["Loadcell Right (bar)"], errors="coerce")
+    work["Step Name"] = work["Step Name"].map(normalize_mixing_step_name)
+    work["Normalized Step"] = (
+        work["Step Name"].astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.casefold()
+    )
 
-    if fill_df is not None and not fill_df.empty:
-        if total_filled is None:
-            total_filled = int(len(fill_df))
-        if total_accepted is None:
-            total_accepted = int(fill_df["Weight Passed"].eq(1).sum())
-        if total_rejected is None:
-            total_rejected = int(fill_df["Weight Passed"].eq(0).sum())
-
-    return {
-        "Total Filled PFS": total_filled if total_filled is not None else 0,
-        "Total Accepted PFS": total_accepted if total_accepted is not None else 0,
-        "Total Rejected PFS": total_rejected if total_rejected is not None else 0,
+    patterns = {
+        "5 mm": r"extrusion\s*:?\s*5\s*mm\s+to\s+accumulator\s+(?:right|left)",
+        "3.8 mm": r"extrusion\s*:?\s*3[\.,]8\s*mm\s+to\s+accumulator\s+(?:right|left)",
+        "2 mm": r"extrusion\s*:?\s*2\s*mm\s+to\s+accumulator\s+(?:right|left)",
     }
+    output = []
 
-
-def add_pfs_quantity_annotations(fig, quantities, font_family, font_size):
-    """Add one compact, bold PFS quantity summary below the graph title."""
-    filled = int(quantities.get("Total Filled PFS", 0))
-    accepted = int(quantities.get("Total Accepted PFS", 0))
-    rejected = int(quantities.get("Total Rejected PFS", 0))
-
-    summary_text = (
-        f"<b>Total Filled PFS: {filled:,}</b>"
-        f"&nbsp;&nbsp;|&nbsp;&nbsp;"
-        f"<b>Total Accepted PFS: {accepted:,}</b>"
-        f"&nbsp;&nbsp;|&nbsp;&nbsp;"
-        f"<b>Total Rejected PFS: {rejected:,}</b>"
-    )
-
-    fig.add_annotation(
-        x=0.5,
-        y=1.095,
-        xref="paper",
-        yref="paper",
-        text=summary_text,
-        showarrow=False,
-        align="center",
-        xanchor="center",
-        yanchor="middle",
-        font=dict(
-            family=font_family,
-            size=max(int(font_size), 12),
-            color="#000000",
-        ),
-    )
-    fig.update_layout(margin=dict(l=70, r=40, t=170, b=75))
-    return fig
-
-
-# =====================================================
-# PLOTLY FIGURES
-# =====================================================
-def apply_graph_style(fig, title, x_title, y_title, font_family="Times New Roman", font_size=12):
-    fig.update_layout(
-        title={"text": title, "x": 0.5, "xanchor": "center"},
-        xaxis_title=x_title,
-        yaxis_title=y_title,
-        template="plotly_white",
-        font=dict(family=font_family, size=font_size, color="#000000"),
-        title_font=dict(
-            family=font_family,
-            size=max(font_size + 8, 18),
-            color="#000000",
-        ),
-        legend_title_text="",
-        legend=dict(font=dict(color="#000000")),
-        hovermode="closest",
-        margin=dict(l=60, r=30, t=80, b=60),
-        paper_bgcolor="#ffffff",
-        plot_bgcolor="#ffffff",
-    )
-    fig.update_xaxes(
-        showgrid=True,
-        gridcolor="#b8b8b8",
-        gridwidth=1,
-        griddash="solid",
-        showline=True,
-        linecolor="#000000",
-        linewidth=2,
-        mirror=True,
-        ticks="outside",
-        tickcolor="#000000",
-        tickfont=dict(
-            family=font_family,
-            size=font_size,
-            color="#000000",
-        ),
-        title_font=dict(family=font_family, size=font_size, color="#000000"),
-        zeroline=False,
-    )
-    fig.update_yaxes(
-        showgrid=True,
-        gridcolor="#b8b8b8",
-        gridwidth=1,
-        griddash="solid",
-        showline=True,
-        linecolor="#000000",
-        linewidth=2,
-        mirror=True,
-        ticks="outside",
-        tickcolor="#000000",
-        tickfont=dict(
-            family=font_family,
-            size=font_size,
-            color="#000000",
-        ),
-        title_font=dict(family=font_family, size=font_size, color="#000000"),
-        zeroline=False,
-    )
-    return fig
-
-
-def make_fill_scatter(fill_pass_df, batch_label, lower_limit, upper_limit, font_family="Times New Roman", font_size=12, show_limits=True):
-    plot_df = fill_pass_df.copy()
-    plot_df["Pump"] = plot_df["Position"].map(lambda value: f"Pump {int(value)}")
-    plot_df["Record Status"] = plot_df["Weight Passed"].map(
-        {1: "Passed", 0: "Failed"}
-    ).fillna("Unknown")
-    fig = px.scatter(
-        plot_df,
-        x="Sample No",
-        y="Nett Weight",
-        color="Pump",
-        symbol="Record Status",
-        color_discrete_map=PUMP_COLOR_MAP,
-        symbol_map={"Passed": "circle", "Failed": "x", "Unknown": "diamond"},
-        category_orders={
-            "Pump": ["Pump 1", "Pump 2", "Pump 3", "Pump 4"],
-            "Record Status": ["Passed", "Failed", "Unknown"],
-        },
-        hover_data=[
-            "Timestamp", "Gross Weight", "Tare Weight",
-            "Weight Passed", "Position",
-        ],
-    )
-    fig.update_traces(marker=dict(size=7, opacity=0.82))
-    # Keep the pump/status legend in one horizontal row below the summary line.
-    fig.update_layout(
-        legend=dict(
-            orientation="h",
-            x=0.5,
-            xanchor="center",
-            y=1.035,
-            yanchor="bottom",
-            font=dict(
-                family=font_family,
-                size=font_size,
-                color="#000000",
-            ),
-            bgcolor="rgba(255,255,255,0)",
-            borderwidth=0,
-            itemsizing="constant",
-            tracegroupgap=8,
-        )
-    )
-    limit_shapes = [
-        dict(
-            type="line", xref="paper", x0=0, x1=1,
-            yref="y", y0=upper_limit, y1=upper_limit,
-            line=dict(color="#9e9e9e", width=4, dash="solid"),
-        ),
-        dict(
-            type="line", xref="paper", x0=0, x1=1,
-            yref="y", y0=lower_limit, y1=lower_limit,
-            line=dict(color="#f28e2b", width=4, dash="solid"),
-        ),
-    ]
-    limit_annotations = [
-        dict(
-            x=0.01, xref="paper", y=upper_limit, yref="y",
-            text=f"Upper limit: {upper_limit:g}", showarrow=False,
-            xanchor="left", yanchor="bottom",
-            font=dict(color="#000000", family=font_family, size=font_size),
-        ),
-        dict(
-            x=0.01, xref="paper", y=lower_limit, yref="y",
-            text=f"Lower limit: {lower_limit:g}", showarrow=False,
-            xanchor="left", yanchor="top",
-            font=dict(color="#000000", family=font_family, size=font_size),
-        ),
-    ]
-    if show_limits:
-        fig.update_layout(shapes=limit_shapes, annotations=limit_annotations)
-
-    fig = apply_graph_style(
-        fig,
-        f"{batch_label} - Fill weight data",
-        "Number of PFS",
-        "Nett Weight",
-        font_family,
-        font_size,
-    )
-    # Reserve separate rows for title, PFS quantity summary, and horizontal legend.
-    fig.update_layout(
-        title=dict(
-            text=f"{batch_label} - Fill weight data",
-            x=0.5,
-            xanchor="center",
-            y=0.975,
-            yanchor="top",
-            pad=dict(t=0, b=0),
-        ),
-        margin=dict(l=70, r=40, t=170, b=75),
-    )
-    return fig
-
-
-def make_fill_histogram(
-    fill_data,
-    batch_label,
-    bin_width=5.0,
-    font_family="Times New Roman",
-    font_size=12,
-):
-    """Create a frequency chart with readable X-axis ranges such as 525-530 mg."""
-    plot_df = fill_data.copy()
-    weights = pd.to_numeric(plot_df["Nett Weight"], errors="coerce").dropna()
-
-    if weights.empty:
-        return apply_graph_style(
-            px.bar(pd.DataFrame({"Weight Range": [], "Frequency": []})),
-            f"{batch_label} - Fill weight data",
-            "Nett Weight Range (mg)",
-            "Frequency",
-            font_family,
-            font_size,
-        )
-
-    bin_width = max(float(bin_width), 0.1)
-    minimum_edge = math.floor(float(weights.min()) / bin_width) * bin_width
-    maximum_edge = math.ceil(float(weights.max()) / bin_width) * bin_width
-    if maximum_edge <= minimum_edge:
-        maximum_edge = minimum_edge + bin_width
-
-    edges = np.arange(minimum_edge, maximum_edge + bin_width * 0.001, bin_width)
-    if len(edges) < 2:
-        edges = np.array([minimum_edge, minimum_edge + bin_width])
-
-    def format_edge(value):
-        return f"{value:.0f}" if float(value).is_integer() else f"{value:g}"
-
-    labels = [
-        f"{format_edge(edges[index])}-{format_edge(edges[index + 1])}"
-        for index in range(len(edges) - 1)
-    ]
-    categories = pd.cut(
-        weights,
-        bins=edges,
-        labels=labels,
-        include_lowest=True,
-        right=False,
-    )
-    counts = categories.value_counts(sort=False).reindex(labels, fill_value=0)
-    frequency_df = pd.DataFrame(
-        {"Weight Range": labels, "Frequency": counts.astype(int).values}
-    )
-
-    fig = px.bar(
-        frequency_df,
-        x="Weight Range",
-        y="Frequency",
-        category_orders={"Weight Range": labels},
-        color_discrete_sequence=["#5b9bd5"],
-        text="Frequency",
-    )
-    fig.update_traces(
-        marker_line_color="white",
-        marker_line_width=0.8,
-        textposition="outside",
-        hovertemplate="Weight range: %{x} mg<br>Frequency: %{y}<extra></extra>",
-    )
-    fig = apply_graph_style(
-        fig,
-        f"{batch_label} - Fill weight data",
-        "Nett Weight Range (mg)",
-        "Frequency",
-        font_family,
-        font_size,
-    )
-    fig.update_xaxes(
-        type="category",
-        tickangle=0,
-        tickfont=dict(
-            family=font_family,
-            size=font_size,
-            color="#000000",
-        ),
-        title_font=dict(
-            family=font_family,
-            size=font_size,
-            color="#000000",
-        ),
-    )
-    fig.update_yaxes(
-        tickfont=dict(
-            family=font_family,
-            size=font_size,
-            color="#000000",
-        ),
-        title_font=dict(
-            family=font_family,
-            size=font_size,
-            color="#000000",
-        ),
-    )
-    fig.update_traces(
-        textfont=dict(
-            family=font_family,
-            size=font_size,
-            color="#000000",
-        )
-    )
-    return fig
-
-
-# =====================================================
-# EXCEL EXPORT
-# =====================================================
-def build_excel(dataframes):
-    output = BytesIO()
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        sheets_written = 0
-        for sheet_name, dataframe in dataframes.items():
-            if dataframe is None or dataframe.empty:
+    for extruder, extruder_data in work.groupby("Extruder", sort=True):
+        for orifice, pattern in patterns.items():
+            stage_data = extruder_data[
+                extruder_data["Normalized Step"].str.contains(pattern, regex=True, na=False)
+            ].copy()
+            stage_data = stage_data[stage_data["Current Cycle"].gt(0)]
+            if stage_data.empty:
                 continue
-            export_df = dataframe.copy()
-            for column in export_df.select_dtypes(include=["datetimetz"]).columns:
-                export_df[column] = export_df[column].dt.tz_localize(None)
-            export_df.to_excel(
-                writer,
-                sheet_name=sheet_name[:31],
-                index=False,
-            )
-            sheets_written += 1
 
-        if sheets_written == 0:
-            pd.DataFrame({"Information": ["No data was extracted."]}).to_excel(
-                writer,
-                sheet_name="Information",
-                index=False,
-            )
+            for cycle, cycle_data in stage_data.groupby("Current Cycle", sort=True):
+                right_move = cycle_data[
+                    cycle_data["Normalized Step"].str.endswith("accumulator right")
+                ]
+                left_move = cycle_data[
+                    cycle_data["Normalized Step"].str.endswith("accumulator left")
+                ]
 
-    output.seek(0)
-    return output
+                output.append({
+                    "Extruder": int(extruder),
+                    "Orifice": orifice,
+                    "Cycle": int(cycle),
+                    "Max Pressure Left - Move Right (bar)": (
+                        right_move["Loadcell Left (bar)"].max()
+                        if not right_move.empty else pd.NA
+                    ),
+                    "Max Pressure Right - Move Left (bar)": (
+                        left_move["Loadcell Right (bar)"].max()
+                        if not left_move.empty else pd.NA
+                    ),
+                    "Move Right Start": right_move["Date & Time"].min() if not right_move.empty else pd.NaT,
+                    "Move Right End": right_move["Date & Time"].max() if not right_move.empty else pd.NaT,
+                    "Move Left Start": left_move["Date & Time"].min() if not left_move.empty else pd.NaT,
+                    "Move Left End": left_move["Date & Time"].max() if not left_move.empty else pd.NaT,
+                    "Move Right Source Pages": (
+                        ", ".join(map(str, sorted(right_move["Source Page"].dropna().astype(int).unique())))
+                        if not right_move.empty else ""
+                    ),
+                    "Move Left Source Pages": (
+                        ", ".join(map(str, sorted(left_move["Source Page"].dropna().astype(int).unique())))
+                        if not left_move.empty else ""
+                    ),
+                })
+
+    result = pd.DataFrame(output, columns=columns)
+    if result.empty:
+        return result
+    pressure_columns = [
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+    ]
+    result[pressure_columns] = result[pressure_columns].apply(pd.to_numeric, errors="coerce")
+    return result.sort_values(["Extruder", "Orifice", "Cycle"]).reset_index(drop=True)
 
 
-# =====================================================
-# INTERACTIVE PLOT CONFIGURATION
-# =====================================================
-PLOTLY_CONFIG = {
-    "displaylogo": False,
-    "scrollZoom": True,
-    "displayModeBar": True,
-    "editable": True,
-    "edits": {
-        "axisTitleText": True,
-        "legendText": True,
-        "annotationText": True,
-        "titleText": True,
-    },
-    "toImageButtonOptions": {
-        "format": "png",
-        "filename": "interactive_graph",
-        "height": 700,
-        "width": 1400,
-        "scale": 2,
-    },
-}
 
+def build_blending_max_pressure_table(blending_data):
+    """Calculate directional maximum pressure for Pre- and Post-pH blending cycles.
 
-def make_interactive(fig, show_x_grid=True, show_y_grid=True, show_range_slider=False):
-    """Apply stable Plotly interaction settings.
+    Pre-pH blending comprises 60 cycles. Post-pH blending begins when the
+    Current Cycle resets after the completed 60th Pre-pH cycle and comprises
+    up to 100 cycles.
 
-    The range-slider property is added only when enabled. Passing an explicit
-    false range-slider update caused a Plotly/Streamlit rerender crash on some
-    Community Cloud environments.
+    Directional pressure mapping:
+    - Blending to accumulator RIGHT: maximum Loadcell LEFT pressure.
+    - Blending to accumulator LEFT: maximum Loadcell RIGHT pressure.
     """
-    fig.update_layout(
-        dragmode="zoom",
-        hovermode="closest",
-        clickmode="event+select",
-        selectdirection="any",
-        uirevision="keep-user-zoom",
+    columns = [
+        "Extruder", "Blending Phase", "Cycle",
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+        "Move Right Start", "Move Right End",
+        "Move Left Start", "Move Left End",
+        "Move Right Source Pages", "Move Left Source Pages",
+    ]
+    if blending_data.empty:
+        return pd.DataFrame(columns=columns)
+
+    work = blending_data.copy()
+    work["Current Cycle"] = pd.to_numeric(work["Current Cycle"], errors="coerce")
+    work["Loadcell Left (bar)"] = pd.to_numeric(work["Loadcell Left (bar)"], errors="coerce")
+    work["Loadcell Right (bar)"] = pd.to_numeric(work["Loadcell Right (bar)"], errors="coerce")
+    work["Normalized Step"] = (
+        work["Step Name"].astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.casefold()
     )
-
-    xaxis_settings = dict(
-        showgrid=show_x_grid,
-        showspikes=True,
-        spikemode="across",
-        spikesnap="cursor",
-        spikedash="dot",
-    )
-    fig.update_xaxes(**xaxis_settings)
-
-    # A newly generated figure has no range slider by default. Therefore, when
-    # the user selects Off, do not send any range-slider property to Plotly.
-    if bool(show_range_slider):
-        fig.update_xaxes(rangeslider=dict(visible=True))
-
-    fig.update_yaxes(
-        showgrid=show_y_grid,
-        showspikes=True,
-        spikemode="across",
-        spikesnap="cursor",
-        spikedash="dot",
-    )
-    return fig
-
-
-def figure_to_html_bytes(fig):
-    return fig.to_html(
-        full_html=True,
-        include_plotlyjs="cdn",
-        config=PLOTLY_CONFIG,
-    ).encode("utf-8")
-
-
-def scatter_figure_to_html_bytes(fig, lower_limit, upper_limit, font_family, font_size, x_min=None, x_max=None, y_min=None, y_max=None):
-    """Create standalone HTML with editable lower and upper limit inputs."""
-    div_id = "fill_weight_scatter"
-    chart_html = fig.to_html(
-        full_html=False, include_plotlyjs="cdn", config=PLOTLY_CONFIG, div_id=div_id
-    )
-    safe_font = str(font_family).replace("\'", "")
-    size = str(int(font_size))
-    lower = repr(float(lower_limit))
-    upper = repr(float(upper_limit))
-    initial_x_min = "" if x_min is None else repr(float(x_min))
-    initial_x_max = "" if x_max is None else repr(float(x_max))
-    initial_y_min = "" if y_min is None else repr(float(y_min))
-    initial_y_max = "" if y_max is None else repr(float(y_max))
-    controls = (
-        "<div style=\"font-family:" + safe_font + ";font-size:" + size + "px;padding:12px 16px;"
-        "border:1px solid #d9d9d9;border-radius:8px;margin:10px 0;display:flex;gap:14px;"
-        "align-items:end;flex-wrap:wrap;background:#fafafa;color:#000000;\">"
-        "<label>Lower fill-weight limit<br><input id=\"lowerLimitInput\" type=\"number\" step=\"0.1\" value=\"" + lower + "\"></label>"
-        "<label>Upper fill-weight limit<br><input id=\"upperLimitInput\" type=\"number\" step=\"0.1\" value=\"" + upper + "\"></label>"
-        "<label>X-axis minimum<br><input id=\"xMinInput\" type=\"number\" step=\"1\" value=\"" + initial_x_min + "\"></label>"
-        "<label>X-axis maximum<br><input id=\"xMaxInput\" type=\"number\" step=\"1\" value=\"" + initial_x_max + "\"></label>"
-        "<label>Y-axis minimum<br><input id=\"yMinInput\" type=\"number\" step=\"0.1\" value=\"" + initial_y_min + "\"></label>"
-        "<label>Y-axis maximum<br><input id=\"yMaxInput\" type=\"number\" step=\"0.1\" value=\"" + initial_y_max + "\"></label>"
-        "<button id=\"applyLimitsButton\">Apply Limits</button>"
-        "<button id=\"applyAxesButton\">Apply Axis Range</button>"
-        "<button id=\"autoAxesButton\">Auto Axis Range</button>"
-        "<button id=\"resetLimitsButton\">Reset Original Limits</button>"
-        "<span id=\"limitMessage\" style=\"color:#b00020;\"></span></div>"
-    )
-    script = "".join([
-        "<script>(function(){",
-        "const plot=document.getElementById(\"" + div_id + "\");",
-        "const lo=document.getElementById(\"lowerLimitInput\");",
-        "const hi=document.getElementById(\"upperLimitInput\");",
-        "const msg=document.getElementById(\"limitMessage\");",
-        "const xMin=document.getElementById(\"xMinInput\");const xMax=document.getElementById(\"xMaxInput\");",
-        "const yMin=document.getElementById(\"yMinInput\");const yMax=document.getElementById(\"yMaxInput\");",
-        "const originalLower=" + lower + ";const originalUpper=" + upper + ";",
-        "function layout(l,u){return {shapes:[",
-        "{type:\"line\",xref:\"paper\",x0:0,x1:1,yref:\"y\",y0:u,y1:u,line:{color:\"#9e9e9e\",width:4}},",
-        "{type:\"line\",xref:\"paper\",x0:0,x1:1,yref:\"y\",y0:l,y1:l,line:{color:\"#f28e2b\",width:4}}],",
-        "annotations:[{x:0.01,xref:\"paper\",y:u,yref:\"y\",text:\"Upper limit: \"+u,showarrow:false},",
-        "{x:0.01,xref:\"paper\",y:l,yref:\"y\",text:\"Lower limit: \"+l,showarrow:false}]};}",
-        "function apply(){const l=Number(lo.value),u=Number(hi.value);",
-        "if(!Number.isFinite(l)||!Number.isFinite(u)||l>=u){msg.textContent=\"Lower limit must be less than upper limit.\";return;}",
-        "msg.textContent=\"\";Plotly.relayout(plot,layout(l,u));}",
-        "function axisValue(el){return el.value.trim()===\"\"?null:Number(el.value);}",
-        "function applyAxes(){const xmin=axisValue(xMin),xmax=axisValue(xMax),ymin=axisValue(yMin),ymax=axisValue(yMax);",
-        "if((xmin!==null&&!Number.isFinite(xmin))||(xmax!==null&&!Number.isFinite(xmax))||(ymin!==null&&!Number.isFinite(ymin))||(ymax!==null&&!Number.isFinite(ymax))){msg.textContent=\"Axis limits must be valid numbers.\";return;}",
-        "if(xmin!==null&&xmax!==null&&xmin>=xmax){msg.textContent=\"X-axis minimum must be less than maximum.\";return;}",
-        "if(ymin!==null&&ymax!==null&&ymin>=ymax){msg.textContent=\"Y-axis minimum must be less than maximum.\";return;}",
-        "msg.textContent=\"\";const update={};",
-        "if(xmin!==null&&xmax!==null){update[\"xaxis.range\"]=[xmin,xmax];update[\"xaxis.autorange\"]=false;}else{update[\"xaxis.autorange\"]=true;}",
-        "if(ymin!==null&&ymax!==null){update[\"yaxis.range\"]=[ymin,ymax];update[\"yaxis.autorange\"]=false;}else{update[\"yaxis.autorange\"]=true;}",
-        "Plotly.relayout(plot,update);}",
-        "document.getElementById(\"applyLimitsButton\").onclick=apply;",
-        "document.getElementById(\"applyAxesButton\").onclick=applyAxes;",
-        "document.getElementById(\"autoAxesButton\").onclick=function(){xMin.value=\"\";xMax.value=\"\";yMin.value=\"\";yMax.value=\"\";Plotly.relayout(plot,{\"xaxis.autorange\":true,\"yaxis.autorange\":true});};",
-        "document.getElementById(\"resetLimitsButton\").onclick=function(){lo.value=originalLower;hi.value=originalUpper;apply();};",
-        "lo.onkeydown=function(e){if(e.key===\"Enter\")apply();};hi.onkeydown=function(e){if(e.key===\"Enter\")apply();};",
-        "})();</script>"
-    ])
-    control_css = (
-        "<style>body{color:#000;background:#fff;}"
-        "label{color:#000;font-weight:600;}"
-        "input,button{color:#000;background:#fff;border:1.5px solid #000;"
-        "border-radius:4px;padding:6px 10px;font-family:" + safe_font + ";"
-        "font-size:" + size + "px;}"
-        "button{cursor:pointer;font-weight:600;}"
-        "</style>"
-    )
-    html = (
-        "<!doctype html><html><head><meta charset=\"utf-8\">"
-        + control_css
-        + "</head><body>"
-        + controls
-        + chart_html
-        + script
-        + "</body></html>"
-    )
-    try:
-        return html.encode("utf-8")
-    except Exception:
-        # Never allow an optional HTML export to terminate the Streamlit app.
-        return figure_to_html_bytes(fig)
-
-# =====================================================
-# STREAMLIT UI
-# =====================================================
-# =====================================================
-# MULTI-BATCH ANALYSIS
-# =====================================================
-def safe_file_stem(name):
-    stem = str(name).rsplit(".", 1)[0]
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_")
-    return stem or "batch_report"
-
-
-def analyze_batch_report(pdf_bytes, source_name):
-    full_text, sorted_full_text, pages = extract_pdf_pages(pdf_bytes)
-    summary_df = extract_batch_summary(full_text)
-    production_df = extract_production_counters(full_text, sorted_full_text)
-    fill_df = extract_fill_weights(full_text, sorted_full_text, pages)
-    safety_df, gmp_df, equipment_df = extract_alarm_tables(pages)
-    safety_df = sanitize_alarm_messages(safety_df)
-    gmp_df = sanitize_alarm_messages(gmp_df)
-    equipment_df = sanitize_alarm_messages(equipment_df)
-    audit_df = extract_audit_trail(pages)
-
-    fill_pass_df = fill_df[fill_df["Weight Passed"].eq(1)].copy()
-    if not fill_pass_df.empty:
-        fill_pass_df = fill_pass_df.sort_values("Timestamp").reset_index(drop=True)
-        fill_pass_df["Sample No"] = range(1, len(fill_pass_df) + 1)
-
-    alarm_frames = [df for df in [safety_df, gmp_df, equipment_df] if not df.empty]
-    all_alarms_df = (
-        pd.concat(alarm_frames, ignore_index=True)
-        if alarm_frames
-        else empty_dataframe(["Timestamp", "State", "Message", "Code", "Alarm Type"])
-    )
-    if not all_alarms_df.empty:
-        all_alarms_df = all_alarms_df.sort_values("Timestamp").reset_index(drop=True)
-
-    batch_number = ""
-    if not summary_df.empty:
-        batch_number = normalize_space(summary_df.iloc[0].get("Batch Number", ""))
-    batch_label = batch_number or safe_file_stem(source_name)
-    page_count = len(pages)
-
-    # Retain the originating report for full traceability after multiple reports
-    # belonging to the same manufacturing batch are combined.
-    for frame in [fill_df, fill_pass_df, safety_df, gmp_df, equipment_df, all_alarms_df, audit_df]:
-        if frame is not None and not frame.empty:
-            frame["Source Report"] = source_name
-
-    # Release PDF page text and word-coordinate structures before the result is
-    # retained. Only structured DataFrames and the page count remain in memory.
-    del full_text, sorted_full_text, pages
-    gc.collect()
-
-    return {
-        "source_name": source_name,
-        "batch_label": batch_label,
-        "page_count": page_count,
-        "summary": summary_df,
-        "production": production_df,
-        "fill": fill_df,
-        "fill_pass": fill_pass_df,
-        "safety": safety_df,
-        "gmp": gmp_df,
-        "equipment": equipment_df,
-        "alarms": all_alarms_df,
-        "alarm_summary": create_alarm_summary(all_alarms_df),
-        "audit": audit_df,
-        "audit_action_summary": create_audit_action_summary(audit_df),
-        "audit_user_summary": create_audit_user_summary(audit_df),
-    }
-
-
-def report_root_batch(batch_label):
-    """Return root batch, e.g. EG26051-1 -> EG26051."""
-    value = normalize_space(batch_label)
-    match = re.fullmatch(r"(.+?)-(\d+)", value)
-    return match.group(1) if match else value
-
-
-def combine_same_batch_reports(individual_results):
-    """Combine report parts only when a root batch and/or multiple related parts exist."""
-    labels = [normalize_space(result["batch_label"]) for result in individual_results]
-    roots = {label: report_root_batch(label) for label in labels}
-    root_counts = {}
-    for root in roots.values():
-        root_counts[root] = root_counts.get(root, 0) + 1
-
-    grouped = {}
-    for result in individual_results:
-        label = normalize_space(result["batch_label"])
-        root = roots[label]
-        # A lone suffix batch remains separate. A root with two or more reports is merged.
-        group_key = root if root_counts[root] > 1 else label
-        grouped.setdefault(group_key, []).append(result)
-
-    combined_results = []
-    for group_key, parts in grouped.items():
-        if len(parts) == 1:
-            combined_results.append(parts[0])
-            continue
-
-        source_names = [part["source_name"] for part in parts]
-
-        def combine_frames(key, sort_column=None, drop_duplicates=True):
-            frames = [part[key] for part in parts if part.get(key) is not None and not part[key].empty]
-            if not frames:
-                return pd.DataFrame()
-            frame = pd.concat(frames, ignore_index=True, sort=False)
-            if drop_duplicates:
-                frame = frame.drop_duplicates()
-            if sort_column and sort_column in frame.columns:
-                frame = frame.sort_values(sort_column, na_position="last")
-            return frame.reset_index(drop=True)
-
-        fill_df = combine_frames("fill", "Timestamp", True)
-        fill_pass_df = fill_df[fill_df["Weight Passed"].eq(1)].copy() if not fill_df.empty else pd.DataFrame()
-        if not fill_pass_df.empty:
-            fill_pass_df = fill_pass_df.sort_values("Timestamp").reset_index(drop=True)
-            fill_pass_df["Sample No"] = range(1, len(fill_pass_df) + 1)
-
-        safety_df = combine_frames("safety", "Timestamp", True)
-        gmp_df = combine_frames("gmp", "Timestamp", True)
-        equipment_df = combine_frames("equipment", "Timestamp", True)
-        alarms_df = combine_frames("alarms", "Timestamp", True)
-        # Audit rows are not de-duplicated because repeated printed audit events can be genuine.
-        audit_df = combine_frames("audit", "Timestamp", False)
-
-        # Sum production counters from every report part.
-        production_frames = [part["production"] for part in parts if not part["production"].empty]
-        if production_frames:
-            production_df = pd.concat(production_frames, ignore_index=True, sort=False)
-            group_columns = [column for column in ["Counter Group", "Counter"] if column in production_df.columns]
-            if group_columns and "Value" in production_df.columns:
-                production_df = (
-                    production_df.groupby(group_columns, dropna=False, as_index=False)["Value"]
-                    .sum()
-                )
-        else:
-            production_df = pd.DataFrame()
-
-        # Consolidated summary: earliest start and latest end across report parts.
-        summary_rows = [part["summary"].iloc[0].to_dict() for part in parts if not part["summary"].empty]
-        consolidated = summary_rows[0].copy() if summary_rows else {"Batch Number": group_key}
-        consolidated["Batch Number"] = group_key
-        consolidated["Combined Report Count"] = len(parts)
-        consolidated["Source Reports"] = "; ".join(source_names)
-
-        starts = pd.to_datetime(
-            [row.get("Batch Start", "") for row in summary_rows],
-            dayfirst=True,
-            errors="coerce",
+    work = work[
+        work["Normalized Step"].str.match(
+            r"^blending to accumulator (?:right|left)$", na=False
         )
-        ends = pd.to_datetime(
-            [row.get("Batch End", "") for row in summary_rows],
-            dayfirst=True,
-            errors="coerce",
-        )
-        valid_starts = starts[~pd.isna(starts)]
-        valid_ends = ends[~pd.isna(ends)]
-        if len(valid_starts):
-            consolidated["Batch Start"] = min(valid_starts).strftime("%d/%m/%Y %H:%M:%S")
-        if len(valid_ends):
-            consolidated["Batch End"] = max(valid_ends).strftime("%d/%m/%Y %H:%M:%S")
-        if len(valid_starts) and len(valid_ends):
-            duration = max(valid_ends) - min(valid_starts)
-            total_seconds = int(duration.total_seconds())
-            consolidated["Runtime"] = f"{total_seconds // 3600:02d}:{(total_seconds % 3600) // 60:02d}:{total_seconds % 60:02d}"
-        summary_df = pd.DataFrame([consolidated])
+        & work["Current Cycle"].gt(0)
+    ].sort_values(["Extruder", "Source Page", "Source Line"], kind="stable")
 
-        combined_results.append({
-            "source_name": "; ".join(source_names),
-            "source_reports": source_names,
-            "report_count": len(parts),
-            "batch_label": group_key,
-            "page_count": sum(part.get("page_count", 0) for part in parts),
-            "summary": summary_df,
-            "production": production_df,
-            "fill": fill_df,
-            "fill_pass": fill_pass_df,
-            "safety": safety_df,
-            "gmp": gmp_df,
-            "equipment": equipment_df,
-            "alarms": alarms_df,
-            "alarm_summary": create_alarm_summary(alarms_df),
-            "audit": audit_df,
-            "audit_action_summary": create_audit_action_summary(audit_df),
-            "audit_user_summary": create_audit_user_summary(audit_df),
+    phase_frames = []
+    for extruder, group in work.groupby("Extruder", sort=True):
+        group = group.copy()
+        phase = "Pre-pH Blending"
+        previous_cycle = None
+        phases = []
+        for cycle in group["Current Cycle"]:
+            if (
+                previous_cycle is not None
+                and previous_cycle >= 60
+                and cycle <= 5
+            ):
+                phase = "Post-pH Blending"
+            phases.append(phase)
+            previous_cycle = cycle
+        group["Blending Phase"] = phases
+        phase_frames.append(group)
+
+    if not phase_frames:
+        return pd.DataFrame(columns=columns)
+    work = pd.concat(phase_frames, ignore_index=True)
+
+    output = []
+    for (extruder, phase, cycle), cycle_data in work.groupby(
+        ["Extruder", "Blending Phase", "Current Cycle"], sort=True
+    ):
+        right_move = cycle_data[
+            cycle_data["Normalized Step"].eq("blending to accumulator right")
+        ]
+        left_move = cycle_data[
+            cycle_data["Normalized Step"].eq("blending to accumulator left")
+        ]
+        output.append({
+            "Extruder": int(extruder),
+            "Blending Phase": phase,
+            "Cycle": int(cycle),
+            "Max Pressure Left - Move Right (bar)": (
+                right_move["Loadcell Left (bar)"].max()
+                if not right_move.empty else pd.NA
+            ),
+            "Max Pressure Right - Move Left (bar)": (
+                left_move["Loadcell Right (bar)"].max()
+                if not left_move.empty else pd.NA
+            ),
+            "Move Right Start": right_move["Date & Time"].min() if not right_move.empty else pd.NaT,
+            "Move Right End": right_move["Date & Time"].max() if not right_move.empty else pd.NaT,
+            "Move Left Start": left_move["Date & Time"].min() if not left_move.empty else pd.NaT,
+            "Move Left End": left_move["Date & Time"].max() if not left_move.empty else pd.NaT,
+            "Move Right Source Pages": (
+                ", ".join(map(str, sorted(right_move["Source Page"].dropna().astype(int).unique())))
+                if not right_move.empty else ""
+            ),
+            "Move Left Source Pages": (
+                ", ".join(map(str, sorted(left_move["Source Page"].dropna().astype(int).unique())))
+                if not left_move.empty else ""
+            ),
         })
 
-    return sorted(combined_results, key=lambda item: item["batch_label"])
+    result = pd.DataFrame(output, columns=columns)
+    pressure_columns = [
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+    ]
+    result[pressure_columns] = result[pressure_columns].apply(pd.to_numeric, errors="coerce")
+    phase_order = pd.CategoricalDtype(
+        ["Pre-pH Blending", "Post-pH Blending"], ordered=True
+    )
+    result["Blending Phase"] = result["Blending Phase"].astype(phase_order)
+    return result.sort_values(
+        ["Extruder", "Blending Phase", "Cycle"]
+    ).reset_index(drop=True)
 
 
-def render_batch_analysis(
-    result, batch_key, lower_limit, upper_limit, histogram_bin_width,
-    show_x_grid, show_y_grid, show_range_slider, marker_size,
-    marker_opacity, font_family, font_size, show_fill_limits,
-    custom_axis_range, x_axis_min, x_axis_max, y_axis_min, y_axis_max,
-    all_results=None,
-):
-    """Render only the selected section to keep Streamlit Cloud memory stable."""
-    batch_label = result["batch_label"]
-    summary_df = result["summary"]
-    production_df = result["production"]
-    fill_df = result["fill"]
-    fill_pass_df = result["fill_pass"]
-    all_alarms_df = result["alarms"]
-    alarm_summary_df = result["alarm_summary"]
-    audit_df = result["audit"]
-    audit_action_summary_df = result["audit_action_summary"]
-    audit_user_summary_df = result["audit_user_summary"]
-    fill_statistics_df = create_fill_weight_statistics(fill_pass_df, batch_label)
-    pfs_quantities = get_pfs_quantity_summary(production_df, fill_df)
+def create_blending_pressure_plot(table, extruder, phase, batch_number):
+    """Create an interactive maximum-pressure plot for one Blending phase."""
+    data = table[
+        table["Extruder"].eq(extruder)
+        & table["Blending Phase"].astype(str).eq(phase)
+    ].sort_values("Cycle").copy()
 
-    st.subheader(batch_label)
-    st.caption(f"Source report(s): {result['source_name']}")
+    figure = go.Figure()
+    series = [
+        (
+            "Max Pressure Left - Move Right (bar)",
+            "Loadcell Left Max - movement to accumulator right",
+            "#9BBB59", "triangle-up",
+            ["Move Right Start", "Move Right End", "Move Right Source Pages"],
+        ),
+        (
+            "Max Pressure Right - Move Left (bar)",
+            "Loadcell Right Max - movement to accumulator left",
+            "#4F81BD", "diamond",
+            ["Move Left Start", "Move Left End", "Move Left Source Pages"],
+        ),
+    ]
+    for column, name, color, symbol, detail_columns in series:
+        values = data.dropna(subset=[column]).copy()
+        if values.empty:
+            continue
+        custom = values[detail_columns].copy()
+        for date_column in detail_columns[:2]:
+            custom[date_column] = pd.to_datetime(
+                custom[date_column], errors="coerce"
+            ).dt.strftime("%d-%m-%Y %H:%M:%S")
+        figure.add_trace(go.Scatter(
+            x=values["Cycle"], y=values[column],
+            mode="lines+markers", name=name,
+            customdata=custom.to_numpy(),
+            line={"color": color, "width": 2},
+            marker={"color": color, "size": 8, "symbol": symbol},
+            hovertemplate=(
+                f"<b>{name}</b><br>"
+                "Phase: " + phase + "<br>"
+                "Cycle: %{x}<br>"
+                "Maximum pressure: %{y:.2f} bar<br>"
+                "Movement start: %{customdata[0]}<br>"
+                "Movement end: %{customdata[1]}<br>"
+                "Source page(s): %{customdata[2]}"
+                "<extra></extra>"
+            ),
+        ))
 
-    section = st.radio(
-        "Analysis section",
-        ["Summary", "Production", "Fill Weight", "Cross-Batch Statistics", "All Alarms", "Audit Trail", "Downloads"],
-        horizontal=True,
-        key=f"section_{batch_key}",
+    expected_cycles = 60 if phase == "Pre-pH Blending" else 100
+    max_pressure = data[[
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+    ]].max().max() if not data.empty else 160
+    y_max = max(160, float(max_pressure) * 1.12) if pd.notna(max_pressure) else 160
+    figure.update_layout(
+        title={
+            "text": f"{batch_number}<br>EXTRUDER - {int(extruder)} | {phase}",
+            "x": 0.5, "xanchor": "center",
+        },
+        xaxis_title="Cycles", yaxis_title="Maximum Pressure (bar)",
+        xaxis={"range": [0, expected_cycles + 2], "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+        yaxis={"range": [0, y_max], "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+        hovermode="closest",
+        legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.20},
+        height=620,
+        margin={"l": 70, "r": 30, "t": 100, "b": 120},
+    )
+    return figure
+
+def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
+    """Create an interactive maximum-pressure-by-cycle chart."""
+    data = table[
+        table["Extruder"].eq(extruder) & table["Orifice"].eq(orifice)
+    ].sort_values("Cycle").copy()
+
+    figure = go.Figure()
+    series = [
+        (
+            "Max Pressure Left - Move Right (bar)",
+            "Loadcell Left Max - movement to accumulator right",
+            "#4F81BD", "diamond",
+            ["Move Right Start", "Move Right End", "Move Right Source Pages"],
+        ),
+        (
+            "Max Pressure Right - Move Left (bar)",
+            "Loadcell Right Max - movement to accumulator left",
+            "#C0504D", "diamond",
+            ["Move Left Start", "Move Left End", "Move Left Source Pages"],
+        ),
+    ]
+
+    for column, name, color, symbol, detail_columns in series:
+        values = data.dropna(subset=[column]).copy()
+        if values.empty:
+            continue
+        custom = values[detail_columns].copy()
+        for date_column in detail_columns[:2]:
+            custom[date_column] = pd.to_datetime(custom[date_column], errors="coerce").dt.strftime(
+                "%d-%m-%Y %H:%M:%S"
+            )
+        figure.add_trace(go.Scatter(
+            x=values["Cycle"],
+            y=values[column],
+            mode="lines+markers",
+            name=name,
+            customdata=custom.to_numpy(),
+            line={"color": color, "width": 2, "dash": "dash" if "Right Max" in name else "solid"},
+            marker={"color": color, "size": 9, "symbol": symbol},
+            hovertemplate=(
+                f"<b>{name}</b><br>"
+                "Cycle: %{x}<br>"
+                "Maximum pressure: %{y:.2f} bar<br>"
+                "Movement start: %{customdata[0]}<br>"
+                "Movement end: %{customdata[1]}<br>"
+                "Source page(s): %{customdata[2]}"
+                "<extra></extra>"
+            ),
+        ))
+
+    max_cycle = int(data["Cycle"].max()) if not data.empty else 1
+    max_pressure = data[[
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+    ]].max().max() if not data.empty else 200
+    y_max = max(200, float(max_pressure) * 1.12) if pd.notna(max_pressure) else 200
+
+    figure.update_layout(
+        title={
+            "text": f"{batch_number}<br>EXTRUDER - {int(extruder)} | MIXING: Extrusion {orifice} cycles",
+            "x": 0.5,
+            "xanchor": "center",
+        },
+        xaxis_title="Cycles",
+        yaxis_title="Maximum Pressure (bar)",
+        xaxis={"dtick": 1, "range": [0.5, max_cycle + 0.5], "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+        yaxis={"range": [0, y_max], "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+        hovermode="closest",
+        legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.20},
+        height=620,
+        margin={"l": 70, "r": 30, "t": 100, "b": 120},
+    )
+    return figure
+
+def create_wetting_rise_time_plot(table, batch_number, limit):
+    """Create an interactive Plotly chart with point-level hover details."""
+    normalized_steps = (
+        table["Step Name"].astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.casefold()
+    )
+    plot_data = table[normalized_steps.eq("stop vacuum timer")].dropna(
+        subset=["Time taken to reach vacuum rise (min)", "Rise time (Sec)"]
+    ).copy()
+
+    figure = go.Figure()
+    styles = {
+        1: {"symbol": "triangle-up", "color": "#9BBB59", "label": "EXTRUDER - 01"},
+        2: {"symbol": "x", "color": "#35A9D6", "label": "EXTRUDER - 02"},
+        3: {"symbol": "circle", "color": "#4F81BD", "label": "EXTRUDER - 03"},
+    }
+
+    for extruder in sorted(plot_data["Extruder"].dropna().unique()):
+        values = plot_data[plot_data["Extruder"].eq(extruder)].sort_values(
+            "Time taken to reach vacuum rise (min)", kind="stable"
+        )
+        style = styles.get(
+            int(extruder),
+            {"symbol": "circle", "color": "#666666", "label": f"EXTRUDER - {int(extruder):02d}"},
+        )
+        custom_data = values[[
+            "Date & Time", "Step Name", "Vacuum Timer Start", "Source Page"
+        ]].copy()
+        custom_data["Date & Time"] = custom_data["Date & Time"].dt.strftime("%d-%m-%Y %H:%M:%S")
+        custom_data["Vacuum Timer Start"] = custom_data["Vacuum Timer Start"].dt.strftime("%d-%m-%Y %H:%M:%S")
+
+        figure.add_trace(go.Scatter(
+            x=values["Time taken to reach vacuum rise (min)"],
+            y=values["Rise time (Sec)"],
+            mode="markers",
+            name=style["label"],
+            customdata=custom_data.to_numpy(),
+            marker={
+                "symbol": style["symbol"],
+                "color": style["color"],
+                "size": 9,
+                "line": {"width": 1, "color": style["color"]},
+            },
+            hovertemplate=(
+                "<b>%{fullData.name}</b><br>"
+                "Date & Time: %{customdata[0]}<br>"
+                "Step Name: %{customdata[1]}<br>"
+                "Elapsed time: %{x:.3f} min<br>"
+                "Rise time: %{y:.0f} sec<br>"
+                "Vacuum Timer Start: %{customdata[2]}<br>"
+                "Source Page: %{customdata[3]}"
+                "<extra></extra>"
+            ),
+        ))
+
+    x_max = max(
+        10.0,
+        float(plot_data["Time taken to reach vacuum rise (min)"].max()) * 1.08
+        if not plot_data.empty else 10.0,
+    )
+    figure.add_hline(
+        y=limit,
+        line_color="#C0504D",
+        line_width=3,
+        annotation_text="RISE TIME LIMIT",
+        annotation_position="top right",
+        annotation_font_color="#C0504D",
+    )
+    figure.update_layout(
+        title={"text": str(batch_number), "x": 0.5, "xanchor": "center"},
+        xaxis_title="Time taken to reach vacuum rise (min)",
+        yaxis_title="Rise time (Sec)",
+        xaxis={"range": [0, x_max], "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+        yaxis={"range": [0, max(700.0, limit * 1.15)], "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+        hovermode="closest",
+        legend={"x": 0.72, "y": 0.45, "bgcolor": "rgba(255,255,255,0.65)"},
+        height=700,
+        margin={"l": 70, "r": 30, "t": 80, "b": 70},
+    )
+    return figure
+
+
+def figure_to_png(fig):
+    buffer = io.BytesIO(); fig.savefig(buffer, format="png", dpi=200, bbox_inches="tight"); return buffer.getvalue()
+
+
+def apply_graph_style(figure, font_family="Times New Roman", font_size=12):
+    """Apply typography, remove grids, and draw the inner plot border."""
+    size = int(font_size)
+    figure.update_layout(
+        font={"family": font_family, "size": size, "color": "#000000"},
+        title_font={"family": font_family, "size": size, "color": "#000000"},
+        legend_font={"family": font_family, "size": size, "color": "#000000"},
+        paper_bgcolor="white", plot_bgcolor="white",
+    )
+    figure.update_xaxes(showgrid=True, gridcolor="#C7C7C7", gridwidth=1,
+        showline=True, mirror=True, linewidth=1.5,
+        linecolor="#000000", ticks="outside",
+        tickfont={"family": font_family, "size": size, "color": "#000000"},
+        title_font={"family": font_family, "size": size, "color": "#000000"})
+    figure.update_yaxes(showgrid=True, gridcolor="#C7C7C7", gridwidth=1,
+        showline=True, mirror=True, linewidth=1.5,
+        linecolor="#000000", ticks="outside",
+        tickfont={"family": font_family, "size": size, "color": "#000000"},
+        title_font={"family": font_family, "size": size, "color": "#000000"})
+    return figure
+
+
+def graph_display_controls():
+    """Sidebar font controls shared by every graph."""
+    with st.sidebar:
+        st.markdown("### Application Controls")
+        if st.button("Clear processed reports and cache", use_container_width=True):
+            st.cache_data.clear()
+            generated_prefixes = (
+                "generated_excel_", "generated_zip_", "generated_html_"
+            )
+            for state_key in list(st.session_state):
+                if state_key.startswith(generated_prefixes):
+                    del st.session_state[state_key]
+            st.session_state.pop("active_upload_signature", None)
+            st.session_state.pop("pdf_processing_status", None)
+            st.session_state.pop("pdf_processing_errors", None)
+            st.session_state.pop("processed_selected_pdf_key", None)
+            st.session_state.pop("selected_pdf_signature", None)
+            gc.collect()
+            st.rerun()
+        st.caption(
+            "Use this before uploading a completely new report set if the app "
+            "becomes slow."
+        )
+        st.markdown("### Graph Controls")
+        family = st.selectbox("Graph font", ["Times New Roman", "Arial", "Calibri", "Georgia"], index=0, key="graph_font_family")
+        preset = st.selectbox("Graph font size", ["10 pt", "12 pt", "14 pt", "16 pt", "18 pt", "20 pt", "Custom"], index=1, key="graph_font_size_preset")
+        if preset == "Custom":
+            size = int(st.number_input("Custom font size", min_value=8, max_value=30, value=12, step=1, key="graph_custom_font_size"))
+        else:
+            size = int(preset.split()[0])
+    return family, size
+
+
+def create_editable_interactive_html(figure, x_axis_label="X axis"):
+    """Export HTML with movable labels and manual X/Y limits and font controls."""
+    html_figure = go.Figure(figure)
+    html_figure.update_xaxes(rangeslider={"visible": False}, fixedrange=False)
+    html_figure.update_yaxes(fixedrange=False)
+    apply_graph_style(html_figure, html_figure.layout.font.family or "Times New Roman", html_figure.layout.font.size or 12)
+    config = {
+        "editable": True,
+        "edits": {"annotationPosition": True, "annotationText": True,
+                  "axisTitleText": True, "legendPosition": True,
+                  "legendText": True, "shapePosition": True, "titleText": True},
+        "displaylogo": False, "scrollZoom": True, "responsive": True,
+        "toImageButtonOptions": {"format": "png", "scale": 2},
+    }
+    html = pio.to_html(html_figure, include_plotlyjs=True, full_html=True,
+                       config=config, div_id="editable_plot")
+    controls = """
+<style>
+body { margin:0; background:#fff; font-family:'Times New Roman',serif; }
+#graph_editor_panel { margin:10px auto; padding:10px 12px; width:calc(100% - 44px); border:1.5px solid #000; background:#f7f7f7; box-sizing:border-box; display:flex; flex-wrap:wrap; gap:8px 12px; align-items:end; }
+#graph_editor_panel label { font-weight:bold; font-size:12px; }
+#graph_editor_panel input,#graph_editor_panel select,#graph_editor_panel button { font-family:inherit; font-size:12px; padding:4px 6px; }
+#editable_plot { margin:10px 20px 20px 20px; border:2px solid #000; box-sizing:border-box; }
+.editor_field { display:flex; flex-direction:column; gap:2px; }
+.grid_option { display:flex; align-items:center; gap:5px; padding-bottom:5px; }
+</style>
+<div id="graph_editor_panel">
+<div class="editor_field"><label>X minimum</label><input id="x_min" type="number" step="any"></div>
+<div class="editor_field"><label>X maximum</label><input id="x_max" type="number" step="any"></div>
+<div class="editor_field"><label>Y minimum</label><input id="y_min" type="number" step="any"></div>
+<div class="editor_field"><label>Y maximum</label><input id="y_max" type="number" step="any"></div>
+<div class="editor_field"><label>Font</label><select id="font_family"><option>Times New Roman</option><option>Arial</option><option>Calibri</option><option>Georgia</option></select></div>
+<div class="editor_field"><label>Font size</label><input id="font_size" type="number" min="8" max="40" value="12"></div>
+<div class="grid_option"><input id="x_grid" type="checkbox" checked><label for="x_grid">X-axis gridlines</label></div>
+<div class="grid_option"><input id="y_grid" type="checkbox" checked><label for="y_grid">Y-axis gridlines</label></div>
+<div class="grid_option"><input id="y2_grid" type="checkbox"><label for="y2_grid">Secondary Y-axis gridlines</label></div>
+<button id="apply_graph_settings">Apply</button><button id="auto_scale">Auto scale</button>
+<span><b>Tip:</b> drag the title, legend and annotations directly in the graph.</span>
+</div>
+<script>
+window.addEventListener('load',function(){
+ const plot=document.getElementById('editable_plot'),layout=plot.layout||{};
+ const xr=layout.xaxis&&layout.xaxis.range?layout.xaxis.range:[],yr=layout.yaxis&&layout.yaxis.range?layout.yaxis.range:[];
+ if(xr.length===2){x_min.value=xr[0];x_max.value=xr[1];} if(yr.length===2){y_min.value=yr[0];y_max.value=yr[1];}
+ if(layout.font&&layout.font.family)font_family.value=layout.font.family; if(layout.font&&layout.font.size)font_size.value=layout.font.size;
+ x_grid.checked = !(layout.xaxis && layout.xaxis.showgrid === false);
+ y_grid.checked = !(layout.yaxis && layout.yaxis.showgrid === false);
+ y2_grid.checked = !!(layout.yaxis2 && layout.yaxis2.showgrid === true);
+ if (!(layout.yaxis2)) { y2_grid.disabled = true; y2_grid.parentElement.style.opacity = '0.5'; }
+ apply_graph_settings.onclick=function(){
+  const xmin=parseFloat(x_min.value),xmax=parseFloat(x_max.value),ymin=parseFloat(y_min.value),ymax=parseFloat(y_max.value),family=font_family.value,size=parseInt(font_size.value||'12');
+  const u={'font.family':family,'font.size':size,'title.font.family':family,'title.font.size':size,'legend.font.family':family,'legend.font.size':size,'xaxis.tickfont.family':family,'xaxis.tickfont.size':size,'xaxis.title.font.family':family,'xaxis.title.font.size':size,'yaxis.tickfont.family':family,'yaxis.tickfont.size':size,'yaxis.title.font.family':family,'yaxis.title.font.size':size,'xaxis.showgrid':x_grid.checked,'yaxis.showgrid':y_grid.checked};
+  if(layout.yaxis2) u['yaxis2.showgrid']=y2_grid.checked;
+  if(!Number.isNaN(xmin)&&!Number.isNaN(xmax)&&xmin<xmax)u['xaxis.range']=[xmin,xmax]; if(!Number.isNaN(ymin)&&!Number.isNaN(ymax)&&ymin<ymax)u['yaxis.range']=[ymin,ymax]; Plotly.relayout(plot,u);
+ };
+ auto_scale.onclick=function(){Plotly.relayout(plot,{'xaxis.autorange':true,'yaxis.autorange':true});x_min.value='';x_max.value='';y_min.value='';y_max.value='';};
+});
+</script>
+"""
+    return html.replace('<body>', '<body>'+controls).encode('utf-8')
+
+
+def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejected, process_ranges, wetting_rise_table, mixing_pressure_table, blending_pressure_table, premix_prepared, premix_blocks, premix_pairs, premix_prediction, premix_summary):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame([batch]).to_excel(writer, "Batch Details", index=False)
+        overview.to_excel(writer, "Process Overview", index=False); summaries.to_excel(writer, "Process Summary", index=False)
+        settings.to_excel(writer, "Recipe Settings", index=False); process_ranges.to_excel(writer, "Process Page Ranges", index=False)
+        wetting_rise_table.to_excel(writer, "Wetting Rise Time", index=False)
+        mixing_pressure_table.to_excel(writer, "Mixing Max Pressure", index=False)
+        blending_pressure_table.to_excel(writer, "Blending Max Pressure", index=False)
+        premix_prepared.to_excel(writer, "Premix Calculated Datalog", index=False)
+        premix_blocks.to_excel(writer, "Premix Direction Blocks", index=False)
+        premix_pairs.to_excel(writer, "Premix Bidirectional", index=False)
+        premix_prediction.to_excel(writer, "Premix Prediction", index=False)
+        premix_summary.to_excel(writer, "Premix Volume Summary", index=False)
+        diagnostics.to_excel(writer, "Datalog Diagnostics", index=False); rejected.to_excel(writer, "Rejected Rows", index=False)
+        for stage in STAGES:
+            (datalog[datalog["Stage"].eq(stage)] if not datalog.empty else pd.DataFrame()).to_excel(writer, f"{stage.title()} Datalog"[:31], index=False)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"; ws.sheet_view.showGridLines = False; ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                cell.font = cell.font.copy(bold=True, color="FFFFFF"); cell.fill = cell.fill.copy(fill_type="solid", fgColor="1F4E78")
+            for column in ws.columns:
+                ws.column_dimensions[column[0].column_letter].width = min(max(len(str(cell.value or "")) for cell in column) + 2, 40)
+    return output.getvalue()
+
+
+
+@st.cache_data(
+    show_spinner=False,
+    ttl=CACHE_TTL_SECONDS,
+    max_entries=CACHE_MAX_REPORTS,
+)
+def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml):
+    """Extract and calculate all report outputs for one uploaded PDF."""
+    pages = extract_pages(pdf_bytes)
+    batch = parse_batch_details(pages)
+    overview = parse_process_overview(pages)
+    summaries = parse_process_summaries(pages)
+    settings = parse_recipe_settings(pages, summaries)
+    datalog, diagnostics, rejected_rows, process_ranges = parse_datalogs(
+        pages, summaries
     )
 
-    if section == "Summary":
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
-        total = len(fill_df)
-        passed = len(fill_pass_df)
-        failed = total - passed
-        pass_rate = passed / total * 100 if total else 0.0
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Fill Records", f"{total:,}")
-        c2.metric("Fill Weight Passed", f"{passed:,}")
-        c3.metric("Fill Weight Not Passed", f"{failed:,}")
-        c4.metric("Pass Rate", f"{pass_rate:.2f}%")
-        a1, a2, a3 = st.columns(3)
-        a1.metric("All Alarm Events", f"{len(all_alarms_df):,}")
-        a2.metric("Audit Records", f"{len(audit_df):,}")
-        a3.metric("PDF Pages", f"{result.get('page_count', 0):,}")
+    wetting_data = (
+        datalog[datalog["Stage"].eq("WETTING")].copy()
+        if not datalog.empty else pd.DataFrame()
+    )
+    wetting_rise_table = build_wetting_rise_time_table(wetting_data)
 
-    elif section == "Production":
-        if production_df.empty:
-            st.warning("No structured production counters were detected.")
-        else:
-            st.dataframe(production_df, use_container_width=True, hide_index=True)
-            groups = production_df["Counter Group"].drop_duplicates().tolist()
-            selected_group = st.selectbox(
-                "Counter group to plot", groups, key=f"production_group_{batch_key}"
-            )
-            plot_df = production_df[production_df["Counter Group"].eq(selected_group)]
-            fig = px.bar(plot_df, x="Counter", y="Value", color="Counter", text="Value")
-            fig.update_traces(textposition="outside")
-            fig = apply_graph_style(fig, selected_group, "Counter", "Value", font_family, font_size)
-            fig = make_interactive(fig, show_x_grid, show_y_grid, False)
-            st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG,
-                            key=f"production_plot_{batch_key}")
+    mixing_data = (
+        datalog[datalog["Stage"].eq("MIXING")].copy()
+        if not datalog.empty else pd.DataFrame()
+    )
+    mixing_pressure_table = build_mixing_max_pressure_table(mixing_data)
 
-    elif section == "Fill Weight":
-        if fill_df.empty:
-            st.warning("No fill-weight records were detected.")
-        else:
-            f1, f2, f3, f4 = st.columns(4)
-            f1.metric("Passed Records", f"{len(fill_pass_df):,}")
-            f2.metric("Mean", f"{fill_pass_df['Nett Weight'].mean():.3f}" if not fill_pass_df.empty else "N/A")
-            f3.metric("Standard Deviation", f"{fill_pass_df['Nett Weight'].std():.3f}" if len(fill_pass_df) > 1 else "N/A")
-            f4.metric("Range", f"{fill_pass_df['Nett Weight'].min():.2f} to {fill_pass_df['Nett Weight'].max():.2f}" if not fill_pass_df.empty else "N/A")
-            st.subheader("PFS Quantity Summary")
-            q1, q2, q3 = st.columns(3)
-            q1.metric("Total Filled PFS", f"{pfs_quantities['Total Filled PFS']:,}")
-            q2.metric("Total Accepted PFS", f"{pfs_quantities['Total Accepted PFS']:,}")
-            q3.metric("Total Rejected PFS", f"{pfs_quantities['Total Rejected PFS']:,}")
+    blending_data = (
+        datalog[datalog["Stage"].eq("BLENDING")].copy()
+        if not datalog.empty else pd.DataFrame()
+    )
+    blending_pressure_table = build_blending_max_pressure_table(blending_data)
 
-            st.subheader("Fill-Weight Statistical Summary by Pump")
-            st.dataframe(fill_statistics_df, use_container_width=True, hide_index=True)
-            record_scope = st.radio(
-                "Fill-weight records for table and plots",
-                ["Passed only", "All records"], horizontal=True,
-                key=f"fill_record_scope_{batch_key}",
-            )
-            selected_fill_df = (
-                fill_pass_df if record_scope == "Passed only" else fill_df
-            ).sort_values("Timestamp").reset_index(drop=True).copy()
-            selected_fill_df["Sample No"] = range(1, len(selected_fill_df) + 1)
-            st.dataframe(selected_fill_df, use_container_width=True, hide_index=True)
+    premixing_data = (
+        datalog[datalog["Stage"].eq("PREMIXING")].copy()
+        if not datalog.empty else pd.DataFrame()
+    )
+    premix_prepared = prepare_premixing_engineering_data(premixing_data)
+    premix_blocks = summarize_premixing_directional_blocks(premix_prepared)
+    premix_pairs = pair_premixing_bidirectional_attempts(premix_blocks)
+    premix_prediction = reverse_predict_premixing_volume_step(
+        premix_pairs, premixing_step_volume_ml
+    )
 
-            if not selected_fill_df.empty:
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Plotted Records", f"{len(selected_fill_df):,}")
-                m2.metric("Passed in Plot", f"{int(selected_fill_df['Weight Passed'].eq(1).sum()):,}")
-                m3.metric("Failed in Plot", f"{int(selected_fill_df['Weight Passed'].eq(0).sum()):,}")
-                positions = sorted(selected_fill_df["Position"].dropna().unique().tolist())
-                selected_positions = st.multiselect(
-                    "Pumps to display", positions, default=positions,
-                    key=f"positions_{batch_key}",
+    if not premix_pairs.empty and not premix_prediction.empty:
+        volume_step_map = premix_prediction[[
+            "Extruder", "Bidirectional Attempt ID",
+            "Volume step size (mL)", "Volume Step Rule",
+        ]].drop_duplicates(["Extruder", "Bidirectional Attempt ID"])
+        premix_pairs = premix_pairs.merge(
+            volume_step_map,
+            on=["Extruder", "Bidirectional Attempt ID"],
+            how="left",
+        )
+
+    premix_summary = build_premixing_volume_step_summary(premix_prediction)
+
+    return {
+        "file_name": file_name,
+        "pages": pages,
+        "batch": batch,
+        "overview": overview,
+        "summaries": summaries,
+        "settings": settings,
+        "datalog": datalog,
+        "diagnostics": diagnostics,
+        "rejected_rows": rejected_rows,
+        "process_ranges": process_ranges,
+        "wetting_rise_table": wetting_rise_table,
+        "mixing_pressure_table": mixing_pressure_table,
+        "blending_pressure_table": blending_pressure_table,
+        "premix_prepared": premix_prepared,
+        "premix_blocks": premix_blocks,
+        "premix_pairs": premix_pairs,
+        "premix_prediction": premix_prediction,
+        "premix_summary": premix_summary,
+        "premixing_step_volume_ml": float(premixing_step_volume_ml),
+    }
+
+
+def result_to_excel(result):
+    """Create the complete Excel workbook for one processed report."""
+    return make_excel(
+        result["batch"], result["overview"], result["summaries"],
+        result["settings"], result["datalog"], result["diagnostics"],
+        result["rejected_rows"], result["process_ranges"],
+        result["wetting_rise_table"], result["mixing_pressure_table"],
+        result["blending_pressure_table"], result["premix_prepared"],
+        result["premix_blocks"], result["premix_pairs"],
+        result["premix_prediction"], result["premix_summary"],
+    )
+
+
+def safe_output_name(value):
+    """Create a filesystem-safe output name."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._")
+    return cleaned or "batch"
+
+
+def build_all_batches_zip(results, errors):
+    """Package one complete Excel workbook per successful PDF into one ZIP."""
+    output = io.BytesIO()
+    used_names = set()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for result_key, result in results.items():
+            batch_number = result["batch"].get("Batch no.") or Path(
+                result["file_name"]
+            ).stem
+            base_name = safe_output_name(batch_number)
+            candidate = f"{base_name}_complete_process_extraction.xlsx"
+            suffix = 2
+            while candidate.casefold() in used_names:
+                candidate = (
+                    f"{base_name}_{suffix}_complete_process_extraction.xlsx"
                 )
-                graph_df = selected_fill_df[
-                    selected_fill_df["Position"].isin(selected_positions)
-                ].copy()
-                if not graph_df.empty:
-                    scatter_label = (
-                        f"{batch_label} - Passed Records"
-                        if record_scope == "Passed only"
-                        else f"{batch_label} - All Records"
-                    )
-                    scatter = make_fill_scatter(
-                        graph_df, scatter_label, lower_limit, upper_limit,
-                        font_family, font_size, show_fill_limits,
-                    )
-                    scatter.update_traces(marker=dict(size=marker_size, opacity=marker_opacity))
-                    # Scatter plot gridlines are intentionally always retained.
-                    scatter = make_interactive(scatter, True, True, show_range_slider)
-                    scatter = add_pfs_quantity_annotations(
-                        scatter,
-                        pfs_quantities,
-                        font_family,
-                        font_size,
-                    )
-                    if custom_axis_range:
-                        scatter.update_xaxes(range=[x_axis_min, x_axis_max], autorange=False)
-                        scatter.update_yaxes(range=[y_axis_min, y_axis_max], autorange=False)
-                    st.plotly_chart(scatter, use_container_width=True, config=PLOTLY_CONFIG,
-                                    key=f"fill_scatter_{batch_key}")
+                suffix += 1
+            used_names.add(candidate.casefold())
+            archive.writestr(candidate, result_to_excel(result))
 
-                    histogram = make_fill_histogram(
-                        graph_df, scatter_label, histogram_bin_width, font_family, font_size
-                    )
-                    histogram = make_interactive(histogram, show_x_grid, show_y_grid, False)
-                    st.plotly_chart(histogram, use_container_width=True, config=PLOTLY_CONFIG,
-                                    key=f"histogram_{batch_key}")
-
-                    if st.button("Prepare Interactive Scatter HTML", key=f"prep_html_{batch_key}"):
-                        html_bytes = scatter_figure_to_html_bytes(
-                            scatter, lower_limit, upper_limit, font_family, font_size,
-                            x_axis_min if custom_axis_range else None,
-                            x_axis_max if custom_axis_range else None,
-                            y_axis_min if custom_axis_range else None,
-                            y_axis_max if custom_axis_range else None,
-                        )
-                        st.download_button(
-                            "Download Interactive Scatter HTML", html_bytes,
-                            file_name=f"{safe_file_stem(batch_label)}_fill_weight.html",
-                            mime="text/html", key=f"html_download_{batch_key}",
-                            use_container_width=True,
-                        )
-
-    elif section == "Cross-Batch Statistics":
-        comparison_results = all_results if all_results is not None else [result]
-        comparison_df = create_batch_pump_statistics_for_charts(comparison_results)
-        if comparison_df.empty:
-            st.warning(
-                "Cross-batch graphs require passed fill-weight data and a product "
-                "strength such as 60 mg, 90 mg, or 120 mg in the batch summary."
-            )
-        else:
-            st.subheader("Cross-Batch Pump Statistics by Strength")
-            st.caption(
-                "Charts use records where Weight Passed = 1. "
-                "All Pumps Combined is shown as a dashed black line with diamond markers."
-            )
-            selected_strengths = st.multiselect(
-                "Strengths to display",
-                options=sorted(
-                    comparison_df["Strength"].dropna().unique().tolist(),
-                    reverse=True,
-                ),
-                default=sorted(
-                    comparison_df["Strength"].dropna().unique().tolist(),
-                    reverse=True,
-                ),
-                key="cross_batch_strength_filter",
-            )
-            filtered_comparison_df = comparison_df[
-                comparison_df["Strength"].isin(selected_strengths)
-            ].copy()
-
-            chart_choice = st.multiselect(
-                "Graphs to display",
-                options=["Mean", "Standard Deviation", "RSD (%)"],
-                default=["Mean", "Standard Deviation", "RSD (%)"],
-                key="cross_batch_chart_filter",
-            )
-            chart_specs = [
-                (
-                    "Mean",
-                    "Average",
-                    "Mean by Batch, Pump and Strength",
-                    "Average Fill Weight (mg)",
-                    "mean_by_batch_pump_strength",
-                ),
-                (
-                    "Standard Deviation",
-                    "Standard Deviation",
-                    "Standard Deviation by Batch, Pump and Strength",
-                    "Standard Deviation (mg)",
-                    "sd_by_batch_pump_strength",
-                ),
-                (
-                    "RSD (%)",
-                    "RSD (%)",
-                    "Relative Standard Deviation by Batch, Pump and Strength",
-                    "RSD (%)",
-                    "rsd_by_batch_pump_strength",
-                ),
+        if errors:
+            error_lines = [
+                f"{file_name}: {message}"
+                for file_name, message in errors.items()
             ]
+            archive.writestr(
+                "extraction_errors.txt",
+                "\n".join(error_lines).encode("utf-8"),
+            )
+    return output.getvalue()
 
-            for choice_label, metric, title, y_title, download_name in chart_specs:
-                if choice_label not in chart_choice:
-                    continue
-                chart = make_strength_comparison_chart(
-                    filtered_comparison_df,
-                    metric,
-                    title,
-                    y_title,
-                    font_family,
-                    font_size,
-                )
-                if chart is None:
-                    continue
-                st.plotly_chart(
-                    chart,
-                    use_container_width=True,
-                    config=PLOTLY_CONFIG,
-                    key=f"{download_name}_{batch_key}",
-                )
-                st.download_button(
-                    f"Download {choice_label} Chart as Interactive HTML",
-                    data=figure_to_html_bytes(chart),
-                    file_name=f"{download_name}.html",
-                    mime="text/html",
-                    key=f"download_{download_name}_{batch_key}",
-                    use_container_width=True,
-                )
 
-            st.subheader("Statistics Used for Cross-Batch Charts")
+def uploaded_report_fingerprint(file_name, pdf_bytes):
+    """Stable identifier used to prevent stale exports for replaced PDFs."""
+    digest = hashlib.sha256(pdf_bytes).hexdigest()[:16]
+    return f"{safe_output_name(Path(file_name).stem)}_{digest}"
+
+def main():
+    st.title("🧪 Complete Batch Process Report Extractor")
+    st.caption(
+        "Upload and analyze one or more batch-cycle PDF reports. Each file is "
+        "processed independently so a failure in one report does not stop the others."
+    )
+    graph_font_family, graph_font_size = graph_display_controls()
+
+    st.markdown("### Premixing batch configuration")
+    premixing_batch_size = st.selectbox(
+        "Premixing batch size / step volume",
+        ["1 kg batch - 16.5 mL", "1.5 kg batch - 25.0 mL", "Custom"],
+        index=0,
+    )
+    if premixing_batch_size == "1 kg batch - 16.5 mL":
+        premixing_step_volume_ml = 16.5
+    elif premixing_batch_size == "1.5 kg batch - 25.0 mL":
+        premixing_step_volume_ml = 25.0
+    else:
+        premixing_step_volume_ml = float(st.number_input(
+            "Custom Premixing step volume (mL)", min_value=0.1,
+            max_value=100.0, value=16.5, step=0.5, format="%.1f"
+        ))
+    st.info(
+        f"Selected Premixing step volume: {premixing_step_volume_ml:g} mL | "
+        f"Plot range: 0 to {premixing_step_volume_ml * 12:g} mL"
+    )
+
+    uploaded_files = st.file_uploader(
+        "Upload Batch Cycle Report PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Select one or more PDF batch reports.",
+    )
+    if not uploaded_files:
+        st.info("Upload one or more batch-report PDFs to begin.")
+        st.stop()
+
+    if len(uploaded_files) > MAX_UPLOAD_FILES:
+        st.error(
+            f"Upload a maximum of {MAX_UPLOAD_FILES} PDF reports per processing run."
+        )
+        st.stop()
+
+    st.caption(
+        f"Selected {len(uploaded_files)} file(s). "
+        f"Maximum allowed per processing run: {MAX_UPLOAD_FILES} files."
+    )
+
+    # Build a lightweight inventory and preserve processing status per file.
+    if "pdf_processing_status" not in st.session_state:
+        st.session_state["pdf_processing_status"] = {}
+    if "pdf_processing_errors" not in st.session_state:
+        st.session_state["pdf_processing_errors"] = {}
+
+    inventory_rows = []
+    file_options = {}
+    file_status_keys = {}
+    for file_index, uploaded_file in enumerate(uploaded_files, start=1):
+        display_label = f"{file_index:02d}. {uploaded_file.name}"
+        status_key = (
+            f"{uploaded_file.name}|{uploaded_file.size}|"
+            f"{premixing_step_volume_ml:g}"
+        )
+        file_options[display_label] = uploaded_file
+        file_status_keys[display_label] = status_key
+        current_status = st.session_state["pdf_processing_status"].get(
+            status_key, "Ready to process"
+        )
+        inventory_rows.append({
+            "No.": file_index,
+            "File Name": uploaded_file.name,
+            "File Size (MB)": round(uploaded_file.size / (1024 * 1024), 2),
+            "Status": current_status,
+        })
+
+    st.markdown("### Uploaded file inventory")
+    st.dataframe(
+        pd.DataFrame(inventory_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    selected_label = st.selectbox(
+        "Select one PDF to process",
+        options=list(file_options),
+        key="selected_pdf_to_process",
+    )
+    selected_upload = file_options[selected_label]
+    selected_status_key = file_status_keys[selected_label]
+    selected_status = st.session_state["pdf_processing_status"].get(
+        selected_status_key, "Ready to process"
+    )
+
+    current_selection_signature = selected_status_key
+    if st.session_state.get("selected_pdf_signature") != current_selection_signature:
+        st.session_state.pop("processed_selected_pdf_key", None)
+        st.session_state.pop("selected_pdf_signature", None)
+
+    status_col, action_col, guidance_col = st.columns([1.1, 1.1, 2.2])
+    if selected_status == "Processed":
+        status_col.success("Status: Processed")
+    elif selected_status == "Failed":
+        status_col.error("Status: Failed")
+    elif selected_status == "Processing":
+        status_col.warning("Status: Processing")
+    else:
+        status_col.info("Status: Ready")
+
+    process_requested = False
+    retry_requested = False
+    if selected_status == "Failed":
+        retry_requested = action_col.button(
+            "Retry Failed PDF",
+            type="primary",
+            use_container_width=True,
+            key=f"retry_{hashlib.sha256(selected_status_key.encode()).hexdigest()[:12]}",
+        )
+    else:
+        process_requested = action_col.button(
+            "Process Selected Report",
+            type="primary",
+            use_container_width=True,
+            key=f"process_{hashlib.sha256(selected_status_key.encode()).hexdigest()[:12]}",
+        )
+
+    guidance_col.info(
+        "Only the selected PDF is processed. Failed files can be retried without "
+        "re-uploading the complete set."
+    )
+
+    selected_error = st.session_state["pdf_processing_errors"].get(
+        selected_status_key
+    )
+    if selected_status == "Failed" and selected_error:
+        st.error(f"Previous failure: {selected_error}")
+
+    should_process = process_requested or retry_requested
+    if should_process:
+        st.session_state["pdf_processing_status"][selected_status_key] = "Processing"
+        st.session_state["pdf_processing_errors"].pop(selected_status_key, None)
+        processing_progress = st.progress(
+            5,
+            text=f"Preparing {selected_upload.name}...",
+        )
+        pdf_bytes = selected_upload.getvalue()
+        processing_progress.progress(
+            15,
+            text="Reading PDF and validating the selected report...",
+        )
+        fingerprint = uploaded_report_fingerprint(selected_upload.name, pdf_bytes)
+        selected_result_key = f"{fingerprint}_{premixing_step_volume_ml:g}"
+
+        with st.status(
+            f"Processing {selected_upload.name}...",
+            expanded=True,
+        ) as status:
+            try:
+                processing_progress.progress(
+                    30,
+                    text="Extracting pages, process summaries, and datalogs...",
+                )
+                selected_result = process_uploaded_report(
+                    selected_upload.name,
+                    pdf_bytes,
+                    premixing_step_volume_ml,
+                )
+                processing_progress.progress(
+                    90,
+                    text="Finalizing calculations and report status...",
+                )
+                st.session_state["processed_selected_pdf_key"] = selected_result_key
+                st.session_state["selected_pdf_signature"] = current_selection_signature
+                st.session_state["pdf_processing_status"][selected_status_key] = "Processed"
+                st.session_state["pdf_processing_errors"].pop(selected_status_key, None)
+                processing_progress.progress(
+                    100,
+                    text=f"Completed: {selected_upload.name}",
+                )
+                status.update(
+                    label=f"Completed: {selected_upload.name}",
+                    state="complete",
+                    expanded=False,
+                )
+            except Exception as error:
+                error_message = f"{type(error).__name__}: {error}"
+                st.session_state["pdf_processing_status"][selected_status_key] = "Failed"
+                st.session_state["pdf_processing_errors"][selected_status_key] = error_message
+                st.session_state.pop("processed_selected_pdf_key", None)
+                processing_progress.progress(
+                    100,
+                    text=f"Failed: {selected_upload.name}",
+                )
+                status.update(
+                    label=f"Failed: {selected_upload.name}",
+                    state="error",
+                    expanded=True,
+                )
+                st.error(error_message)
+                st.info("Use **Retry Failed PDF** to run this file again.")
+                gc.collect()
+                st.stop()
+            finally:
+                gc.collect()
+    else:
+        processed_key = st.session_state.get("processed_selected_pdf_key")
+        expected_prefix = None
+        if (
+            processed_key
+            and selected_status == "Processed"
+            and st.session_state.get("selected_pdf_signature")
+            == current_selection_signature
+        ):
+            pdf_bytes = selected_upload.getvalue()
+            fingerprint = uploaded_report_fingerprint(selected_upload.name, pdf_bytes)
+            expected_prefix = f"{fingerprint}_{premixing_step_volume_ml:g}"
+        if processed_key and processed_key == expected_prefix:
+            selected_result = process_uploaded_report(
+                selected_upload.name,
+                pdf_bytes,
+                premixing_step_volume_ml,
+            )
+        else:
+            if selected_status == "Failed":
+                st.info("Click **Retry Failed PDF** to process this report again.")
+            else:
+                st.info("Select a PDF and click **Process Selected Report**.")
+            st.stop()
+
+    st.markdown("### Processed report summary")
+    batch_number_summary = (
+        selected_result["batch"].get("Batch no.") or "Batch number not found"
+    )
+    st.dataframe(
+        pd.DataFrame([{
+            "File Name": selected_result["file_name"],
+            "Batch No.": batch_number_summary,
+            "PDF Pages": len(selected_result["pages"]),
+            "Process Runs": len(selected_result["summaries"]),
+            "Datalog Rows": len(selected_result["datalog"]),
+            "Rejected Rows": len(selected_result["rejected_rows"]),
+            "Premixing Step (mL)": selected_result["premixing_step_volume_ml"],
+            "Status": "Processed",
+        }]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    selected_result_key = st.session_state["processed_selected_pdf_key"]
+    pages = selected_result["pages"]
+    batch = selected_result["batch"]
+    overview = selected_result["overview"]
+    summaries = selected_result["summaries"]
+    settings = selected_result["settings"]
+    datalog = selected_result["datalog"]
+    diagnostics = selected_result["diagnostics"]
+    rejected_rows = selected_result["rejected_rows"]
+    process_ranges = selected_result["process_ranges"]
+    wetting_rise_table = selected_result["wetting_rise_table"]
+    mixing_pressure_table = selected_result["mixing_pressure_table"]
+    blending_pressure_table = selected_result["blending_pressure_table"]
+    premix_prepared = selected_result["premix_prepared"]
+    premix_blocks = selected_result["premix_blocks"]
+    premix_pairs = selected_result["premix_pairs"]
+    premix_prediction = selected_result["premix_prediction"]
+    premix_summary = selected_result["premix_summary"]
+    selected_premixing_step_volume_ml = selected_result["premixing_step_volume_ml"]
+
+    st.markdown(f"### Selected report: {selected_result['file_name']}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("PDF pages", f"{len(pages):,}"); c2.metric("Overview operations", f"{len(overview):,}")
+    c3.metric("Target process runs", f"{len(summaries):,}"); c4.metric("Datalog rows", f"{len(datalog):,}")
+    st.subheader("Batch Details"); st.dataframe(pd.DataFrame([batch]), use_container_width=True, hide_index=True)
+    st.subheader("Process Overview Times"); st.dataframe(overview, use_container_width=True, hide_index=True)
+    st.subheader("Process Summary"); st.dataframe(summaries, use_container_width=True, hide_index=True)
+
+    recipe_tab, datalog_tab, wetting_tab, mixing_tab, blending_tab, premixing_tab, diagnostics_tab = st.tabs(["Recipe Settings", "Datalog Explorer", "Wetting Rise-Time Plot", "Mixing Max-Pressure Plots", "Blending Max-Pressure Plots", "Premixing Engineering Analysis", "Diagnostics"])
+    with recipe_tab:
+        st.dataframe(settings, use_container_width=True, hide_index=True, height=520)
+        st.download_button("Download Recipe Settings CSV", settings.to_csv(index=False).encode(), "recipe_settings.csv", "text/csv")
+    with datalog_tab:
+        if datalog.empty: st.warning("No datalog rows were extracted.")
+        else:
+            stage = st.selectbox("Stage", [x for x in STAGES if x in set(datalog["Stage"])])
+            stage_data = datalog[datalog["Stage"].eq(stage)]; extruders = sorted(stage_data["Extruder"].dropna().astype(int).unique())
+            extruder = st.selectbox("Extruder", extruders) if len(extruders) else None
+            view = stage_data[stage_data["Extruder"].eq(extruder)] if extruder is not None else stage_data
+            steps = sorted(view["Step Name"].dropna().unique()); selected_steps = st.multiselect("Step Name", steps, default=steps)
+            view = view[view["Step Name"].isin(selected_steps)].copy()
+            stage_columns = ["Stage", "Machine", "Extruder", "Date & Time", "Step Name", "Source Page"] + DATALOG_COLUMNS[stage]
+            view = view[[c for c in stage_columns if c in view.columns]].sort_values(["Date & Time", "Source Page"], kind="stable").reset_index(drop=True)
+            view.insert(0, "Record No.", range(1, len(view) + 1)); st.dataframe(view, use_container_width=True, hide_index=True, height=560)
+            st.download_button("Download Filtered Datalog CSV", view.to_csv(index=False).encode(), f"{stage.lower()}_extruder_{extruder}.csv", "text/csv")
+    with wetting_tab:
+        st.markdown("#### Wetting Vacuum Rise-Time Analysis")
+        st.caption("Elapsed time starts at the first 'Start Timeout timer'. Rise time is calculated from each 'Vacuum Timers' event to the following 'Stop vacuum timer' event.")
+        limit = st.number_input("Rise time limit (Sec)", min_value=0.0, value=600.0, step=10.0)
+        if wetting_rise_table.empty: st.warning("No Wetting timer-event table was generated.")
+        else:
+            available = sorted(wetting_rise_table["Extruder"].unique()); selected = st.multiselect("Extruders", available, default=available)
+            table_view = wetting_rise_table[wetting_rise_table["Extruder"].isin(selected)].copy()
+            st.dataframe(table_view, use_container_width=True, hide_index=True, height=430)
+            batch_number = batch.get("Batch no.") or "Batch"
+            interactive_figure = create_wetting_rise_time_plot(
+                table_view, batch_number, limit
+            )
+            apply_graph_style(interactive_figure, graph_font_family, graph_font_size)
+            st.plotly_chart(
+                interactive_figure,
+                use_container_width=True,
+                config={
+                    "displaylogo": False,
+                    "scrollZoom": True,
+                    "modeBarButtonsToAdd": ["drawline", "eraseshape"],
+                    "toImageButtonOptions": {
+                        "format": "png",
+                        "filename": f"{batch_number}_wetting_rise_time",
+                        "height": 700,
+                        "width": 1200,
+                        "scale": 2,
+                    },
+                },
+            )
+            st.caption(
+                "Move the cursor over any point to view Extruder, timestamp, Step Name, "
+                "elapsed time, rise time, paired Vacuum Timer timestamp, and source page. "
+                "Use the chart toolbar to zoom, pan, reset, or download a PNG."
+            )
+            x1, x2 = st.columns(2)
+            x1.download_button(
+                "Download Rise-Time Table CSV",
+                table_view.to_csv(index=False).encode(),
+                f"{batch_number}_wetting_rise_time.csv",
+                "text/csv",
+            )
+            wetting_html_key = (
+                f"generated_html_wetting_{selected_label}_{','.join(map(str, selected))}"
+            )
+            if x2.button("Prepare Interactive Plot HTML", key=f"prepare_{wetting_html_key}"):
+                with st.spinner("Preparing interactive Wetting HTML..."):
+                    st.session_state[wetting_html_key] = create_editable_interactive_html(
+                        interactive_figure, "Elapsed time"
+                    )
+            if wetting_html_key in st.session_state:
+                x2.download_button(
+                    "Download Interactive Plot HTML",
+                    st.session_state[wetting_html_key],
+                    f"{batch_number}_wetting_rise_time_interactive.html",
+                    "text/html",
+                    key=f"download_{wetting_html_key}",
+                )
+    with mixing_tab:
+        st.markdown("#### Mixing Maximum Pressure by Extrusion Cycle")
+        st.caption(
+            "For movement to accumulator right, the maximum left-loadcell pressure is used. "
+            "For movement to accumulator left, the maximum right-loadcell pressure is used. "
+            "Cycle 0 is excluded."
+        )
+        if mixing_pressure_table.empty:
+            st.warning("No directional Mixing pressure-cycle data were generated.")
+        else:
+            mixing_extruders = sorted(mixing_pressure_table["Extruder"].unique().astype(int))
+            selected_mixing_extruder = st.selectbox(
+                "Mixing extruder", mixing_extruders, key="mixing_plot_extruder"
+            )
+            available_orifices = [
+                item for item in ["5 mm", "3.8 mm", "2 mm"]
+                if item in set(
+                    mixing_pressure_table.loc[
+                        mixing_pressure_table["Extruder"].eq(selected_mixing_extruder),
+                        "Orifice",
+                    ]
+                )
+            ]
+            selected_orifices = st.multiselect(
+                "Extrusion stages", available_orifices,
+                default=available_orifices,
+                key="mixing_plot_orifices",
+            )
+            mixing_view = mixing_pressure_table[
+                mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
+                & mixing_pressure_table["Orifice"].isin(selected_orifices)
+            ].copy()
             st.dataframe(
-                filtered_comparison_df.sort_values(
-                    ["Strength", "Batch", "Pump"],
-                    ascending=[False, True, True],
-                ),
+                mixing_view,
                 use_container_width=True,
                 hide_index=True,
+                height=360,
             )
 
-    elif section == "All Alarms":
-        if all_alarms_df.empty:
-            st.warning("No structured alarm records were detected.")
-        else:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Alarm Events", f"{len(all_alarms_df):,}")
-            c2.metric("Unique Alarm Types", f"{len(alarm_summary_df):,}")
-            c3.metric("Repeated Alarm Types", f"{int((alarm_summary_df['Occurrences'] > 1).sum()):,}")
-            st.dataframe(all_alarms_df, use_container_width=True, hide_index=True)
-            st.subheader("Alarm Frequency Summary")
-            st.dataframe(alarm_summary_df, use_container_width=True, hide_index=True)
-            top = alarm_summary_df.head(20).sort_values("Occurrences")
-            if not top.empty:
-                fig = px.bar(top, x="Occurrences", y="Message", orientation="h")
-                fig = apply_graph_style(fig, "Top Alarms", "Occurrences", "Alarm Message", font_family, font_size)
-                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG,
-                                key=f"alarm_plot_{batch_key}")
+            batch_number_for_mixing = batch.get("Batch no.") or "Batch"
+            for orifice in selected_orifices:
+                mixing_figure = create_mixing_pressure_plot(
+                    mixing_pressure_table,
+                    selected_mixing_extruder,
+                    orifice,
+                    batch_number_for_mixing,
+                )
+                apply_graph_style(mixing_figure, graph_font_family, graph_font_size)
+                st.plotly_chart(
+                    mixing_figure,
+                    use_container_width=True,
+                    config={
+                        "displaylogo": False,
+                        "scrollZoom": True,
+                        "toImageButtonOptions": {
+                            "format": "png",
+                            "filename": (
+                                f"{batch_number_for_mixing}_extruder_"
+                                f"{selected_mixing_extruder}_{orifice.replace(' ', '_')}_max_pressure"
+                            ),
+                            "height": 620,
+                            "width": 1200,
+                            "scale": 2,
+                        },
+                    },
+                    key=f"mixing_chart_{selected_mixing_extruder}_{orifice}",
+                )
 
-    elif section == "Audit Trail":
-        if audit_df.empty:
-            st.warning("No structured audit-trail records were detected.")
-        else:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Audit Records", f"{len(audit_df):,}")
-            c2.metric("Unique Actions", f"{len(audit_action_summary_df):,}")
-            c3.metric("Users", f"{len(audit_user_summary_df):,}")
-            st.dataframe(audit_df, use_container_width=True, hide_index=True)
-            st.subheader("Audit Action Frequency Summary")
-            st.dataframe(audit_action_summary_df, use_container_width=True, hide_index=True)
-
-    elif section == "Downloads":
-        st.caption("Excel is generated only when requested to avoid repeated memory spikes.")
-        if st.button("Prepare Batch Excel Report", key=f"prep_excel_{batch_key}",
-                     use_container_width=True):
-            excel_file = build_excel({
-                "Batch Summary": summary_df,
-                "Production Counters": production_df,
-                "Fill Weight All": fill_df,
-                "Fill Weight Passed": fill_pass_df,
-                "Fill Weight Statistics": fill_statistics_df,
-                "PFS Quantity Summary": pd.DataFrame(
-                    [{"Parameter": key, "Quantity": value} for key, value in pfs_quantities.items()]
-                ),
-                "All Alarms": all_alarms_df,
-                "All Alarm Summary": alarm_summary_df,
-                "Audit Trail": audit_df,
-                "Audit Action Summary": audit_action_summary_df,
-                "Audit User Summary": audit_user_summary_df,
-            })
-            st.download_button(
-                "Download This Batch Excel Report", excel_file,
-                file_name=f"{safe_file_stem(batch_label)}_Batch_Report_Analysis.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"excel_{batch_key}", use_container_width=True,
+            mixing_html_figure = go.Figure()
+            mixing_colors = ["#0057B8", "#D62728", "#2E8B57", "#FF8C00", "#7030A0", "#008B8B"]
+            mixing_symbols = ["circle", "diamond", "square", "triangle-up", "x", "star"]
+            mixing_dashes = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
+            mixing_style_index = 0
+            for orifice in selected_orifices:
+                source_figure = create_mixing_pressure_plot(
+                    mixing_pressure_table,
+                    selected_mixing_extruder,
+                    orifice,
+                    batch_number_for_mixing,
+                )
+                for trace in source_figure.data:
+                    color = mixing_colors[mixing_style_index % len(mixing_colors)]
+                    symbol = mixing_symbols[mixing_style_index % len(mixing_symbols)]
+                    dash = mixing_dashes[mixing_style_index % len(mixing_dashes)]
+                    trace.name = f"{orifice} | {trace.name}"
+                    trace.line.color = color
+                    trace.line.dash = dash
+                    trace.line.width = 3
+                    trace.marker.color = color
+                    trace.marker.symbol = symbol
+                    trace.marker.size = 9
+                    mixing_html_figure.add_trace(trace)
+                    mixing_style_index += 1
+            mixing_html_figure.update_layout(
+                title=f"{batch_number_for_mixing} | Extruder {selected_mixing_extruder} | Mixing Max Pressure",
+                xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
+                xaxis={"showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+                yaxis={"showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+                hovermode="closest", height=700,
             )
+            apply_graph_style(mixing_html_figure, graph_font_family, graph_font_size)
+            m1, m2 = st.columns(2)
+            m1.download_button(
+                "Download Mixing Max-Pressure Table CSV",
+                mixing_view.to_csv(index=False).encode("utf-8"),
+                f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_mixing_max_pressure.csv",
+                "text/csv",
+            )
+            mixing_html_key = (
+                f"generated_html_mixing_{selected_label}_{selected_mixing_extruder}_"
+                f"{'_'.join(selected_orifices)}"
+            )
+            if m2.button("Prepare Interactive Mixing HTML", key=f"prepare_{mixing_html_key}"):
+                with st.spinner("Preparing interactive Mixing HTML..."):
+                    st.session_state[mixing_html_key] = create_editable_interactive_html(
+                        mixing_html_figure, "Cycles"
+                    )
+            if mixing_html_key in st.session_state:
+                m2.download_button(
+                    "Download Interactive Mixing Plot HTML",
+                    st.session_state[mixing_html_key],
+                    f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_mixing_max_pressure.html",
+                    "text/html",
+                    key=f"download_{mixing_html_key}",
+                )
 
-
-# =====================================================
-# STREAMLIT UI
-# =====================================================
-st.title("Multi-Batch Report Analyzer")
-st.caption("Upload multiple batch-report PDFs. Related report parts are merged by root batch number.")
-st.info(
-    "Memory-safe mode: PDF page text and coordinate data are released immediately "
-    "after structured extraction. Streamlit data caching is disabled."
-)
-if st.sidebar.button("Clear App Data and Cache", type="primary", use_container_width=True):
-    try:
-        st.cache_data.clear()
-        st.cache_resource.clear()
-    except Exception:
-        pass
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    gc.collect()
-    st.rerun()
-
-uploaded_files = st.file_uploader(
-    "Upload one or more batch report PDFs",
-    type=["pdf"],
-    accept_multiple_files=True,
-)
-
-if not uploaded_files:
-    st.info("Upload one or more PDF reports to begin.")
-    st.stop()
-
-st.sidebar.header("Graph Settings")
-lower_limit = st.sidebar.number_input("Lower fill-weight limit", value=526.0)
-upper_limit = st.sidebar.number_input("Upper fill-weight limit", value=540.0)
-show_fill_limits = st.sidebar.checkbox("Show lower and upper limits in scatter plot and HTML export", value=True)
-st.sidebar.subheader("Scatter Plot Axis Range")
-custom_axis_range = st.sidebar.checkbox("Use custom X and Y axis limits", value=False)
-x_axis_min = st.sidebar.number_input("X-axis minimum", value=1.0, disabled=not custom_axis_range)
-x_axis_max = st.sidebar.number_input("X-axis maximum", value=1000.0, disabled=not custom_axis_range)
-y_axis_min = st.sidebar.number_input("Y-axis minimum", value=520.0, disabled=not custom_axis_range)
-y_axis_max = st.sidebar.number_input("Y-axis maximum", value=545.0, disabled=not custom_axis_range)
-histogram_bin_width = st.sidebar.number_input(
-    "Histogram weight interval (mg)",
-    min_value=0.5,
-    max_value=20.0,
-    value=5.0,
-    step=0.5,
-    help="Example: 5 mg displays ranges such as 525-530, 530-535, and 535-540.",
-)
-show_x_grid = st.sidebar.checkbox("Show X-axis gridlines", value=True)
-show_y_grid = st.sidebar.checkbox("Show Y-axis gridlines", value=True)
-range_slider_mode = st.sidebar.selectbox(
-    "X-axis range slider",
-    options=["Off", "On"],
-    index=0,
-    key="x_axis_range_slider_mode_v2",
-)
-show_range_slider = range_slider_mode == "On"
-marker_size = st.sidebar.slider("Scatter marker size", 3, 16, 7)
-marker_opacity = st.sidebar.slider("Scatter marker opacity", 0.2, 1.0, 0.82, 0.02)
-st.sidebar.subheader("Graph Font Settings")
-font_family = st.sidebar.selectbox("Font type", FONT_OPTIONS, index=0)
-font_size = st.sidebar.number_input("Font size", min_value=8, max_value=48, value=12, step=1)
-
-if lower_limit >= upper_limit:
-    st.error("Lower fill-weight limit must be less than the upper limit.")
-    st.stop()
-if custom_axis_range and x_axis_min >= x_axis_max:
-    st.error("X-axis minimum must be less than X-axis maximum.")
-    st.stop()
-if custom_axis_range and y_axis_min >= y_axis_max:
-    st.error("Y-axis minimum must be less than Y-axis maximum.")
-    st.stop()
-
-analyze_clicked = st.button(
-    "Analyze Uploaded Reports",
-    type="primary",
-    use_container_width=True,
-)
-
-if analyze_clicked:
-    # Remove any previous structured results before a new extraction run.
-    st.session_state.pop("analysis_results", None)
-    results = []
-    progress = st.progress(0, text="Preparing batch analyses...")
-    for index, uploaded in enumerate(uploaded_files):
-        try:
-            pdf_bytes = uploaded.getvalue()
-            result = analyze_batch_report(pdf_bytes, uploaded.name)
-            results.append(result)
-            del pdf_bytes
-            gc.collect()
-        except Exception as exc:
-            st.error(f"Could not process {uploaded.name}: {exc}")
-        progress.progress(
-            (index + 1) / len(uploaded_files),
-            text=f"Processed {index + 1} of {len(uploaded_files)} reports",
+    with blending_tab:
+        st.markdown("#### Blending Maximum Pressure by Cycle")
+        st.caption(
+            "Pre-pH Blending contains 60 cycles. Post-pH Blending begins when the "
+            "cycle counter resets after completed cycle 60 and contains up to 100 cycles. "
+            "Movement to accumulator right uses maximum Loadcell Left pressure; movement "
+            "to accumulator left uses maximum Loadcell Right pressure."
         )
-    progress.empty()
+        if blending_pressure_table.empty:
+            st.warning("No directional Blending pressure-cycle data were generated.")
+        else:
+            blending_extruders = sorted(
+                blending_pressure_table["Extruder"].dropna().astype(int).unique()
+            )
+            selected_blending_extruder = st.selectbox(
+                "Blending extruder", blending_extruders,
+                key="blending_plot_extruder",
+            )
+            available_phases = [
+                phase for phase in ["Pre-pH Blending", "Post-pH Blending"]
+                if phase in set(
+                    blending_pressure_table.loc[
+                        blending_pressure_table["Extruder"].eq(selected_blending_extruder),
+                        "Blending Phase",
+                    ].astype(str)
+                )
+            ]
+            selected_phases = st.multiselect(
+                "Blending phases", available_phases,
+                default=available_phases,
+                key="blending_plot_phases",
+            )
+            blending_view = blending_pressure_table[
+                blending_pressure_table["Extruder"].eq(selected_blending_extruder)
+                & blending_pressure_table["Blending Phase"].astype(str).isin(selected_phases)
+            ].copy()
+            st.dataframe(
+                blending_view, use_container_width=True,
+                hide_index=True, height=380,
+            )
 
-    if results:
-        uploaded_report_count = len(results)
-        results = combine_same_batch_reports(results)
-        st.session_state["analysis_results"] = results
-        st.session_state["uploaded_report_count"] = uploaded_report_count
-    else:
-        st.error("None of the uploaded reports could be processed.")
+            batch_number_for_blending = batch.get("Batch no.") or "Batch"
+            for phase in selected_phases:
+                blending_figure = create_blending_pressure_plot(
+                    blending_pressure_table,
+                    selected_blending_extruder,
+                    phase,
+                    batch_number_for_blending,
+                )
+                apply_graph_style(blending_figure, graph_font_family, graph_font_size)
+                st.plotly_chart(
+                    blending_figure,
+                    use_container_width=True,
+                    config={
+                        "displaylogo": False,
+                        "scrollZoom": True,
+                        "toImageButtonOptions": {
+                            "format": "png",
+                            "filename": (
+                                f"{batch_number_for_blending}_extruder_"
+                                f"{selected_blending_extruder}_{phase.replace(' ', '_')}_max_pressure"
+                            ),
+                            "height": 620, "width": 1200, "scale": 2,
+                        },
+                    },
+                    key=f"blending_chart_{selected_blending_extruder}_{phase}",
+                )
 
-results = st.session_state.get("analysis_results", [])
+            combined_blending_figure = go.Figure()
+            blending_colors = ["#0057B8", "#D62728", "#2E8B57", "#FF8C00"]
+            blending_symbols = ["circle", "diamond", "triangle-up", "square"]
+            blending_dashes = ["solid", "dash", "dot", "dashdot"]
+            blending_style_index = 0
+            for phase in selected_phases:
+                source_figure = create_blending_pressure_plot(
+                    blending_pressure_table,
+                    selected_blending_extruder,
+                    phase,
+                    batch_number_for_blending,
+                )
+                for trace in source_figure.data:
+                    color = blending_colors[blending_style_index % len(blending_colors)]
+                    symbol = blending_symbols[blending_style_index % len(blending_symbols)]
+                    dash = blending_dashes[blending_style_index % len(blending_dashes)]
+                    trace.name = f"{phase} | {trace.name}"
+                    trace.line.color = color
+                    trace.line.dash = dash
+                    trace.line.width = 3
+                    trace.marker.color = color
+                    trace.marker.symbol = symbol
+                    trace.marker.size = 9
+                    combined_blending_figure.add_trace(trace)
+                    blending_style_index += 1
+            combined_blending_figure.update_layout(
+                title=(
+                    f"{batch_number_for_blending} | Extruder "
+                    f"{selected_blending_extruder} | Blending Max Pressure"
+                ),
+                xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
+                xaxis={"showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+                yaxis={"showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
+                hovermode="closest", height=700,
+            )
+            apply_graph_style(combined_blending_figure, graph_font_family, graph_font_size)
+            b1, b2 = st.columns(2)
+            b1.download_button(
+                "Download Blending Max-Pressure Table CSV",
+                blending_view.to_csv(index=False).encode("utf-8"),
+                f"{batch_number_for_blending}_extruder_{selected_blending_extruder}_blending_max_pressure.csv",
+                "text/csv",
+            )
+            blending_html_key = (
+                f"generated_html_blending_{selected_label}_{selected_blending_extruder}_"
+                f"{'_'.join(selected_phases)}"
+            )
+            if b2.button("Prepare Interactive Blending HTML", key=f"prepare_{blending_html_key}"):
+                with st.spinner("Preparing interactive Blending HTML..."):
+                    st.session_state[blending_html_key] = create_editable_interactive_html(
+                        combined_blending_figure, "Cycles"
+                    )
+            if blending_html_key in st.session_state:
+                b2.download_button(
+                    "Download Interactive Blending Plot HTML",
+                    st.session_state[blending_html_key],
+                    f"{batch_number_for_blending}_extruder_{selected_blending_extruder}_blending_max_pressure.html",
+                    "text/html",
+                    key=f"download_{blending_html_key}",
+                )
 
-if not results:
-    st.info(
-        "Files are selected but have not been processed. Click "
-        "**Analyze Uploaded Reports** to start. The app will not automatically "
-        "reprocess retained uploads when it starts or reruns."
+    with premixing_tab:
+        st.markdown("#### Premixing Predicted Volume-Step Analysis")
+        st.caption(
+            "Cylinder diameter = 80.1 mm for all extruders. Direction is inferred from "
+            "servo-speed signs. Opposite movement blocks are paired using same-cycle "
+            "preference. Select Actual Max Pressure or the inferred 15-bar Pressure Step. "
+            "The Premixing x-axis is fixed from 0 to 198 mL."
+        )
+        if premix_summary.empty:
+            st.warning("No Premixing bidirectional volume-step analysis was generated.")
+        else:
+            premix_extruders = sorted(premix_summary["Extruder"].unique().astype(int))
+            selected_premix_extruder = st.selectbox(
+                "Premixing extruder", premix_extruders,
+                key="premixing_analysis_extruder",
+            )
+            summary_view = premix_summary[
+                premix_summary["Extruder"].eq(selected_premix_extruder)
+            ].copy()
+            selected_premix_pressure_mode = st.radio(
+                "Pressure to plot",
+                options=["Actual Max Pressure", "Pressure Step"],
+                horizontal=True,
+                key="premixing_pressure_plot_mode",
+                help=(
+                    "Actual Max Pressure plots left and right loadcell maxima. "
+                    "Pressure Step plots the inferred 15-bar recipe steps."
+                ),
+            )
+            batch_number_for_premix = batch.get("Batch no.") or "Batch"
+            premix_figure = create_premixing_volume_step_plot(
+                premix_summary,
+                selected_premix_extruder,
+                batch_number_for_premix,
+                selected_premix_pressure_mode,
+                selected_premixing_step_volume_ml,
+            )
+            apply_graph_style(premix_figure, graph_font_family, graph_font_size)
+            st.plotly_chart(
+                premix_figure,
+                use_container_width=True,
+                config={
+                    "displaylogo": False,
+                    "scrollZoom": True,
+                    "toImageButtonOptions": {
+                        "format": "png",
+                        "filename": (
+                            f"{batch_number_for_premix}_extruder_"
+                            f"{selected_premix_extruder}_premixing_volume_step"
+                        ),
+                        "height": 700, "width": 1200, "scale": 2,
+                    },
+                },
+                key=f"premix_chart_{selected_premix_extruder}",
+            )
+            st.dataframe(
+                summary_view, use_container_width=True,
+                hide_index=True, height=360,
+            )
+
+            with st.expander("Directional movement blocks"):
+                st.dataframe(
+                    premix_blocks[
+                        premix_blocks["Extruder"].eq(selected_premix_extruder)
+                    ],
+                    use_container_width=True, hide_index=True, height=420,
+                )
+            with st.expander("Improved bidirectional pairing"):
+                st.dataframe(
+                    premix_pairs[
+                        premix_pairs["Extruder"].eq(selected_premix_extruder)
+                    ],
+                    use_container_width=True, hide_index=True, height=420,
+                )
+            with st.expander("Reverse-predicted volume and pressure sequence"):
+                st.dataframe(
+                    premix_prediction[
+                        premix_prediction["Extruder"].eq(selected_premix_extruder)
+                    ],
+                    use_container_width=True, hide_index=True, height=450,
+                )
+
+            p1, p2 = st.columns(2)
+            p1.download_button(
+                "Download Premixing Volume-Step Summary CSV",
+                summary_view.to_csv(index=False).encode("utf-8"),
+                f"{batch_number_for_premix}_extruder_{selected_premix_extruder}_premixing_summary.csv",
+                "text/csv",
+            )
+            premix_html_key = (
+                f"generated_html_premix_{selected_label}_{selected_premix_extruder}_"
+                f"{selected_premix_pressure_mode}_{selected_premixing_step_volume_ml}"
+            )
+            if p2.button("Prepare Interactive Premixing HTML", key=f"prepare_{premix_html_key}"):
+                with st.spinner("Preparing interactive Premixing HTML..."):
+                    st.session_state[premix_html_key] = create_editable_interactive_html(
+                        premix_figure, "Volume step"
+                    )
+            if premix_html_key in st.session_state:
+                p2.download_button(
+                    "Download Interactive Premixing Plot HTML",
+                    st.session_state[premix_html_key],
+                    f"{batch_number_for_premix}_extruder_{selected_premix_extruder}_premixing_plot.html",
+                    "text/html",
+                    key=f"download_{premix_html_key}",
+                )
+
+    with diagnostics_tab:
+        st.markdown("#### Assigned process page ranges"); st.dataframe(process_ranges, use_container_width=True, hide_index=True)
+        st.markdown("#### Page-level diagnostics"); st.dataframe(diagnostics, use_container_width=True, hide_index=True, height=400)
+        st.markdown("#### Rejected rows")
+        if rejected_rows.empty: st.success("No timestamp rows were rejected.")
+        else: st.dataframe(rejected_rows, use_container_width=True, hide_index=True, height=400)
+
+    batch_number = batch.get("Batch no.") or Path(
+        selected_result["file_name"]
+    ).stem
+    safe_batch_number = safe_output_name(batch_number)
+    selected_result_key = selected_result_key
+
+    st.markdown("### Export files")
+    export_col1, export_col2 = st.columns(2)
+
+    selected_excel_key = (
+        f"generated_excel_{selected_result_key}"
     )
-    st.stop()
-
-uploaded_report_count = st.session_state.get("uploaded_report_count", len(results))
-combined_batch_count = len(results)
-merged_group_count = sum(
-    1 for result in results if result.get("report_count", 1) > 1
-)
-
-st.success(
-    f"Processed {uploaded_report_count} report(s) into "
-    f"{combined_batch_count} batch analysis group(s). "
-    f"Merged batch groups: {merged_group_count}."
-)
-
-try:
-    batch_statistics_df, combined_statistics_df = create_uploaded_batches_statistics(results)
-    st.header("Fill-Weight Statistical Summary for All Uploaded Batches")
-    st.subheader("Batch-wise and Pump-wise Statistics")
-    st.dataframe(batch_statistics_df, use_container_width=True, hide_index=True)
-    st.subheader("All Uploaded Batches Combined")
-    st.dataframe(combined_statistics_df, use_container_width=True, hide_index=True)
-    if st.button("Prepare Combined Statistics Excel", use_container_width=True):
-        combined_statistics_excel = build_excel({
-            "Batch Pump Statistics": batch_statistics_df,
-            "All Batches Combined": combined_statistics_df,
-        })
-        st.download_button(
-            "Download Combined Fill-Weight Statistics",
-            data=combined_statistics_excel,
-            file_name="Combined_Fill_Weight_Statistics_All_Batches.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    if export_col1.button(
+        "Prepare Selected Batch Excel",
+        key=f"prepare_{selected_excel_key}",
+        use_container_width=True,
+    ):
+        with st.spinner("Preparing selected batch Excel workbook..."):
+            st.session_state[selected_excel_key] = result_to_excel(selected_result)
+    if selected_excel_key in st.session_state:
+        export_col1.download_button(
+            "⬇️ Download Selected Batch Excel",
+            st.session_state[selected_excel_key],
+            f"{safe_batch_number}_complete_process_extraction.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"download_{selected_excel_key}",
+            type="primary",
             use_container_width=True,
         )
-except Exception as statistics_error:
-    st.warning(f"Combined statistics could not be displayed: {statistics_error}")
 
-# Render only one batch at a time. Streamlit tabs execute all tab bodies and can
-# keep every chart in memory, which is unsafe for multiple 300-500 page reports.
-batch_labels = [result["batch_label"] for result in results]
-selected_batch_label = st.selectbox("Batch analysis to display", batch_labels)
-selected_index = batch_labels.index(selected_batch_label)
-selected_result = results[selected_index]
-batch_key = f"batch_{selected_index + 1}_{safe_file_stem(selected_result['source_name'])}"
-
-try:
-    render_batch_analysis(
-        selected_result,
-        batch_key,
-        lower_limit,
-        upper_limit,
-        histogram_bin_width,
-        show_x_grid,
-        show_y_grid,
-        show_range_slider,
-        marker_size,
-        marker_opacity,
-        font_family,
-        int(font_size),
-        show_fill_limits,
-        custom_axis_range,
-        x_axis_min,
-        x_axis_max,
-        y_axis_min,
-        y_axis_max,
-        results,
+    export_col2.info(
+        "To process the next PDF, select another file in the inventory and click "
+        "**Process Selected Report**. This avoids CPU throttling."
     )
-except Exception as display_error:
-    st.error("The selected batch dashboard could not be rendered.")
-    st.exception(display_error)
-    st.info("Use Clear App Data and Cache, upload the report again, and click Analyze Uploaded Reports.")
 
-# render_batch_analysis already provides the selected batch workbook. Do not build
-# every batch workbook and a ZIP automatically on each widget rerun.
 
-with st.expander("Multi-batch extraction summary"):
-    summary_rows = []
-    for result in results:
-        summary_rows.append({
-            "Source Report(s)": result["source_name"],
-            "Reports Combined": result.get("report_count", 1),
-            "Batch": result["batch_label"],
-            "Fill Records": len(result["fill"]),
-            "Passed Fill Records": len(result["fill_pass"]),
-            "Alarm Events": len(result["alarms"]),
-            "Audit Records": len(result["audit"]),
-            "PDF Pages": result.get("page_count", 0),
-        })
-    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("Parser version: 2026-10-30-v32-cross-batch-strength-charts")
+if __name__ == "__main__":
+    main()
