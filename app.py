@@ -20,7 +20,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.10.30-mixing-multi-run-v36"
+APP_SCHEMA_VERSION = "2026.10.30-mixing-combined-stage-runs-v37"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -60,7 +60,7 @@ def duration_text(start, end):
 
 
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.30-mixing-multi-run-v36"
+    parser_version = "2026.10.30-mixing-combined-stage-runs-v37"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -2001,7 +2001,8 @@ def main():
         st.caption(
             "For movement to accumulator right, the maximum left-loadcell pressure is used. "
             "For movement to accumulator left, the maximum right-loadcell pressure is used. "
-            "Each orifice has distinct legend wording, colours, marker symbols, and line styles. "
+            "Each extrusion stage is shown in one graph, combining all selected runs. "
+                "Run identity remains visible in the legend and line style. "
             "Cycle 0 is excluded."
         )
         if mixing_pressure_table.empty:
@@ -2034,7 +2035,7 @@ def main():
                 format_func=lambda value: f"Run {value}",
                 key="mixing_plot_runs",
                 help=(
-                    "Select one or more runs. All available runs are selected by default."
+                    "Select one or more runs. Data from the same extrusion stage are combined into one graph."
                 ),
             )
             if not selected_mixing_runs:
@@ -2068,52 +2069,15 @@ def main():
             )
 
             batch_number_for_mixing = batch.get("Batch no.") or "Batch"
-            for run_number in selected_mixing_runs:
-                st.markdown(f"##### Extruder {selected_mixing_extruder} | Run {run_number}")
-                for orifice in selected_orifices:
-                    run_orifice_data = mixing_pressure_table[
-                        mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
-                        & mixing_pressure_table["Run Number"].eq(run_number)
-                        & mixing_pressure_table["Orifice"].eq(orifice)
-                    ]
-                    if run_orifice_data.empty:
-                        continue
-                    mixing_figure = create_mixing_pressure_plot(
-                        mixing_pressure_table,
-                        selected_mixing_extruder,
-                        run_number,
-                        orifice,
-                        batch_number_for_mixing,
-                    )
-                    apply_graph_style(mixing_figure, graph_font_family, graph_font_size)
-                    st.plotly_chart(
-                        mixing_figure,
-                        use_container_width=True,
-                        config={
-                            "displaylogo": False,
-                            "scrollZoom": True,
-                            "toImageButtonOptions": {
-                                "format": "png",
-                                "filename": (
-                                    f"{batch_number_for_mixing}_extruder_"
-                                    f"{selected_mixing_extruder}_run_{run_number}_"
-                                    f"{orifice.replace(' ', '_')}_max_pressure"
-                                ),
-                                "height": 620,
-                                "width": 1200,
-                                "scale": 2,
-                            },
-                        },
-                        key=(
-                            f"mixing_chart_{selected_mixing_extruder}_"
-                            f"{run_number}_{orifice}"
-                        ),
-                    )
-
-            mixing_html_figure = go.Figure()
             run_dash_overrides = ["solid", "dash", "dot", "dashdot", "longdash"]
-            for run_index, run_number in enumerate(selected_mixing_runs):
-                for orifice in selected_orifices:
+
+            # Create one graph per selected extrusion stage. When several runs
+            # contain the same stage, all run traces are combined in that graph.
+            combined_stage_figures = {}
+            for orifice in selected_orifices:
+                stage_figure = go.Figure()
+                stage_runs = []
+                for run_index, run_number in enumerate(selected_mixing_runs):
                     run_orifice_data = mixing_pressure_table[
                         mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
                         & mixing_pressure_table["Run Number"].eq(run_number)
@@ -2121,6 +2085,7 @@ def main():
                     ]
                     if run_orifice_data.empty:
                         continue
+                    stage_runs.append(run_number)
                     source_figure = create_mixing_pressure_plot(
                         mixing_pressure_table,
                         selected_mixing_extruder,
@@ -2134,7 +2099,103 @@ def main():
                             trace.line.dash = run_dash_overrides[
                                 run_index % len(run_dash_overrides)
                             ]
-                        mixing_html_figure.add_trace(trace)
+                        stage_figure.add_trace(trace)
+
+                if not stage_runs:
+                    continue
+
+                stage_run_text = ", ".join(
+                    f"Run {run_number}" for run_number in stage_runs
+                )
+                stage_data = mixing_pressure_table[
+                    mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
+                    & mixing_pressure_table["Run Number"].isin(stage_runs)
+                    & mixing_pressure_table["Orifice"].eq(orifice)
+                ]
+                max_cycle = int(stage_data["Cycle"].max()) if not stage_data.empty else 1
+                max_pressure = stage_data[[
+                    "Max Pressure Left - Move Right (bar)",
+                    "Max Pressure Right - Move Left (bar)",
+                ]].max().max() if not stage_data.empty else 200
+                y_max = (
+                    max(200, float(max_pressure) * 1.12)
+                    if pd.notna(max_pressure) else 200
+                )
+                stage_figure.update_layout(
+                    title={
+                        "text": (
+                            f"{batch_number_for_mixing}<br>EXTRUDER - "
+                            f"{int(selected_mixing_extruder)} | {stage_run_text} | "
+                            f"MIXING: Extrusion {orifice} cycles"
+                        ),
+                        "x": 0.5,
+                        "xanchor": "center",
+                    },
+                    xaxis_title="<b>Cycles</b>",
+                    yaxis_title="<b>Maximum Pressure (bar)</b>",
+                    xaxis={
+                        "dtick": 1,
+                        "range": [0.5, max_cycle + 0.5],
+                        "showgrid": True,
+                        "gridcolor": "#C7C7C7",
+                        "gridwidth": 1,
+                    },
+                    yaxis={
+                        "range": [0, y_max],
+                        "showgrid": True,
+                        "gridcolor": "#C7C7C7",
+                        "gridwidth": 1,
+                    },
+                    hovermode="closest",
+                    legend={
+                        "orientation": "h",
+                        "x": 0.5,
+                        "xanchor": "center",
+                        "y": -0.20,
+                    },
+                    height=700,
+                    margin={"l": 70, "r": 30, "t": 110, "b": 140},
+                )
+                apply_graph_style(
+                    stage_figure, graph_font_family, graph_font_size
+                )
+                combined_stage_figures[orifice] = stage_figure
+                st.markdown(
+                    f"##### Extruder {selected_mixing_extruder} | {orifice} | "
+                    f"{stage_run_text}"
+                )
+                st.plotly_chart(
+                    stage_figure,
+                    use_container_width=True,
+                    config={
+                        "displaylogo": False,
+                        "scrollZoom": True,
+                        "toImageButtonOptions": {
+                            "format": "png",
+                            "filename": (
+                                f"{batch_number_for_mixing}_extruder_"
+                                f"{selected_mixing_extruder}_runs_"
+                                f"{'_'.join(map(str, stage_runs))}_"
+                                f"{orifice.replace(' ', '_')}_max_pressure"
+                            ),
+                            "height": 700,
+                            "width": 1200,
+                            "scale": 2,
+                        },
+                    },
+                    key=(
+                        f"mixing_chart_{selected_mixing_extruder}_"
+                        f"{'_'.join(map(str, stage_runs))}_{orifice}"
+                    ),
+                )
+
+            mixing_html_figure = go.Figure()
+            for orifice in selected_orifices:
+                stage_figure = combined_stage_figures.get(orifice)
+                if stage_figure is None:
+                    continue
+                for trace in stage_figure.data:
+                    mixing_html_figure.add_trace(trace)
             selected_run_text = ", ".join(
                 f"Run {run_number}" for run_number in selected_mixing_runs
             )
