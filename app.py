@@ -20,7 +20,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.10.30-mixing-html-style-v34"
+APP_SCHEMA_VERSION = "2026.10.30-persistent-section-download-v35"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -60,7 +60,7 @@ def duration_text(start, end):
 
 
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.30-mixing-html-style-v34"
+    parser_version = "2026.10.30-persistent-section-download-v35"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -1888,11 +1888,30 @@ def main():
     st.subheader("Process Overview Times"); st.dataframe(overview, use_container_width=True, hide_index=True)
     st.subheader("Process Summary"); st.dataframe(summaries, use_container_width=True, hide_index=True)
 
-    recipe_tab, datalog_tab, wetting_tab, mixing_tab, blending_tab, premixing_tab, diagnostics_tab = st.tabs(["Recipe Settings", "Datalog Explorer", "Wetting Rise-Time Plot", "Mixing Max-Pressure Plots", "Blending Max-Pressure Plots", "Premixing Engineering Analysis", "Diagnostics"])
-    with recipe_tab:
+    analysis_sections = [
+        "Recipe Settings",
+        "Datalog Explorer",
+        "Wetting Rise-Time Plot",
+        "Mixing Max-Pressure Plots",
+        "Blending Max-Pressure Plots",
+        "Premixing Engineering Analysis",
+        "Diagnostics",
+    ]
+    active_section = st.radio(
+        "Analysis section",
+        options=analysis_sections,
+        horizontal=True,
+        key="active_analysis_section",
+        help=(
+            "The selected section is preserved when preparing or downloading files, "
+            "so the page does not return to Recipe Settings."
+        ),
+    )
+
+    if active_section == "Recipe Settings":
         st.dataframe(settings, use_container_width=True, hide_index=True, height=520)
         st.download_button("Download Recipe Settings CSV", settings.to_csv(index=False).encode(), "recipe_settings.csv", "text/csv")
-    with datalog_tab:
+    elif active_section == "Datalog Explorer":
         if datalog.empty: st.warning("No datalog rows were extracted.")
         else:
             stage = st.selectbox("Stage", [x for x in STAGES if x in set(datalog["Stage"])])
@@ -1905,7 +1924,7 @@ def main():
             view = view[[c for c in stage_columns if c in view.columns]].sort_values(["Date & Time", "Source Page"], kind="stable").reset_index(drop=True)
             view.insert(0, "Record No.", range(1, len(view) + 1)); st.dataframe(view, use_container_width=True, hide_index=True, height=560)
             st.download_button("Download Filtered Datalog CSV", view.to_csv(index=False).encode(), f"{stage.lower()}_extruder_{extruder}.csv", "text/csv")
-    with wetting_tab:
+    elif active_section == "Wetting Rise-Time Plot":
         st.markdown("#### Wetting Vacuum Rise-Time Analysis")
         st.caption("Elapsed time starts at the first 'Start Timeout timer'. Rise time is calculated from each 'Vacuum Timers' event to the following 'Stop vacuum timer' event.")
         limit = st.number_input("Rise time limit (Sec)", min_value=0.0, value=600.0, step=10.0)
@@ -1962,8 +1981,9 @@ def main():
                     f"{batch_number}_wetting_rise_time_interactive.html",
                     "text/html",
                     key=f"download_{wetting_html_key}",
+                    on_click="ignore"
                 )
-    with mixing_tab:
+    elif active_section == "Mixing Max-Pressure Plots":
         st.markdown("#### Mixing Maximum Pressure by Extrusion Cycle")
         original_mixing_columns = set(mixing_pressure_table.columns)
         mixing_pressure_table = ensure_mixing_pressure_schema(
@@ -2116,9 +2136,10 @@ def main():
                     f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_run_{selected_mixing_run}_{'_'.join(item.replace(' ', '_') for item in selected_orifices)}_mixing_max_pressure.html",
                     "text/html",
                     key=f"download_{mixing_html_key}",
+                    on_click="ignore"
                 )
 
-    with blending_tab:
+    elif active_section == "Blending Max-Pressure Plots":
         st.markdown("#### Blending Maximum Pressure by Cycle")
         st.caption(
             "Pre-pH Blending contains 60 cycles. Post-pH Blending begins when the "
@@ -2245,9 +2266,10 @@ def main():
                     f"{batch_number_for_blending}_extruder_{selected_blending_extruder}_blending_max_pressure.html",
                     "text/html",
                     key=f"download_{blending_html_key}",
+                    on_click="ignore"
                 )
 
-    with premixing_tab:
+    elif active_section == "Premixing Engineering Analysis":
         st.markdown("#### Premixing Predicted Volume-Step Analysis")
         st.caption(
             "Cylinder diameter = 80.1 mm for all extruders. Direction is inferred from "
@@ -2352,9 +2374,10 @@ def main():
                     f"{batch_number_for_premix}_extruder_{selected_premix_extruder}_premixing_plot.html",
                     "text/html",
                     key=f"download_{premix_html_key}",
+                    on_click="ignore"
                 )
 
-    with diagnostics_tab:
+    elif active_section == "Diagnostics":
         st.markdown("#### Assigned process page ranges"); st.dataframe(process_ranges, use_container_width=True, hide_index=True)
         st.markdown("#### Page-level diagnostics"); st.dataframe(diagnostics, use_container_width=True, hide_index=True, height=400)
         st.markdown("#### Rejected rows")
