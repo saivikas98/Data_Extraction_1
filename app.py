@@ -20,7 +20,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.10.30-mixing-combined-stage-runs-v37"
+APP_SCHEMA_VERSION = "2026.10.30-mixing-two-lines-combined-runs-v38"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -60,7 +60,7 @@ def duration_text(start, end):
 
 
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.30-mixing-combined-stage-runs-v37"
+    parser_version = "2026.10.30-mixing-two-lines-combined-runs-v38"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -2002,7 +2002,7 @@ def main():
             "For movement to accumulator right, the maximum left-loadcell pressure is used. "
             "For movement to accumulator left, the maximum right-loadcell pressure is used. "
             "Each extrusion stage is shown in one graph, combining all selected runs. "
-                "Run identity remains visible in the legend and line style. "
+                "Run identity remains available in hover details, while each stage displays only two pressure lines. "
             "Cycle 0 is excluded."
         )
         if mixing_pressure_table.empty:
@@ -2071,56 +2071,146 @@ def main():
             batch_number_for_mixing = batch.get("Batch no.") or "Batch"
             run_dash_overrides = ["solid", "dash", "dot", "dashdot", "longdash"]
 
-            # Create one graph per selected extrusion stage. When several runs
-            # contain the same stage, all run traces are combined in that graph.
+            # Create one graph per selected extrusion stage. Data from all
+            # selected runs are appended sequentially and represented by only
+            # two traces: movement right and movement left.
             combined_stage_figures = {}
+            orifice_styles = {
+                "5 mm": {
+                    "right_color": "#0057B8", "left_color": "#D62728",
+                    "right_symbol": "circle", "left_symbol": "diamond",
+                    "right_dash": "solid", "left_dash": "dash",
+                },
+                "3.8 mm": {
+                    "right_color": "#2E8B57", "left_color": "#C2185B",
+                    "right_symbol": "square", "left_symbol": "triangle-up",
+                    "right_dash": "solid", "left_dash": "dot",
+                },
+                "2 mm": {
+                    "right_color": "#008B8B", "left_color": "#8B4513",
+                    "right_symbol": "cross", "left_symbol": "triangle-down",
+                    "right_dash": "dashdot", "left_dash": "longdash",
+                },
+                "1.5 mm": {
+                    "right_color": "#7030A0", "left_color": "#FF8C00",
+                    "right_symbol": "star", "left_symbol": "hexagon",
+                    "right_dash": "longdashdot", "left_dash": "dot",
+                },
+            }
+
             for orifice in selected_orifices:
-                stage_figure = go.Figure()
                 stage_runs = []
-                for run_index, run_number in enumerate(selected_mixing_runs):
-                    run_orifice_data = mixing_pressure_table[
+                combined_rows = []
+                cycle_offset = 0
+
+                for run_number in selected_mixing_runs:
+                    run_data = mixing_pressure_table[
                         mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
                         & mixing_pressure_table["Run Number"].eq(run_number)
                         & mixing_pressure_table["Orifice"].eq(orifice)
-                    ]
-                    if run_orifice_data.empty:
+                    ].sort_values("Cycle").copy()
+                    if run_data.empty:
                         continue
-                    stage_runs.append(run_number)
-                    source_figure = create_mixing_pressure_plot(
-                        mixing_pressure_table,
-                        selected_mixing_extruder,
-                        run_number,
-                        orifice,
-                        batch_number_for_mixing,
-                    )
-                    for trace in source_figure.data:
-                        trace.name = f"Run {run_number} | {trace.name}"
-                        if len(selected_mixing_runs) > 1:
-                            trace.line.dash = run_dash_overrides[
-                                run_index % len(run_dash_overrides)
-                            ]
-                        stage_figure.add_trace(trace)
 
-                if not stage_runs:
+                    stage_runs.append(run_number)
+                    run_data["Original Cycle"] = run_data["Cycle"].astype(int)
+                    run_data["Combined Cycle"] = (
+                        run_data["Original Cycle"] + cycle_offset
+                    )
+                    combined_rows.append(run_data)
+                    cycle_offset += int(run_data["Original Cycle"].max())
+
+                if not combined_rows:
                     continue
 
+                stage_data = pd.concat(combined_rows, ignore_index=True)
+                stage_data = stage_data.sort_values(
+                    ["Combined Cycle", "Run Number", "Original Cycle"],
+                    kind="stable",
+                )
                 stage_run_text = ", ".join(
                     f"Run {run_number}" for run_number in stage_runs
                 )
-                stage_data = mixing_pressure_table[
-                    mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
-                    & mixing_pressure_table["Run Number"].isin(stage_runs)
-                    & mixing_pressure_table["Orifice"].eq(orifice)
+                style = orifice_styles.get(orifice, orifice_styles["5 mm"])
+                stage_figure = go.Figure()
+
+                series = [
+                    (
+                        "Max Pressure Left - Move Right (bar)",
+                        f"{orifice} | Loadcell Left Max | movement to accumulator right",
+                        style["right_color"], style["right_symbol"],
+                        style["right_dash"],
+                        ["Run Number", "Original Cycle", "Move Right Start",
+                         "Move Right End", "Move Right Source Pages"],
+                    ),
+                    (
+                        "Max Pressure Right - Move Left (bar)",
+                        f"{orifice} | Loadcell Right Max | movement to accumulator left",
+                        style["left_color"], style["left_symbol"],
+                        style["left_dash"],
+                        ["Run Number", "Original Cycle", "Move Left Start",
+                         "Move Left End", "Move Left Source Pages"],
+                    ),
                 ]
-                max_cycle = int(stage_data["Cycle"].max()) if not stage_data.empty else 1
+
+                for column, name, color, symbol, dash, detail_columns in series:
+                    values = stage_data.dropna(subset=[column]).copy()
+                    if values.empty:
+                        continue
+                    custom = values[detail_columns].copy()
+                    for date_column in detail_columns[2:4]:
+                        custom[date_column] = pd.to_datetime(
+                            custom[date_column], errors="coerce"
+                        ).dt.strftime("%d-%m-%Y %H:%M:%S")
+                    stage_figure.add_trace(go.Scatter(
+                        x=values["Combined Cycle"],
+                        y=values[column],
+                        mode="lines+markers",
+                        name=name,
+                        customdata=custom.to_numpy(),
+                        line={"color": color, "width": 3, "dash": dash},
+                        marker={"color": color, "size": 9, "symbol": symbol},
+                        hovertemplate=(
+                            f"<b>{name}</b><br>"
+                            "Combined cycle: %{x}<br>"
+                            "Run: %{customdata[0]}<br>"
+                            "Original cycle: %{customdata[1]}<br>"
+                            "Maximum pressure: %{y:.2f} bar<br>"
+                            "Movement start: %{customdata[2]}<br>"
+                            "Movement end: %{customdata[3]}<br>"
+                            "Source page(s): %{customdata[4]}"
+                            "<extra></extra>"
+                        ),
+                    ))
+
+                max_cycle = int(stage_data["Combined Cycle"].max())
                 max_pressure = stage_data[[
                     "Max Pressure Left - Move Right (bar)",
                     "Max Pressure Right - Move Left (bar)",
-                ]].max().max() if not stage_data.empty else 200
+                ]].max().max()
                 y_max = (
                     max(200, float(max_pressure) * 1.12)
                     if pd.notna(max_pressure) else 200
                 )
+
+                # Mark transitions between appended runs without creating extra
+                # legend traces.
+                boundary_offset = 0
+                for run_number in stage_runs[:-1]:
+                    run_max = int(
+                        stage_data.loc[
+                            stage_data["Run Number"].eq(run_number),
+                            "Original Cycle",
+                        ].max()
+                    )
+                    boundary_offset += run_max
+                    stage_figure.add_vline(
+                        x=boundary_offset + 0.5,
+                        line_width=1,
+                        line_dash="dot",
+                        line_color="#808080",
+                    )
+
                 stage_figure.update_layout(
                     title={
                         "text": (
@@ -2131,7 +2221,7 @@ def main():
                         "x": 0.5,
                         "xanchor": "center",
                     },
-                    xaxis_title="<b>Cycles</b>",
+                    xaxis_title="<b>Combined Cycles Across Selected Runs</b>",
                     yaxis_title="<b>Maximum Pressure (bar)</b>",
                     xaxis={
                         "dtick": 1,
