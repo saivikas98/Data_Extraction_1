@@ -20,7 +20,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.10.30-persistent-section-download-v35"
+APP_SCHEMA_VERSION = "2026.10.30-mixing-multi-run-v36"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -60,7 +60,7 @@ def duration_text(start, end):
 
 
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.30-persistent-section-download-v35"
+    parser_version = "2026.10.30-mixing-multi-run-v36"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -2027,18 +2027,25 @@ def main():
             )
             if not available_runs:
                 available_runs = [1]
-            selected_mixing_run = st.selectbox(
-                "Mixing run",
-                available_runs,
+            selected_mixing_runs = st.multiselect(
+                "Mixing runs",
+                options=available_runs,
+                default=available_runs,
                 format_func=lambda value: f"Run {value}",
-                key="mixing_plot_run",
+                key="mixing_plot_runs",
+                help=(
+                    "Select one or more runs. All available runs are selected by default."
+                ),
             )
+            if not selected_mixing_runs:
+                st.warning("Select at least one Mixing run to display the results.")
+                st.stop()
             available_orifices = [
                 item for item in ["5 mm", "3.8 mm", "2 mm", "1.5 mm"]
                 if item in set(
                     mixing_pressure_table.loc[
                         mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
-                        & mixing_pressure_table["Run Number"].eq(selected_mixing_run),
+                        & mixing_pressure_table["Run Number"].isin(selected_mixing_runs),
                         "Orifice",
                     ]
                 )
@@ -2050,7 +2057,7 @@ def main():
             )
             mixing_view = mixing_pressure_table[
                 mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
-                & mixing_pressure_table["Run Number"].eq(selected_mixing_run)
+                & mixing_pressure_table["Run Number"].isin(selected_mixing_runs)
                 & mixing_pressure_table["Orifice"].isin(selected_orifices)
             ].copy()
             st.dataframe(
@@ -2061,51 +2068,82 @@ def main():
             )
 
             batch_number_for_mixing = batch.get("Batch no.") or "Batch"
-            for orifice in selected_orifices:
-                mixing_figure = create_mixing_pressure_plot(
-                    mixing_pressure_table,
-                    selected_mixing_extruder,
-                    selected_mixing_run,
-                    orifice,
-                    batch_number_for_mixing,
-                )
-                apply_graph_style(mixing_figure, graph_font_family, graph_font_size)
-                st.plotly_chart(
-                    mixing_figure,
-                    use_container_width=True,
-                    config={
-                        "displaylogo": False,
-                        "scrollZoom": True,
-                        "toImageButtonOptions": {
-                            "format": "png",
-                            "filename": (
-                                f"{batch_number_for_mixing}_extruder_"
-                                f"{selected_mixing_extruder}_run_{selected_mixing_run}_{orifice.replace(' ', '_')}_max_pressure"
-                            ),
-                            "height": 620,
-                            "width": 1200,
-                            "scale": 2,
+            for run_number in selected_mixing_runs:
+                st.markdown(f"##### Extruder {selected_mixing_extruder} | Run {run_number}")
+                for orifice in selected_orifices:
+                    run_orifice_data = mixing_pressure_table[
+                        mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
+                        & mixing_pressure_table["Run Number"].eq(run_number)
+                        & mixing_pressure_table["Orifice"].eq(orifice)
+                    ]
+                    if run_orifice_data.empty:
+                        continue
+                    mixing_figure = create_mixing_pressure_plot(
+                        mixing_pressure_table,
+                        selected_mixing_extruder,
+                        run_number,
+                        orifice,
+                        batch_number_for_mixing,
+                    )
+                    apply_graph_style(mixing_figure, graph_font_family, graph_font_size)
+                    st.plotly_chart(
+                        mixing_figure,
+                        use_container_width=True,
+                        config={
+                            "displaylogo": False,
+                            "scrollZoom": True,
+                            "toImageButtonOptions": {
+                                "format": "png",
+                                "filename": (
+                                    f"{batch_number_for_mixing}_extruder_"
+                                    f"{selected_mixing_extruder}_run_{run_number}_"
+                                    f"{orifice.replace(' ', '_')}_max_pressure"
+                                ),
+                                "height": 620,
+                                "width": 1200,
+                                "scale": 2,
+                            },
                         },
-                    },
-                    key=f"mixing_chart_{selected_mixing_extruder}_{selected_mixing_run}_{orifice}",
-                )
+                        key=(
+                            f"mixing_chart_{selected_mixing_extruder}_"
+                            f"{run_number}_{orifice}"
+                        ),
+                    )
 
             mixing_html_figure = go.Figure()
-            for orifice in selected_orifices:
-                source_figure = create_mixing_pressure_plot(
-                    mixing_pressure_table,
-                    selected_mixing_extruder,
-                    selected_mixing_run,
-                    orifice,
-                    batch_number_for_mixing,
-                )
-                for trace in source_figure.data:
-                    # Preserve the orifice-specific nomenclature and styling
-                    # created by create_mixing_pressure_plot(). Do not recolour
-                    # or re-symbolize traces when combining them into HTML.
-                    mixing_html_figure.add_trace(trace)
+            run_dash_overrides = ["solid", "dash", "dot", "dashdot", "longdash"]
+            for run_index, run_number in enumerate(selected_mixing_runs):
+                for orifice in selected_orifices:
+                    run_orifice_data = mixing_pressure_table[
+                        mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
+                        & mixing_pressure_table["Run Number"].eq(run_number)
+                        & mixing_pressure_table["Orifice"].eq(orifice)
+                    ]
+                    if run_orifice_data.empty:
+                        continue
+                    source_figure = create_mixing_pressure_plot(
+                        mixing_pressure_table,
+                        selected_mixing_extruder,
+                        run_number,
+                        orifice,
+                        batch_number_for_mixing,
+                    )
+                    for trace in source_figure.data:
+                        trace.name = f"Run {run_number} | {trace.name}"
+                        if len(selected_mixing_runs) > 1:
+                            trace.line.dash = run_dash_overrides[
+                                run_index % len(run_dash_overrides)
+                            ]
+                        mixing_html_figure.add_trace(trace)
+            selected_run_text = ", ".join(
+                f"Run {run_number}" for run_number in selected_mixing_runs
+            )
             mixing_html_figure.update_layout(
-                title=f"{batch_number_for_mixing} | Extruder {selected_mixing_extruder} | Run {selected_mixing_run} | Mixing Max Pressure",
+                title=(
+                    f"{batch_number_for_mixing} | Extruder "
+                    f"{selected_mixing_extruder} | {selected_run_text} | "
+                    "Mixing Max Pressure"
+                ),
                 xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
                 xaxis={"showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
                 yaxis={"showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
@@ -2113,15 +2151,18 @@ def main():
             )
             apply_graph_style(mixing_html_figure, graph_font_family, graph_font_size)
             m1, m2 = st.columns(2)
+            selected_runs_tag = "_".join(
+                str(run_number) for run_number in selected_mixing_runs
+            )
             m1.download_button(
                 "Download Mixing Max-Pressure Table CSV",
                 mixing_view.to_csv(index=False).encode("utf-8"),
-                f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_run_{selected_mixing_run}_mixing_max_pressure.csv",
+                f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_runs_{selected_runs_tag}_mixing_max_pressure.csv",
                 "text/csv",
             )
             mixing_html_key = (
                 f"generated_html_mixing_{APP_SCHEMA_VERSION}_{selected_label}_"
-                f"{selected_mixing_extruder}_{selected_mixing_run}_"
+                f"{selected_mixing_extruder}_runs_{selected_runs_tag}_"
                 f"{'_'.join(selected_orifices)}"
             )
             if m2.button("Prepare Interactive Mixing HTML", key=f"prepare_{mixing_html_key}"):
@@ -2133,7 +2174,7 @@ def main():
                 m2.download_button(
                     "Download Interactive Mixing Plot HTML",
                     st.session_state[mixing_html_key],
-                    f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_run_{selected_mixing_run}_{'_'.join(item.replace(' ', '_') for item in selected_orifices)}_mixing_max_pressure.html",
+                    f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_runs_{selected_runs_tag}_{'_'.join(item.replace(' ', '_') for item in selected_orifices)}_mixing_max_pressure.html",
                     "text/html",
                     key=f"download_{mixing_html_key}",
                     on_click="ignore"
