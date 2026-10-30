@@ -6,6 +6,7 @@ import re
 import zipfile
 from pathlib import Path
 
+import fitz
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -20,7 +21,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.10.30-mixing-two-lines-combined-runs-v38"
+APP_SCHEMA_VERSION = "2026.10.30-fast-pymupdf-v39"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -59,9 +60,54 @@ def duration_text(start, end):
     return f"{days}.{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def extract_pages(pdf_bytes):
-    parser_version = "2026.10.30-mixing-two-lines-combined-runs-v38"
-    _ = parser_version
+def extract_page_layout_pymupdf(page):
+    """Reconstruct layout-like text quickly from PyMuPDF word coordinates."""
+    words = page.get_text("words", sort=True)
+    if not words:
+        return ""
+
+    grouped_lines = {}
+    for word in words:
+        x0, _y0, x1, _y1, text, block_no, line_no, word_no = word[:8]
+        grouped_lines.setdefault((block_no, line_no), []).append(
+            (float(x0), float(x1), int(word_no), str(text))
+        )
+
+    output_lines = []
+    for line_words in grouped_lines.values():
+        line_words.sort(key=lambda item: (item[0], item[2]))
+        parts = []
+        previous_x1 = None
+        for x0, x1, _word_no, text in line_words:
+            if previous_x1 is None:
+                leading_spaces = max(0, int(round(x0 / 4.0)))
+                parts.append(" " * leading_spaces + text)
+            else:
+                gap_points = max(0.0, x0 - previous_x1)
+                spaces = max(1, int(round(gap_points / 4.0)))
+                parts.append(" " * spaces + text)
+            previous_x1 = x1
+        output_lines.append("".join(parts).rstrip())
+    return "\n".join(output_lines)
+
+
+def extract_pages(pdf_bytes, extraction_engine="Fast - PyMuPDF"):
+    """Extract all PDF pages using a fast engine with safe fallback."""
+    if extraction_engine == "Fast - PyMuPDF":
+        try:
+            document = fitz.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                return [
+                    extract_page_layout_pymupdf(document.load_page(page_index))
+                    for page_index in range(document.page_count)
+                ]
+            finally:
+                document.close()
+        except Exception:
+            # Preserve report availability if a PDF contains an unsupported
+            # object or malformed page that PyMuPDF cannot read.
+            pass
+
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
     for page in reader.pages:
@@ -1464,10 +1510,10 @@ def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejec
     ttl=CACHE_TTL_SECONDS,
     max_entries=CACHE_MAX_REPORTS,
 )
-def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml, schema_version):
+def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml, schema_version, extraction_engine):
     """Extract and calculate all report outputs for one uploaded PDF."""
     _ = schema_version  # Explicit cache-key token for parser/schema changes.
-    pages = extract_pages(pdf_bytes)
+    pages = extract_pages(pdf_bytes, extraction_engine)
     batch = parse_batch_details(pages)
     overview = parse_process_overview(pages)
     summaries = parse_process_summaries(pages)
@@ -1614,6 +1660,16 @@ def main():
     )
     graph_font_family, graph_font_size = graph_display_controls()
 
+    extraction_engine = st.selectbox(
+        "PDF extraction engine",
+        options=["Fast - PyMuPDF", "Compatibility - pypdf"],
+        index=0,
+        help=(
+            "Fast PyMuPDF is recommended for large batch reports. Use Compatibility "
+            "mode only if a specific report does not parse correctly."
+        ),
+    )
+
     st.markdown("### Premixing batch configuration")
     premixing_batch_size = st.selectbox(
         "Premixing batch size / step volume",
@@ -1754,7 +1810,7 @@ def main():
         pdf_bytes = selected_upload.getvalue()
         processing_progress.progress(
             15,
-            text="Reading PDF and validating the selected report...",
+            text=f"Reading PDF with {extraction_engine}...",
         )
         fingerprint = uploaded_report_fingerprint(selected_upload.name, pdf_bytes)
         selected_result_key = (
@@ -1768,13 +1824,14 @@ def main():
             try:
                 processing_progress.progress(
                     30,
-                    text="Extracting pages, process summaries, and datalogs...",
+                    text="Parsing process summaries, settings, and datalogs...",
                 )
                 selected_result = process_uploaded_report(
                     selected_upload.name,
                     pdf_bytes,
                     premixing_step_volume_ml,
                     APP_SCHEMA_VERSION,
+                    extraction_engine,
                 )
                 processing_progress.progress(
                     90,
@@ -1833,6 +1890,7 @@ def main():
                 pdf_bytes,
                 premixing_step_volume_ml,
                 APP_SCHEMA_VERSION,
+                extraction_engine,
             )
         else:
             if selected_status == "Failed":
