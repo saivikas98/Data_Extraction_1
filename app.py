@@ -3,6 +3,7 @@ import hashlib
 import io
 import math
 import re
+import time
 import zipfile
 from pathlib import Path
 
@@ -21,7 +22,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.10.30-fast-pymupdf-v39"
+APP_SCHEMA_VERSION = "2026.10.30-stage-timings-v40"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -1511,36 +1512,84 @@ def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejec
     max_entries=CACHE_MAX_REPORTS,
 )
 def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml, schema_version, extraction_engine):
-    """Extract and calculate all report outputs for one uploaded PDF."""
-    _ = schema_version  # Explicit cache-key token for parser/schema changes.
+    """Extract one PDF and record elapsed time for every processing stage."""
+    _ = schema_version
+    overall_start = time.perf_counter()
+    stage_timings = []
+
+    def record_timing(stage_name, stage_start, details=""):
+        elapsed = time.perf_counter() - stage_start
+        stage_timings.append({
+            "Processing Stage": stage_name,
+            "Elapsed Time (s)": round(elapsed, 3),
+            "Elapsed Time": (
+                f"{elapsed / 60:.2f} min" if elapsed >= 60
+                else f"{elapsed:.2f} sec"
+            ),
+            "Details": details,
+        })
+
+    stage_start = time.perf_counter()
     pages = extract_pages(pdf_bytes, extraction_engine)
+    record_timing(
+        "PDF text extraction", stage_start,
+        f"{len(pages):,} pages | {extraction_engine}",
+    )
+
+    stage_start = time.perf_counter()
     batch = parse_batch_details(pages)
     overview = parse_process_overview(pages)
     summaries = parse_process_summaries(pages)
     settings = parse_recipe_settings(pages, summaries)
+    record_timing(
+        "Report headers and recipe settings", stage_start,
+        f"{len(summaries):,} process runs | {len(settings):,} settings",
+    )
+
+    stage_start = time.perf_counter()
     datalog, diagnostics, rejected_rows, process_ranges = parse_datalogs(
         pages, summaries
     )
+    record_timing(
+        "Datalog extraction", stage_start,
+        f"{len(datalog):,} rows | {len(rejected_rows):,} rejected",
+    )
 
+    stage_start = time.perf_counter()
     wetting_data = (
         datalog[datalog["Stage"].eq("WETTING")].copy()
         if not datalog.empty else pd.DataFrame()
     )
     wetting_rise_table = build_wetting_rise_time_table(wetting_data)
+    record_timing(
+        "Wetting calculations", stage_start,
+        f"{len(wetting_data):,} input rows | {len(wetting_rise_table):,} results",
+    )
 
+    stage_start = time.perf_counter()
     mixing_data = (
         datalog[datalog["Stage"].eq("MIXING")].copy()
         if not datalog.empty else pd.DataFrame()
     )
     mixing_data = assign_mixing_runs_from_summaries(mixing_data, summaries)
     mixing_pressure_table = build_mixing_max_pressure_table(mixing_data)
+    record_timing(
+        "Mixing calculations", stage_start,
+        f"{len(mixing_data):,} input rows | {len(mixing_pressure_table):,} cycle results",
+    )
 
+    stage_start = time.perf_counter()
     blending_data = (
         datalog[datalog["Stage"].eq("BLENDING")].copy()
         if not datalog.empty else pd.DataFrame()
     )
     blending_pressure_table = build_blending_max_pressure_table(blending_data)
+    record_timing(
+        "Blending calculations", stage_start,
+        f"{len(blending_data):,} input rows | {len(blending_pressure_table):,} cycle results",
+    )
 
+    stage_start = time.perf_counter()
     premixing_data = (
         datalog[datalog["Stage"].eq("PREMIXING")].copy()
         if not datalog.empty else pd.DataFrame()
@@ -1562,10 +1611,15 @@ def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml, sche
             on=["Extruder", "Bidirectional Attempt ID"],
             how="left",
         )
-
     premix_summary = build_premixing_volume_step_summary(premix_prediction)
+    record_timing(
+        "Premixing calculations", stage_start,
+        f"{len(premixing_data):,} input rows | {len(premix_prediction):,} attempts",
+    )
 
-    return {
+    stage_start = time.perf_counter()
+    # Keep a dedicated finalization stage for sorting and result packaging.
+    result = {
         "file_name": file_name,
         "pages": pages,
         "batch": batch,
@@ -1586,6 +1640,21 @@ def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml, sche
         "premix_summary": premix_summary,
         "premixing_step_volume_ml": float(premixing_step_volume_ml),
     }
+    record_timing("Result packaging", stage_start, "Prepared tables for review and export")
+
+    total_elapsed = time.perf_counter() - overall_start
+    stage_timings.append({
+        "Processing Stage": "TOTAL PROCESSING TIME",
+        "Elapsed Time (s)": round(total_elapsed, 3),
+        "Elapsed Time": (
+            f"{total_elapsed / 60:.2f} min" if total_elapsed >= 60
+            else f"{total_elapsed:.2f} sec"
+        ),
+        "Details": f"{len(pages):,} PDF pages processed",
+    })
+    result["processing_timings"] = pd.DataFrame(stage_timings)
+    result["total_processing_seconds"] = round(total_elapsed, 3)
+    return result
 
 
 def result_to_excel(result):
@@ -1917,6 +1986,53 @@ def main():
         use_container_width=True,
         hide_index=True,
     )
+
+    timing_table = selected_result.get(
+        "processing_timings",
+        pd.DataFrame(columns=[
+            "Processing Stage", "Elapsed Time (s)", "Elapsed Time", "Details"
+        ]),
+    )
+    if not timing_table.empty:
+        total_seconds = float(selected_result.get("total_processing_seconds", 0.0))
+        timing_col1, timing_col2, timing_col3 = st.columns(3)
+        timing_col1.metric(
+            "Total processing time",
+            f"{total_seconds / 60:.2f} min" if total_seconds >= 60
+            else f"{total_seconds:.2f} sec",
+        )
+        extraction_seconds = timing_table.loc[
+            timing_table["Processing Stage"].eq("PDF text extraction"),
+            "Elapsed Time (s)",
+        ]
+        datalog_seconds = timing_table.loc[
+            timing_table["Processing Stage"].eq("Datalog extraction"),
+            "Elapsed Time (s)",
+        ]
+        timing_col2.metric(
+            "PDF extraction",
+            f"{float(extraction_seconds.iloc[0]):.2f} sec"
+            if not extraction_seconds.empty else "N/A",
+        )
+        timing_col3.metric(
+            "Datalog extraction",
+            f"{float(datalog_seconds.iloc[0]):.2f} sec"
+            if not datalog_seconds.empty else "N/A",
+        )
+        with st.expander("Processing time by stage", expanded=True):
+            st.dataframe(
+                timing_table,
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.download_button(
+                "Download Processing Timings CSV",
+                timing_table.to_csv(index=False).encode("utf-8"),
+                f"{safe_output_name(selected_result['file_name'])}_processing_timings.csv",
+                "text/csv",
+                key=f"timing_csv_{selected_result_key}",
+                on_click="ignore",
+            )
 
     selected_result_key = st.session_state["processed_selected_pdf_key"]
     pages = selected_result["pages"]
