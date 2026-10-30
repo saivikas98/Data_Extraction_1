@@ -4,6 +4,8 @@ import hashlib
 import io
 import math
 import re
+import subprocess
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -23,7 +25,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.10.30-indexed-parser-ultrafast-v41"
+APP_SCHEMA_VERSION = "2026.10.30-session-result-no-reprocess-v43"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -93,8 +95,46 @@ def extract_page_layout_pymupdf(page):
     return "\n".join(output_lines)
 
 
-def extract_pages(pdf_bytes, extraction_engine="Fast - PyMuPDF"):
-    """Extract all PDF pages using a fast engine with safe fallback."""
+def extract_pages_poppler(pdf_bytes):
+    """Extract all pages through native Poppler pdftotext for maximum speed."""
+    with tempfile.TemporaryDirectory(prefix="batch_pdf_") as temp_dir:
+        pdf_path = Path(temp_dir) / "input.pdf"
+        text_path = Path(temp_dir) / "output.txt"
+        pdf_path.write_bytes(pdf_bytes)
+        command = [
+            "pdftotext",
+            "-layout",
+            "-enc", "UTF-8",
+            str(pdf_path),
+            str(text_path),
+        ]
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        if completed.returncode != 0 or not text_path.exists():
+            message = completed.stderr.strip() or "pdftotext extraction failed"
+            raise RuntimeError(message)
+        extracted_text = text_path.read_text(encoding="utf-8", errors="replace")
+        pages = extracted_text.split("\f")
+        if pages and pages[-1] == "":
+            pages.pop()
+        return pages
+
+
+def extract_pages(pdf_bytes, extraction_engine="Fastest - Poppler pdftotext"):
+    """Extract all PDF pages using native Poppler, PyMuPDF, or pypdf."""
+    if extraction_engine == "Fastest - Poppler pdftotext":
+        try:
+            return extract_pages_poppler(pdf_bytes)
+        except (FileNotFoundError, RuntimeError, subprocess.TimeoutExpired):
+            # Fall back automatically when Poppler is unavailable or a PDF is
+            # malformed; deployment remains usable without manual intervention.
+            extraction_engine = "Ultra Fast - PyMuPDF text"
+
     if extraction_engine in {
         "Ultra Fast - PyMuPDF text",
         "Layout - PyMuPDF words",
@@ -1559,6 +1599,7 @@ def graph_display_controls():
             st.session_state.pop("pdf_processing_status", None)
             st.session_state.pop("pdf_processing_errors", None)
             st.session_state.pop("processed_selected_pdf_key", None)
+            st.session_state.pop("processed_selected_result", None)
             st.session_state.pop("selected_pdf_signature", None)
             gc.collect()
             st.rerun()
@@ -1877,6 +1918,7 @@ def main():
         st.cache_data.clear()
         st.session_state["active_app_schema_version"] = APP_SCHEMA_VERSION
         st.session_state.pop("processed_selected_pdf_key", None)
+        st.session_state.pop("processed_selected_result", None)
         st.session_state.pop("selected_pdf_signature", None)
         st.session_state.pop("pdf_processing_status", None)
         st.session_state.pop("pdf_processing_errors", None)
@@ -1891,17 +1933,29 @@ def main():
     extraction_engine = st.selectbox(
         "PDF extraction engine",
         options=[
+            "Fastest - Poppler pdftotext",
             "Ultra Fast - PyMuPDF text",
             "Layout - PyMuPDF words",
             "Compatibility - pypdf",
         ],
         index=0,
         help=(
-            "Ultra Fast is recommended for large batch reports. Use Layout mode "
-            "only if column alignment is not parsed correctly, and pypdf only as "
-            "a final compatibility fallback."
+            "Fastest Poppler is recommended for very large reports. The app "
+            "automatically falls back to PyMuPDF if Poppler cannot read a file."
         ),
     )
+
+    if extraction_engine == "Ultra Fast - PyMuPDF text":
+        st.info(
+            "PyMuPDF reduced the 4,874-page report to about 2.5 minutes. For "
+            "additional improvement, use Fastest - Poppler pdftotext."
+        )
+    if extraction_engine == "Compatibility - pypdf":
+        st.warning(
+            "Compatibility - pypdf is very slow for large reports. Your previous "
+            "4,874-page report spent 375 seconds in PDF extraction alone. Select "
+            "Ultra Fast - PyMuPDF text unless the fast output is incorrect."
+        )
 
     st.markdown("### Premixing batch configuration")
     premixing_batch_size = st.selectbox(
@@ -1957,7 +2011,7 @@ def main():
         display_label = f"{file_index:02d}. {uploaded_file.name}"
         status_key = (
             f"{uploaded_file.name}|{uploaded_file.size}|"
-            f"{premixing_step_volume_ml:g}"
+            f"{premixing_step_volume_ml:g}|{extraction_engine}|{APP_SCHEMA_VERSION}"
         )
         file_options[display_label] = uploaded_file
         file_status_keys[display_label] = status_key
@@ -2032,6 +2086,13 @@ def main():
     if selected_status == "Failed" and selected_error:
         st.error(f"Previous failure: {selected_error}")
 
+    pdf_bytes = selected_upload.getvalue()
+    fingerprint = uploaded_report_fingerprint(selected_upload.name, pdf_bytes)
+    selected_result_key = (
+        f"{fingerprint}_{premixing_step_volume_ml:g}_"
+        f"{APP_SCHEMA_VERSION}_{extraction_engine}"
+    )
+
     should_process = process_requested or retry_requested
     if should_process:
         st.session_state["pdf_processing_status"][selected_status_key] = "Processing"
@@ -2040,14 +2101,9 @@ def main():
             5,
             text=f"Preparing {selected_upload.name}...",
         )
-        pdf_bytes = selected_upload.getvalue()
         processing_progress.progress(
             15,
             text=f"Reading PDF with {extraction_engine}...",
-        )
-        fingerprint = uploaded_report_fingerprint(selected_upload.name, pdf_bytes)
-        selected_result_key = (
-            f"{fingerprint}_{premixing_step_volume_ml:g}_{APP_SCHEMA_VERSION}"
         )
 
         with st.status(
@@ -2059,6 +2115,7 @@ def main():
                     30,
                     text="Parsing process summaries, settings, and datalogs...",
                 )
+                processing_call_start = time.perf_counter()
                 selected_result = process_uploaded_report(
                     selected_upload.name,
                     pdf_bytes,
@@ -2066,11 +2123,15 @@ def main():
                     APP_SCHEMA_VERSION,
                     extraction_engine,
                 )
+                selected_result["result_retrieval_seconds"] = round(
+                    time.perf_counter() - processing_call_start, 3
+                )
                 processing_progress.progress(
                     90,
                     text="Finalizing calculations and report status...",
                 )
                 st.session_state["processed_selected_pdf_key"] = selected_result_key
+                st.session_state["processed_selected_result"] = selected_result
                 st.session_state["selected_pdf_signature"] = current_selection_signature
                 st.session_state["pdf_processing_status"][selected_status_key] = "Processed"
                 st.session_state["pdf_processing_errors"].pop(selected_status_key, None)
@@ -2088,6 +2149,7 @@ def main():
                 st.session_state["pdf_processing_status"][selected_status_key] = "Failed"
                 st.session_state["pdf_processing_errors"][selected_status_key] = error_message
                 st.session_state.pop("processed_selected_pdf_key", None)
+                st.session_state.pop("processed_selected_result", None)
                 processing_progress.progress(
                     100,
                     text=f"Failed: {selected_upload.name}",
@@ -2105,26 +2167,21 @@ def main():
                 gc.collect()
     else:
         processed_key = st.session_state.get("processed_selected_pdf_key")
-        expected_prefix = None
+        expected_result_key = None
         if (
             processed_key
             and selected_status == "Processed"
             and st.session_state.get("selected_pdf_signature")
             == current_selection_signature
         ):
-            pdf_bytes = selected_upload.getvalue()
-            fingerprint = uploaded_report_fingerprint(selected_upload.name, pdf_bytes)
-            expected_prefix = (
-                f"{fingerprint}_{premixing_step_volume_ml:g}_{APP_SCHEMA_VERSION}"
-            )
-        if processed_key and processed_key == expected_prefix:
-            selected_result = process_uploaded_report(
-                selected_upload.name,
-                pdf_bytes,
-                premixing_step_volume_ml,
-                APP_SCHEMA_VERSION,
-                extraction_engine,
-            )
+            expected_result_key = selected_result_key
+        stored_result = st.session_state.get("processed_selected_result")
+        if (
+            processed_key
+            and processed_key == expected_result_key
+            and isinstance(stored_result, dict)
+        ):
+            selected_result = stored_result
         else:
             if selected_status == "Failed":
                 st.info("Click **Retry Failed PDF** to process this report again.")
@@ -2194,7 +2251,7 @@ def main():
                 timing_table.to_csv(index=False).encode("utf-8"),
                 f"{safe_output_name(selected_result['file_name'])}_processing_timings.csv",
                 "text/csv",
-                key=f"timing_csv_{selected_result_key}",
+                key=f"timing_csv_{hashlib.sha256(current_selection_signature.encode()).hexdigest()[:16]}",
                 on_click="ignore",
             )
 
@@ -2918,7 +2975,6 @@ def main():
         selected_result["file_name"]
     ).stem
     safe_batch_number = safe_output_name(batch_number)
-    selected_result_key = selected_result_key
 
     st.markdown("### Export files")
     export_col1, export_col2 = st.columns(2)
