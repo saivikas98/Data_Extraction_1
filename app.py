@@ -20,7 +20,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.10.30-mixing-distinct-nomenclature-v33"
+APP_SCHEMA_VERSION = "2026.10.30-mixing-html-style-v34"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -60,7 +60,7 @@ def duration_text(start, end):
 
 
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.30-mixing-distinct-nomenclature-v33"
+    parser_version = "2026.10.30-mixing-html-style-v34"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -2071,10 +2071,6 @@ def main():
                 )
 
             mixing_html_figure = go.Figure()
-            mixing_colors = ["#0057B8", "#D62728", "#2E8B57", "#FF8C00", "#7030A0", "#008B8B"]
-            mixing_symbols = ["circle", "diamond", "square", "triangle-up", "x", "star"]
-            mixing_dashes = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
-            mixing_style_index = 0
             for orifice in selected_orifices:
                 source_figure = create_mixing_pressure_plot(
                     mixing_pressure_table,
@@ -2084,18 +2080,10 @@ def main():
                     batch_number_for_mixing,
                 )
                 for trace in source_figure.data:
-                    color = mixing_colors[mixing_style_index % len(mixing_colors)]
-                    symbol = mixing_symbols[mixing_style_index % len(mixing_symbols)]
-                    dash = mixing_dashes[mixing_style_index % len(mixing_dashes)]
-                    trace.name = trace.name
-                    trace.line.color = color
-                    trace.line.dash = dash
-                    trace.line.width = 3
-                    trace.marker.color = color
-                    trace.marker.symbol = symbol
-                    trace.marker.size = 9
+                    # Preserve the orifice-specific nomenclature and styling
+                    # created by create_mixing_pressure_plot(). Do not recolour
+                    # or re-symbolize traces when combining them into HTML.
                     mixing_html_figure.add_trace(trace)
-                    mixing_style_index += 1
             mixing_html_figure.update_layout(
                 title=f"{batch_number_for_mixing} | Extruder {selected_mixing_extruder} | Run {selected_mixing_run} | Mixing Max Pressure",
                 xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
@@ -2112,7 +2100,8 @@ def main():
                 "text/csv",
             )
             mixing_html_key = (
-                f"generated_html_mixing_{selected_label}_{selected_mixing_extruder}_{selected_mixing_run}_"
+                f"generated_html_mixing_{APP_SCHEMA_VERSION}_{selected_label}_"
+                f"{selected_mixing_extruder}_{selected_mixing_run}_"
                 f"{'_'.join(selected_orifices)}"
             )
             if m2.button("Prepare Interactive Mixing HTML", key=f"prepare_{mixing_html_key}"):
@@ -2124,7 +2113,7 @@ def main():
                 m2.download_button(
                     "Download Interactive Mixing Plot HTML",
                     st.session_state[mixing_html_key],
-                    f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_run_{selected_mixing_run}_mixing_max_pressure.html",
+                    f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_run_{selected_mixing_run}_{'_'.join(item.replace(' ', '_') for item in selected_orifices)}_mixing_max_pressure.html",
                     "text/html",
                     key=f"download_{mixing_html_key}",
                 )
