@@ -20,6 +20,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
+APP_SCHEMA_VERSION = "2026.10.30-mixing-split-runs-v31"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -59,7 +60,7 @@ def duration_text(start, end):
 
 
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.30-mixing-split-runs-v30"
+    parser_version = "2026.10.30-mixing-cache-schema-v31"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -757,6 +758,39 @@ def build_wetting_rise_time_table(wetting_data):
 
 
 
+def assign_mixing_runs_from_summaries(mixing_data, summaries):
+    """Recover Mixing run numbers using process start/end windows."""
+    data = mixing_data.copy()
+    if data.empty:
+        return data
+    if "Run Number" in data.columns and data["Run Number"].notna().any():
+        return data
+    data["Run Number"] = pd.NA
+    data["Process Start"] = pd.NaT
+    mixing_summaries = summaries[summaries["Stage"].eq("MIXING")].copy()
+    if mixing_summaries.empty:
+        data["Run Number"] = 1
+        return data
+    mixing_summaries = mixing_summaries.sort_values("Source Page")
+    mixing_summaries["Run Number"] = (
+        mixing_summaries.groupby("Extruder", dropna=False).cumcount() + 1
+    )
+    for _, run in mixing_summaries.iterrows():
+        start = run.get("Process start")
+        end = run.get("Process end")
+        mask = data["Extruder"].eq(run["Extruder"])
+        if pd.notna(start):
+            mask &= data["Date & Time"].ge(start)
+        if pd.notna(end):
+            mask &= data["Date & Time"].le(end)
+        data.loc[mask, "Run Number"] = int(run["Run Number"])
+        data.loc[mask, "Process Start"] = start
+    data["Run Number"] = pd.to_numeric(
+        data["Run Number"], errors="coerce"
+    ).fillna(1).astype(int)
+    return data
+
+
 def build_mixing_max_pressure_table(mixing_data):
     """Calculate directional maximum pressure for each extrusion cycle.
 
@@ -1358,8 +1392,9 @@ def make_excel(batch, overview, summaries, settings, datalog, diagnostics, rejec
     ttl=CACHE_TTL_SECONDS,
     max_entries=CACHE_MAX_REPORTS,
 )
-def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml):
+def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml, schema_version):
     """Extract and calculate all report outputs for one uploaded PDF."""
+    _ = schema_version  # Explicit cache-key token for parser/schema changes.
     pages = extract_pages(pdf_bytes)
     batch = parse_batch_details(pages)
     overview = parse_process_overview(pages)
@@ -1379,6 +1414,7 @@ def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml):
         datalog[datalog["Stage"].eq("MIXING")].copy()
         if not datalog.empty else pd.DataFrame()
     )
+    mixing_data = assign_mixing_runs_from_summaries(mixing_data, summaries)
     mixing_pressure_table = build_mixing_max_pressure_table(mixing_data)
 
     blending_data = (
@@ -1641,7 +1677,9 @@ def main():
             text="Reading PDF and validating the selected report...",
         )
         fingerprint = uploaded_report_fingerprint(selected_upload.name, pdf_bytes)
-        selected_result_key = f"{fingerprint}_{premixing_step_volume_ml:g}"
+        selected_result_key = (
+            f"{fingerprint}_{premixing_step_volume_ml:g}_{APP_SCHEMA_VERSION}"
+        )
 
         with st.status(
             f"Processing {selected_upload.name}...",
@@ -1656,6 +1694,7 @@ def main():
                     selected_upload.name,
                     pdf_bytes,
                     premixing_step_volume_ml,
+                    APP_SCHEMA_VERSION,
                 )
                 processing_progress.progress(
                     90,
@@ -1705,12 +1744,15 @@ def main():
         ):
             pdf_bytes = selected_upload.getvalue()
             fingerprint = uploaded_report_fingerprint(selected_upload.name, pdf_bytes)
-            expected_prefix = f"{fingerprint}_{premixing_step_volume_ml:g}"
+            expected_prefix = (
+                f"{fingerprint}_{premixing_step_volume_ml:g}_{APP_SCHEMA_VERSION}"
+            )
         if processed_key and processed_key == expected_prefix:
             selected_result = process_uploaded_report(
                 selected_upload.name,
                 pdf_bytes,
                 premixing_step_volume_ml,
+                APP_SCHEMA_VERSION,
             )
         else:
             if selected_status == "Failed":
@@ -1843,6 +1885,21 @@ def main():
                 )
     with mixing_tab:
         st.markdown("#### Mixing Maximum Pressure by Extrusion Cycle")
+        if not mixing_pressure_table.empty and "Run Number" not in mixing_pressure_table.columns:
+            st.warning(
+                "An older cached Mixing table was detected and has been rebuilt using "
+                "the current split-run logic."
+            )
+            current_mixing_data = (
+                datalog[datalog["Stage"].eq("MIXING")].copy()
+                if not datalog.empty else pd.DataFrame()
+            )
+            current_mixing_data = assign_mixing_runs_from_summaries(
+                current_mixing_data, summaries
+            )
+            mixing_pressure_table = build_mixing_max_pressure_table(
+                current_mixing_data
+            )
         st.caption(
             "For movement to accumulator right, the maximum left-loadcell pressure is used. "
             "For movement to accumulator left, the maximum right-loadcell pressure is used. "
