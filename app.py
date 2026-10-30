@@ -20,7 +20,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.10.30-mixing-split-runs-v31"
+APP_SCHEMA_VERSION = "2026.10.30-mixing-distinct-nomenclature-v33"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -60,7 +60,7 @@ def duration_text(start, end):
 
 
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.30-mixing-cache-schema-v31"
+    parser_version = "2026.10.30-mixing-distinct-nomenclature-v33"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -791,6 +791,50 @@ def assign_mixing_runs_from_summaries(mixing_data, summaries):
     return data
 
 
+def ensure_mixing_pressure_schema(mixing_pressure_table, datalog, summaries):
+    """Return a Mixing pressure table with the current split-run schema.
+
+    This is intentionally defensive so older cached/session results cannot cause
+    a KeyError when the UI requests Run Number.
+    """
+    required_columns = {
+        "Extruder", "Run Number", "Process Start", "Orifice", "Cycle",
+        "Max Pressure Left - Move Right (bar)",
+        "Max Pressure Right - Move Left (bar)",
+    }
+    table = (
+        mixing_pressure_table.copy()
+        if isinstance(mixing_pressure_table, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    if not table.empty and required_columns.issubset(table.columns):
+        table["Run Number"] = pd.to_numeric(
+            table["Run Number"], errors="coerce"
+        ).fillna(1).astype(int)
+        return table
+
+    mixing_data = (
+        datalog[datalog["Stage"].eq("MIXING")].copy()
+        if isinstance(datalog, pd.DataFrame)
+        and not datalog.empty
+        and "Stage" in datalog.columns
+        else pd.DataFrame()
+    )
+    if mixing_data.empty:
+        return build_mixing_max_pressure_table(mixing_data)
+
+    mixing_data = assign_mixing_runs_from_summaries(mixing_data, summaries)
+    rebuilt = build_mixing_max_pressure_table(mixing_data)
+    if "Run Number" not in rebuilt.columns:
+        rebuilt["Run Number"] = 1
+    if "Process Start" not in rebuilt.columns:
+        rebuilt["Process Start"] = pd.NaT
+    rebuilt["Run Number"] = pd.to_numeric(
+        rebuilt["Run Number"], errors="coerce"
+    ).fillna(1).astype(int)
+    return rebuilt
+
+
 def build_mixing_max_pressure_table(mixing_data):
     """Calculate directional maximum pressure for each extrusion cycle.
 
@@ -1088,22 +1132,49 @@ def create_mixing_pressure_plot(table, extruder, run_number, orifice, batch_numb
     ].sort_values("Cycle").copy()
 
     figure = go.Figure()
+
+    # Use a distinct visual nomenclature for every extrusion-orifice stage.
+    # This makes 5 mm and 1.5 mm immediately distinguishable in individual
+    # charts, legends, hover labels, screenshots, and combined HTML exports.
+    orifice_styles = {
+        "5 mm": {
+            "right_color": "#0057B8", "left_color": "#D62728",
+            "right_symbol": "circle", "left_symbol": "diamond",
+            "right_dash": "solid", "left_dash": "dash",
+        },
+        "3.8 mm": {
+            "right_color": "#2E8B57", "left_color": "#C2185B",
+            "right_symbol": "square", "left_symbol": "triangle-up",
+            "right_dash": "solid", "left_dash": "dot",
+        },
+        "2 mm": {
+            "right_color": "#008B8B", "left_color": "#8B4513",
+            "right_symbol": "cross", "left_symbol": "triangle-down",
+            "right_dash": "dashdot", "left_dash": "longdash",
+        },
+        "1.5 mm": {
+            "right_color": "#7030A0", "left_color": "#FF8C00",
+            "right_symbol": "star", "left_symbol": "hexagon",
+            "right_dash": "longdashdot", "left_dash": "dot",
+        },
+    }
+    style = orifice_styles.get(orifice, orifice_styles["5 mm"])
     series = [
         (
             "Max Pressure Left - Move Right (bar)",
-            "Loadcell Left Max - movement to accumulator right",
-            "#4F81BD", "diamond",
+            f"{orifice} | Loadcell Left Max | movement to accumulator right",
+            style["right_color"], style["right_symbol"], style["right_dash"],
             ["Move Right Start", "Move Right End", "Move Right Source Pages"],
         ),
         (
             "Max Pressure Right - Move Left (bar)",
-            "Loadcell Right Max - movement to accumulator left",
-            "#C0504D", "diamond",
+            f"{orifice} | Loadcell Right Max | movement to accumulator left",
+            style["left_color"], style["left_symbol"], style["left_dash"],
             ["Move Left Start", "Move Left End", "Move Left Source Pages"],
         ),
     ]
 
-    for column, name, color, symbol, detail_columns in series:
+    for column, name, color, symbol, dash, detail_columns in series:
         values = data.dropna(subset=[column]).copy()
         if values.empty:
             continue
@@ -1118,10 +1189,11 @@ def create_mixing_pressure_plot(table, extruder, run_number, orifice, batch_numb
             mode="lines+markers",
             name=name,
             customdata=custom.to_numpy(),
-            line={"color": color, "width": 2, "dash": "dash" if "Right Max" in name else "solid"},
+            line={"color": color, "width": 3, "dash": dash},
             marker={"color": color, "size": 9, "symbol": symbol},
             hovertemplate=(
                 f"<b>{name}</b><br>"
+                "Orifice: {orifice}<br>"
                 "Cycle: %{x}<br>"
                 "Maximum pressure: %{y:.2f} bar<br>"
                 "Movement start: %{customdata[0]}<br>"
@@ -1527,6 +1599,14 @@ def uploaded_report_fingerprint(file_name, pdf_bytes):
     return f"{safe_output_name(Path(file_name).stem)}_{digest}"
 
 def main():
+    if st.session_state.get("active_app_schema_version") != APP_SCHEMA_VERSION:
+        st.cache_data.clear()
+        st.session_state["active_app_schema_version"] = APP_SCHEMA_VERSION
+        st.session_state.pop("processed_selected_pdf_key", None)
+        st.session_state.pop("selected_pdf_signature", None)
+        st.session_state.pop("pdf_processing_status", None)
+        st.session_state.pop("pdf_processing_errors", None)
+
     st.title("🧪 Complete Batch Process Report Extractor")
     st.caption(
         "Upload and analyze one or more batch-cycle PDF reports. Each file is "
@@ -1885,24 +1965,23 @@ def main():
                 )
     with mixing_tab:
         st.markdown("#### Mixing Maximum Pressure by Extrusion Cycle")
-        if not mixing_pressure_table.empty and "Run Number" not in mixing_pressure_table.columns:
-            st.warning(
-                "An older cached Mixing table was detected and has been rebuilt using "
-                "the current split-run logic."
-            )
-            current_mixing_data = (
-                datalog[datalog["Stage"].eq("MIXING")].copy()
-                if not datalog.empty else pd.DataFrame()
-            )
-            current_mixing_data = assign_mixing_runs_from_summaries(
-                current_mixing_data, summaries
-            )
-            mixing_pressure_table = build_mixing_max_pressure_table(
-                current_mixing_data
+        original_mixing_columns = set(mixing_pressure_table.columns)
+        mixing_pressure_table = ensure_mixing_pressure_schema(
+            mixing_pressure_table, datalog, summaries
+        )
+        if (
+            original_mixing_columns
+            and "Run Number" not in original_mixing_columns
+            and not mixing_pressure_table.empty
+        ):
+            st.info(
+                "The Mixing table was automatically upgraded to separate repeated "
+                "Extruder runs."
             )
         st.caption(
             "For movement to accumulator right, the maximum left-loadcell pressure is used. "
             "For movement to accumulator left, the maximum right-loadcell pressure is used. "
+            "Each orifice has distinct legend wording, colours, marker symbols, and line styles. "
             "Cycle 0 is excluded."
         )
         if mixing_pressure_table.empty:
@@ -1912,12 +1991,22 @@ def main():
             selected_mixing_extruder = st.selectbox(
                 "Mixing extruder", mixing_extruders, key="mixing_plot_extruder"
             )
-            available_runs = sorted(
-                mixing_pressure_table.loc[
-                    mixing_pressure_table["Extruder"].eq(selected_mixing_extruder),
-                    "Run Number",
-                ].dropna().astype(int).unique()
+            run_series = mixing_pressure_table.get(
+                "Run Number",
+                pd.Series(1, index=mixing_pressure_table.index, dtype="int64"),
             )
+            available_runs = sorted(
+                pd.to_numeric(
+                    run_series[
+                        mixing_pressure_table["Extruder"].eq(
+                            selected_mixing_extruder
+                        )
+                    ],
+                    errors="coerce",
+                ).dropna().astype(int).unique()
+            )
+            if not available_runs:
+                available_runs = [1]
             selected_mixing_run = st.selectbox(
                 "Mixing run",
                 available_runs,
@@ -1998,7 +2087,7 @@ def main():
                     color = mixing_colors[mixing_style_index % len(mixing_colors)]
                     symbol = mixing_symbols[mixing_style_index % len(mixing_symbols)]
                     dash = mixing_dashes[mixing_style_index % len(mixing_dashes)]
-                    trace.name = f"{orifice} | {trace.name}"
+                    trace.name = trace.name
                     trace.line.color = color
                     trace.line.dash = dash
                     trace.line.width = 3
