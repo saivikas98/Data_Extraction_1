@@ -59,7 +59,7 @@ def duration_text(start, end):
 
 
 def extract_pages(pdf_bytes):
-    parser_version = "2026.10.30-mixing-1.5mm-extruder1-v29"
+    parser_version = "2026.10.30-mixing-split-runs-v30"
     _ = parser_version
     reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
     pages = []
@@ -78,8 +78,13 @@ def value_after_label(text, label):
 
 
 def identify_stage(text, suffix):
+    """Identify stage headings, including split-run suffixes such as [1/2]."""
     for stage in STAGES:
-        if re.search(rf"(?mi)^\s*{stage}\s+{suffix}\s*$", text):
+        pattern = (
+            rf"(?mi)^\s*{stage}\s+{suffix}"
+            rf"(?:\s*\[\s*\d+\s*/\s*\d+\s*\])?\s*$"
+        )
+        if re.search(pattern, text):
             return stage
     return None
 
@@ -162,8 +167,15 @@ def normalize_mixing_step_name(step_name):
 def parse_datalogs(pages, summaries):
     extracted_frames, diagnostic_rows, rejected_rows, process_ranges = [], [], [], []
     timestamp_start = re.compile(rf"^\s*({DATE})\s+({TIME})\s+")
-    for _, summary in summaries.sort_values("Source Page").reset_index(drop=True).iterrows():
+    ordered_summaries = summaries.sort_values("Source Page").reset_index(drop=True).copy()
+    if not ordered_summaries.empty:
+        ordered_summaries["Run Number"] = (
+            ordered_summaries.groupby(["Stage", "Extruder"], dropna=False).cumcount() + 1
+        )
+    for _, summary in ordered_summaries.iterrows():
         stage, machine, extruder = summary["Stage"], summary["Machine"], summary["Extruder"]
+        run_number = int(summary.get("Run Number", 1))
+        process_start = summary.get("Process start")
         summary_page, expected = int(summary["Source Page"]), len(DATALOG_COLUMNS[stage])
         row_pattern = re.compile(rf"^\s*({DATE})\s+({TIME})\s+(.+?)\s+((?:\S+\s+){{{expected - 1}}}\S+)\s*$")
         started = False; first_page = None; last_page = None; run_frames = []
@@ -197,7 +209,7 @@ def parse_datalogs(pages, summaries):
                     normalize_mixing_step_name(raw_step_name)
                     if stage == "MIXING" else raw_step_name
                 )
-                record = {"Stage": stage, "Machine": machine, "Extruder": extruder, "Date & Time": parse_dt(f"{match.group(1)} {match.group(2)}"), "Step Name": corrected_step_name, "Source Page": page_number, "Source Line": line_number}
+                record = {"Stage": stage, "Machine": machine, "Extruder": extruder, "Run Number": run_number, "Process Start": process_start, "Date & Time": parse_dt(f"{match.group(1)} {match.group(2)}"), "Step Name": corrected_step_name, "Source Page": page_number, "Source Line": line_number}
                 record.update(dict(zip(DATALOG_COLUMNS[stage], values))); records.append(record)
                 normalized = re.sub(r"\s+", " ", record["Step Name"]).strip().casefold()
                 if stage == "BLENDING" and normalized in {"blending is done", "blending is completed", "blending completed"}:
@@ -209,7 +221,7 @@ def parse_datalogs(pages, summaries):
         if run_frames: extracted_frames.append(pd.concat(run_frames, ignore_index=True))
     datalog = pd.concat(extracted_frames, ignore_index=True).drop_duplicates().sort_values(["Stage", "Extruder", "Source Page", "Source Line"], kind="stable").reset_index(drop=True) if extracted_frames else pd.DataFrame()
     if not datalog.empty:
-        preferred = ["Stage", "Machine", "Extruder", "Date & Time", "Step Name", "Source Page", "Source Line"]
+        preferred = ["Stage", "Machine", "Extruder", "Run Number", "Process Start", "Date & Time", "Step Name", "Source Page", "Source Line"]
         datalog = datalog[preferred + [c for c in datalog.columns if c not in preferred]]
     return datalog, pd.DataFrame(diagnostic_rows), pd.DataFrame(rejected_rows), pd.DataFrame(process_ranges)
 
@@ -756,7 +768,7 @@ def build_mixing_max_pressure_table(mixing_data):
     Cycle 0 is excluded because it represents initialization rather than a completed cycle.
     """
     columns = [
-        "Extruder", "Orifice", "Cycle",
+        "Extruder", "Run Number", "Process Start", "Orifice", "Cycle",
         "Max Pressure Left - Move Right (bar)",
         "Max Pressure Right - Move Left (bar)",
         "Move Right Start", "Move Right End",
@@ -786,7 +798,15 @@ def build_mixing_max_pressure_table(mixing_data):
     }
     output = []
 
-    for extruder, extruder_data in work.groupby("Extruder", sort=True):
+    if "Run Number" not in work.columns:
+        work["Run Number"] = 1
+    if "Process Start" not in work.columns:
+        work["Process Start"] = pd.NaT
+
+    for (extruder, run_number), extruder_data in work.groupby(
+        ["Extruder", "Run Number"], sort=True, dropna=False
+    ):
+        process_start = extruder_data["Process Start"].dropna().min()
         for orifice, pattern in patterns.items():
             stage_data = extruder_data[
                 extruder_data["Normalized Step"].str.contains(pattern, regex=True, na=False)
@@ -805,6 +825,8 @@ def build_mixing_max_pressure_table(mixing_data):
 
                 output.append({
                     "Extruder": int(extruder),
+                    "Run Number": int(run_number) if pd.notna(run_number) else 1,
+                    "Process Start": process_start,
                     "Orifice": orifice,
                     "Cycle": int(cycle),
                     "Max Pressure Left - Move Right (bar)": (
@@ -837,7 +859,7 @@ def build_mixing_max_pressure_table(mixing_data):
         "Max Pressure Right - Move Left (bar)",
     ]
     result[pressure_columns] = result[pressure_columns].apply(pd.to_numeric, errors="coerce")
-    return result.sort_values(["Extruder", "Orifice", "Cycle"]).reset_index(drop=True)
+    return result.sort_values(["Extruder", "Run Number", "Orifice", "Cycle"]).reset_index(drop=True)
 
 
 
@@ -1023,10 +1045,12 @@ def create_blending_pressure_plot(table, extruder, phase, batch_number):
     )
     return figure
 
-def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
+def create_mixing_pressure_plot(table, extruder, run_number, orifice, batch_number):
     """Create an interactive maximum-pressure-by-cycle chart."""
     data = table[
-        table["Extruder"].eq(extruder) & table["Orifice"].eq(orifice)
+        table["Extruder"].eq(extruder)
+        & table["Run Number"].eq(run_number)
+        & table["Orifice"].eq(orifice)
     ].sort_values("Cycle").copy()
 
     figure = go.Figure()
@@ -1082,7 +1106,7 @@ def create_mixing_pressure_plot(table, extruder, orifice, batch_number):
 
     figure.update_layout(
         title={
-            "text": f"{batch_number}<br>EXTRUDER - {int(extruder)} | MIXING: Extrusion {orifice} cycles",
+            "text": f"{batch_number}<br>EXTRUDER - {int(extruder)} | RUN {int(run_number)} | MIXING: Extrusion {orifice} cycles",
             "x": 0.5,
             "xanchor": "center",
         },
@@ -1831,11 +1855,24 @@ def main():
             selected_mixing_extruder = st.selectbox(
                 "Mixing extruder", mixing_extruders, key="mixing_plot_extruder"
             )
+            available_runs = sorted(
+                mixing_pressure_table.loc[
+                    mixing_pressure_table["Extruder"].eq(selected_mixing_extruder),
+                    "Run Number",
+                ].dropna().astype(int).unique()
+            )
+            selected_mixing_run = st.selectbox(
+                "Mixing run",
+                available_runs,
+                format_func=lambda value: f"Run {value}",
+                key="mixing_plot_run",
+            )
             available_orifices = [
                 item for item in ["5 mm", "3.8 mm", "2 mm", "1.5 mm"]
                 if item in set(
                     mixing_pressure_table.loc[
-                        mixing_pressure_table["Extruder"].eq(selected_mixing_extruder),
+                        mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
+                        & mixing_pressure_table["Run Number"].eq(selected_mixing_run),
                         "Orifice",
                     ]
                 )
@@ -1847,6 +1884,7 @@ def main():
             )
             mixing_view = mixing_pressure_table[
                 mixing_pressure_table["Extruder"].eq(selected_mixing_extruder)
+                & mixing_pressure_table["Run Number"].eq(selected_mixing_run)
                 & mixing_pressure_table["Orifice"].isin(selected_orifices)
             ].copy()
             st.dataframe(
@@ -1861,6 +1899,7 @@ def main():
                 mixing_figure = create_mixing_pressure_plot(
                     mixing_pressure_table,
                     selected_mixing_extruder,
+                    selected_mixing_run,
                     orifice,
                     batch_number_for_mixing,
                 )
@@ -1875,14 +1914,14 @@ def main():
                             "format": "png",
                             "filename": (
                                 f"{batch_number_for_mixing}_extruder_"
-                                f"{selected_mixing_extruder}_{orifice.replace(' ', '_')}_max_pressure"
+                                f"{selected_mixing_extruder}_run_{selected_mixing_run}_{orifice.replace(' ', '_')}_max_pressure"
                             ),
                             "height": 620,
                             "width": 1200,
                             "scale": 2,
                         },
                     },
-                    key=f"mixing_chart_{selected_mixing_extruder}_{orifice}",
+                    key=f"mixing_chart_{selected_mixing_extruder}_{selected_mixing_run}_{orifice}",
                 )
 
             mixing_html_figure = go.Figure()
@@ -1894,6 +1933,7 @@ def main():
                 source_figure = create_mixing_pressure_plot(
                     mixing_pressure_table,
                     selected_mixing_extruder,
+                    selected_mixing_run,
                     orifice,
                     batch_number_for_mixing,
                 )
@@ -1911,7 +1951,7 @@ def main():
                     mixing_html_figure.add_trace(trace)
                     mixing_style_index += 1
             mixing_html_figure.update_layout(
-                title=f"{batch_number_for_mixing} | Extruder {selected_mixing_extruder} | Mixing Max Pressure",
+                title=f"{batch_number_for_mixing} | Extruder {selected_mixing_extruder} | Run {selected_mixing_run} | Mixing Max Pressure",
                 xaxis_title="<b>Cycles</b>", yaxis_title="<b>Maximum Pressure (bar)</b>",
                 xaxis={"showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
                 yaxis={"showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
@@ -1922,11 +1962,11 @@ def main():
             m1.download_button(
                 "Download Mixing Max-Pressure Table CSV",
                 mixing_view.to_csv(index=False).encode("utf-8"),
-                f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_mixing_max_pressure.csv",
+                f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_run_{selected_mixing_run}_mixing_max_pressure.csv",
                 "text/csv",
             )
             mixing_html_key = (
-                f"generated_html_mixing_{selected_label}_{selected_mixing_extruder}_"
+                f"generated_html_mixing_{selected_label}_{selected_mixing_extruder}_{selected_mixing_run}_"
                 f"{'_'.join(selected_orifices)}"
             )
             if m2.button("Prepare Interactive Mixing HTML", key=f"prepare_{mixing_html_key}"):
@@ -1938,7 +1978,7 @@ def main():
                 m2.download_button(
                     "Download Interactive Mixing Plot HTML",
                     st.session_state[mixing_html_key],
-                    f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_mixing_max_pressure.html",
+                    f"{batch_number_for_mixing}_extruder_{selected_mixing_extruder}_run_{selected_mixing_run}_mixing_max_pressure.html",
                     "text/html",
                     key=f"download_{mixing_html_key}",
                 )
