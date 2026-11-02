@@ -25,7 +25,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.11.02-premixing-values-from-recipe-v45"
+APP_SCHEMA_VERSION = "2026.11.02-premixing-coherent-profile-v46"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -725,11 +725,12 @@ def predict_premixing_pressure_level(actual_pressure):
 
 
 def get_premixing_recipe_values(settings):
-    """Read Premixing control values directly from extracted recipe settings.
+    """Read one coherent Premixing recipe profile from extracted settings.
 
-    One value is selected per parameter. If repeated Premixing settings disagree
-    across extruders or runs, processing stops rather than silently mixing
-    different recipes.
+    Large reports may contain multiple Premixing runs with different recipes.
+    Values are therefore selected from one recipe-settings source page, never
+    mixed across pages. The latest complete profile is used because it
+    represents the most recent Premixing run in the report.
     """
     defaults = {
         "volume_step_ml": PREMIXING_VOLUME_STEP_ML,
@@ -737,69 +738,134 @@ def get_premixing_recipe_values(settings):
         "repeat_cycles": PREMIXING_REPEAT_CYCLES,
     }
     if settings.empty:
-        return {**defaults, "source": "Code defaults: recipe settings unavailable"}
+        return {
+            **defaults,
+            "source": "Code defaults: recipe settings unavailable",
+            "selection_warning": "",
+            "available_profiles": [],
+        }
 
-    premix = settings[settings["Stage"].astype(str).str.upper().eq("PREMIXING")].copy()
+    premix = settings[
+        settings["Stage"].astype(str).str.upper().eq("PREMIXING")
+    ].copy()
     if premix.empty:
-        return {**defaults, "source": "Code defaults: Premixing settings unavailable"}
+        return {
+            **defaults,
+            "source": "Code defaults: Premixing settings unavailable",
+            "selection_warning": "",
+            "available_profiles": [],
+        }
 
-    normalized_parameter = (
+    premix["Normalized Parameter"] = (
         premix["Parameter"].astype(str)
         .str.replace(r"\s+", " ", regex=True)
         .str.strip()
         .str.casefold()
     )
-
     parameter_patterns = {
         "volume_step_ml": r"^volume step size$",
         "pressure_step_bar": r"^pressure step size$",
         "repeat_cycles": r"^repeat cycle(?:s)?$",
     }
-    values = {}
-    source_pages = []
-    missing = []
-    for output_name, pattern in parameter_patterns.items():
-        rows = premix[normalized_parameter.str.match(pattern, na=False)].copy()
-        numeric = pd.to_numeric(rows.get("Set Value"), errors="coerce").dropna()
-        unique_values = sorted(numeric.unique().tolist())
-        if not unique_values:
-            missing.append(output_name)
-            continue
-        if len(unique_values) > 1:
-            raise ValueError(
-                f"Conflicting Premixing recipe values for {output_name}: "
-                f"{unique_values}. Process files/runs separately or align the recipe."
-            )
-        values[output_name] = float(unique_values[0])
-        if "Source Page" in rows.columns:
-            source_pages.extend(rows["Source Page"].dropna().astype(int).tolist())
 
-    if missing:
-        readable = ", ".join(missing)
+    # Build complete profiles independently per recipe source page and machine.
+    profile_group_columns = ["Source Page"]
+    if "Extruder" in premix.columns:
+        profile_group_columns.append("Extruder")
+    if "Machine" in premix.columns:
+        profile_group_columns.append("Machine")
+
+    available_profiles = []
+    for group_key, profile_rows in premix.groupby(
+        profile_group_columns, dropna=False, sort=True
+    ):
+        profile = {}
+        for output_name, pattern in parameter_patterns.items():
+            matching = profile_rows[
+                profile_rows["Normalized Parameter"].str.match(pattern, na=False)
+            ]
+            numeric = pd.to_numeric(
+                matching.get("Set Value"), errors="coerce"
+            ).dropna()
+            if not numeric.empty:
+                profile[output_name] = float(numeric.iloc[-1])
+
+        if set(parameter_patterns).issubset(profile):
+            source_page = int(profile_rows["Source Page"].dropna().iloc[0])
+            extruder = (
+                profile_rows["Extruder"].dropna().iloc[0]
+                if "Extruder" in profile_rows.columns
+                and not profile_rows["Extruder"].dropna().empty
+                else None
+            )
+            machine = (
+                str(profile_rows["Machine"].dropna().iloc[0])
+                if "Machine" in profile_rows.columns
+                and not profile_rows["Machine"].dropna().empty
+                else ""
+            )
+            available_profiles.append({
+                **profile,
+                "source_page": source_page,
+                "extruder": int(extruder) if pd.notna(extruder) else None,
+                "machine": machine,
+            })
+
+    if not available_profiles:
         raise ValueError(
-            "Required Premixing recipe setting(s) not found: " + readable
+            "No complete Premixing recipe profile contains Volume step size, "
+            "Pressure step size, and Repeat cycle on the same recipe page."
         )
 
-    repeat_cycles = int(round(values["repeat_cycles"]))
+    # Use the latest complete profile, preserving all parameters from that one
+    # recipe instead of combining 5.0 mL from one run with 16.5 mL from another.
+    selected = max(
+        available_profiles,
+        key=lambda item: (item["source_page"], item.get("extruder") or 0),
+    )
+
+    repeat_cycles = int(round(selected["repeat_cycles"]))
     if repeat_cycles < 1 or not math.isclose(
-        values["repeat_cycles"], repeat_cycles, abs_tol=1e-9
+        selected["repeat_cycles"], repeat_cycles, abs_tol=1e-9
     ):
         raise ValueError(
             f"Repeat cycle must be a positive whole number; found "
-            f"{values['repeat_cycles']}."
+            f"{selected['repeat_cycles']} on page {selected['source_page']}."
         )
-    if values["volume_step_ml"] <= 0 or values["pressure_step_bar"] <= 0:
-        raise ValueError("Premixing volume and pressure step sizes must be positive.")
+    if selected["volume_step_ml"] <= 0 or selected["pressure_step_bar"] <= 0:
+        raise ValueError(
+            "Premixing volume and pressure step sizes must be positive."
+        )
+
+    unique_volume_values = sorted({
+        profile["volume_step_ml"] for profile in available_profiles
+    })
+    selection_warning = ""
+    if len(available_profiles) > 1:
+        profile_text = "; ".join(
+            f"page {profile['source_page']}: "
+            f"volume={profile['volume_step_ml']:g} mL, "
+            f"pressure={profile['pressure_step_bar']:g} bar, "
+            f"repeat={int(round(profile['repeat_cycles']))}"
+            for profile in available_profiles
+        )
+        selection_warning = (
+            "Multiple complete Premixing recipe profiles were found. "
+            f"The latest complete profile on page {selected['source_page']} was "
+            f"used. Profiles: {profile_text}"
+        )
 
     return {
-        "volume_step_ml": float(values["volume_step_ml"]),
-        "pressure_step_bar": float(values["pressure_step_bar"]),
+        "volume_step_ml": float(selected["volume_step_ml"]),
+        "pressure_step_bar": float(selected["pressure_step_bar"]),
         "repeat_cycles": repeat_cycles,
         "source": (
-            "Extracted Premixing recipe settings"
-            + (f" | page(s): {', '.join(map(str, sorted(set(source_pages))))}"
-               if source_pages else "")
+            "Extracted from one complete Premixing recipe profile | "
+            f"page {selected['source_page']}"
+            + (f" | {selected['machine']}" if selected.get("machine") else "")
         ),
+        "selection_warning": selection_warning,
+        "available_profiles": available_profiles,
     }
 
 
@@ -2543,6 +2609,14 @@ def main():
     recipe_col2.metric("Pressure step size", f"{recipe_values['pressure_step_bar']:g} bar")
     recipe_col3.metric("Repeat cycle", f"{recipe_values['repeat_cycles']}")
     st.caption(recipe_values["source"])
+    if recipe_values.get("selection_warning"):
+        st.warning(recipe_values["selection_warning"])
+        with st.expander("Available Premixing recipe profiles"):
+            st.dataframe(
+                pd.DataFrame(recipe_values.get("available_profiles", [])),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     selected_result_key = st.session_state["processed_selected_pdf_key"]
     pages = selected_result["pages"]
