@@ -25,7 +25,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.10.30-session-result-no-reprocess-v43"
+APP_SCHEMA_VERSION = "2026.11.02-premixing-values-from-recipe-v45"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -724,6 +724,85 @@ def predict_premixing_pressure_level(actual_pressure):
     return step_number, target
 
 
+def get_premixing_recipe_values(settings):
+    """Read Premixing control values directly from extracted recipe settings.
+
+    One value is selected per parameter. If repeated Premixing settings disagree
+    across extruders or runs, processing stops rather than silently mixing
+    different recipes.
+    """
+    defaults = {
+        "volume_step_ml": PREMIXING_VOLUME_STEP_ML,
+        "pressure_step_bar": PREMIXING_PRESSURE_STEP_BAR,
+        "repeat_cycles": PREMIXING_REPEAT_CYCLES,
+    }
+    if settings.empty:
+        return {**defaults, "source": "Code defaults: recipe settings unavailable"}
+
+    premix = settings[settings["Stage"].astype(str).str.upper().eq("PREMIXING")].copy()
+    if premix.empty:
+        return {**defaults, "source": "Code defaults: Premixing settings unavailable"}
+
+    normalized_parameter = (
+        premix["Parameter"].astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.casefold()
+    )
+
+    parameter_patterns = {
+        "volume_step_ml": r"^volume step size$",
+        "pressure_step_bar": r"^pressure step size$",
+        "repeat_cycles": r"^repeat cycle(?:s)?$",
+    }
+    values = {}
+    source_pages = []
+    missing = []
+    for output_name, pattern in parameter_patterns.items():
+        rows = premix[normalized_parameter.str.match(pattern, na=False)].copy()
+        numeric = pd.to_numeric(rows.get("Set Value"), errors="coerce").dropna()
+        unique_values = sorted(numeric.unique().tolist())
+        if not unique_values:
+            missing.append(output_name)
+            continue
+        if len(unique_values) > 1:
+            raise ValueError(
+                f"Conflicting Premixing recipe values for {output_name}: "
+                f"{unique_values}. Process files/runs separately or align the recipe."
+            )
+        values[output_name] = float(unique_values[0])
+        if "Source Page" in rows.columns:
+            source_pages.extend(rows["Source Page"].dropna().astype(int).tolist())
+
+    if missing:
+        readable = ", ".join(missing)
+        raise ValueError(
+            "Required Premixing recipe setting(s) not found: " + readable
+        )
+
+    repeat_cycles = int(round(values["repeat_cycles"]))
+    if repeat_cycles < 1 or not math.isclose(
+        values["repeat_cycles"], repeat_cycles, abs_tol=1e-9
+    ):
+        raise ValueError(
+            f"Repeat cycle must be a positive whole number; found "
+            f"{values['repeat_cycles']}."
+        )
+    if values["volume_step_ml"] <= 0 or values["pressure_step_bar"] <= 0:
+        raise ValueError("Premixing volume and pressure step sizes must be positive.")
+
+    return {
+        "volume_step_ml": float(values["volume_step_ml"]),
+        "pressure_step_bar": float(values["pressure_step_bar"]),
+        "repeat_cycles": repeat_cycles,
+        "source": (
+            "Extracted Premixing recipe settings"
+            + (f" | page(s): {', '.join(map(str, sorted(set(source_pages))))}"
+               if source_pages else "")
+        ),
+    }
+
+
 def normalize_premixing_pressure(actual_pressure):
     """Normalize pressure: decimal <= 0.5 rounds down; > 0.5 rounds up."""
     if pd.isna(actual_pressure):
@@ -740,38 +819,52 @@ def expected_premixing_left_volume(volume_step_ml, step_volume_ml):
     return 2 * float(volume_step_ml) - float(step_volume_ml)
 
 
-def premixing_recipe_pressure_step(actual_pressure):
+def premixing_recipe_pressure_step(actual_pressure, pressure_step_bar):
     """Map the actual maximum pressure to the nearest 15-bar recipe step."""
     if pd.isna(actual_pressure):
         return np.nan
     normalized = normalize_premixing_pressure(actual_pressure)
     if normalized <= 0:
         return 0.0
+    pressure_step_bar = float(pressure_step_bar)
+    if pressure_step_bar <= 0:
+        raise ValueError("Premixing pressure step must be greater than 0 bar.")
     step_number = max(1, int(np.floor(
-        (normalized + PREMIXING_PRESSURE_STEP_BAR / 2)
-        / PREMIXING_PRESSURE_STEP_BAR
+        (normalized + pressure_step_bar / 2)
+        / pressure_step_bar
     )))
     return float(min(
-        step_number * PREMIXING_PRESSURE_STEP_BAR,
+        step_number * pressure_step_bar,
         PREMIXING_MAX_PRESSURE_BAR,
     ))
 
 
-def reverse_predict_premixing_volume_step(paired_attempts, step_volume_ml=PREMIXING_VOLUME_STEP_ML):
+def reverse_predict_premixing_volume_step(
+    paired_attempts,
+    step_volume_ml=PREMIXING_VOLUME_STEP_ML,
+    pressure_step_bar=PREMIXING_PRESSURE_STEP_BAR,
+    repeat_cycles=PREMIXING_REPEAT_CYCLES,
+):
     """Reconstruct volume step using cycle, normalized pressure, and left volume."""
     if paired_attempts.empty:
         return pd.DataFrame()
 
     step_volume_ml = float(step_volume_ml)
+    pressure_step_bar = float(pressure_step_bar)
+    repeat_cycles = int(repeat_cycles)
     if step_volume_ml <= 0:
         raise ValueError("Premixing step volume must be greater than 0 mL.")
+    if pressure_step_bar <= 0:
+        raise ValueError("Premixing pressure step must be greater than 0 bar.")
+    if repeat_cycles < 1:
+        raise ValueError("Premixing repeat cycle must be at least 1.")
 
     output = []
     for extruder, attempts in paired_attempts.groupby("Extruder", sort=True):
         volume_step_number = 1
         volume_step_size = step_volume_ml
-        highest_normalized_pressure = int(PREMIXING_PRESSURE_STEP_BAR)
-        established_recipe_pressure = PREMIXING_PRESSURE_STEP_BAR
+        highest_normalized_pressure = float(pressure_step_bar)
+        established_recipe_pressure = float(pressure_step_bar)
         previous_cycle = None
 
         ordered = attempts.sort_values("Start Date & Time", kind="stable")
@@ -787,7 +880,7 @@ def reverse_predict_premixing_volume_step(paired_attempts, step_volume_ml=PREMIX
                 pd.notna(normalized_pressure)
                 and normalized_pressure > previous_highest
             )
-            inferred_recipe_pressure = premixing_recipe_pressure_step(actual_pressure)
+            inferred_recipe_pressure = premixing_recipe_pressure_step(actual_pressure, pressure_step_bar)
             if pd.notna(inferred_recipe_pressure):
                 established_recipe_pressure = max(
                     established_recipe_pressure, inferred_recipe_pressure
@@ -812,7 +905,7 @@ def reverse_predict_premixing_volume_step(paired_attempts, step_volume_ml=PREMIX
                 rule = "Initial volume step"
             elif current_cycle is not None and previous_cycle is not None and current_cycle > previous_cycle:
                 rule = "Same volume step: higher cycle repeat attempt"
-            elif previous_cycle == PREMIXING_REPEAT_CYCLES and current_cycle == 1:
+            elif previous_cycle == repeat_cycles and current_cycle == 1:
                 if pressure_increased:
                     rule = "Same volume step: Cycle 3 to 1 pressure increase"
                 elif pushed_volume_within_target:
@@ -840,6 +933,8 @@ def reverse_predict_premixing_volume_step(paired_attempts, step_volume_ml=PREMIX
                 "Volume step size (mL)": volume_step_size,
                 "Volume Step Number": volume_step_number,
                 "Selected Premixing Step Volume (mL)": step_volume_ml,
+                "Selected Pressure Step (bar)": pressure_step_bar,
+                "Selected Repeat Cycles": repeat_cycles,
                 "Volume Step Rule": rule,
                 "Actual Maximum Pressure (bar)": actual_pressure,
                 "Normalized Maximum Pressure (bar)": normalized_pressure,
@@ -892,6 +987,7 @@ def build_premixing_volume_step_summary(prediction):
 def create_premixing_volume_step_plot(
     summary, extruder, batch_number, pressure_mode="Actual Max Pressure",
     step_volume_ml=PREMIXING_VOLUME_STEP_ML,
+    pressure_step_bar=PREMIXING_PRESSURE_STEP_BAR,
 ):
     """Create Premixing pressure/attempt plot with fixed 0-198 mL x-axis."""
     data = summary[summary["Extruder"].eq(extruder)].sort_values(
@@ -962,7 +1058,7 @@ def create_premixing_volume_step_plot(
                "range": [0, float(step_volume_ml) * 12], "dtick": float(step_volume_ml),
                "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
         yaxis={"title": {"text": "<b>PRESSURE (bar)</b>", "standoff": 12},
-               "range": [0, 200], "dtick": 15 if pressure_mode == "Pressure Step" else 20,
+               "range": [0, 200], "dtick": float(pressure_step_bar) if pressure_mode == "Pressure Step" else 20,
                "showgrid": True, "gridcolor": "#C7C7C7", "gridwidth": 1, },
         yaxis2={"title": {"text": "<b>ATTEMPTS</b>", "standoff": 12},
                 "overlaying": "y", "side": "right",
@@ -1561,30 +1657,106 @@ def figure_to_png(fig):
     buffer = io.BytesIO(); fig.savefig(buffer, format="png", dpi=200, bbox_inches="tight"); return buffer.getvalue()
 
 
+def _hex_to_rgba(hex_color, opacity):
+    """Convert #RRGGBB to an rgba() string accepted by Plotly."""
+    color = str(hex_color).lstrip("#")
+    if len(color) != 6:
+        color = "FFFFFF"
+    red, green, blue = (int(color[index:index + 2], 16) for index in (0, 2, 4))
+    return f"rgba({red},{green},{blue},{float(opacity):.3f})"
+
+
+def _legend_layout_from_state(font_family, default_font_size):
+    """Translate sidebar controls into Plotly legend layout properties."""
+    preset = st.session_state.get("legend_box_preset", "Horizontal rectangle")
+    position = st.session_state.get("legend_position_preset", "Bottom center")
+    orientation = (
+        "h" if st.session_state.get("legend_orientation", "Horizontal")
+        == "Horizontal" else "v"
+    )
+    width = int(st.session_state.get("legend_box_width", 520))
+    height_percent = int(st.session_state.get("legend_box_height_percent", 35))
+
+    preset_values = {
+        "Horizontal rectangle": ("h", 520, 35),
+        "Vertical rectangle": ("v", 240, 70),
+        "Compact square": ("v", 260, 45),
+        "Wide rectangle": ("h", 900, 28),
+    }
+    if preset in preset_values:
+        orientation, width, height_percent = preset_values[preset]
+
+    positions = {
+        "Bottom center": (0.5, -0.20, "center", "top"),
+        "Top center": (0.5, 1.02, "center", "bottom"),
+        "Right": (1.02, 0.5, "left", "middle"),
+        "Left": (-0.02, 0.5, "right", "middle"),
+    }
+    if position == "Custom":
+        x_value = float(st.session_state.get("legend_custom_x", 0.5))
+        y_value = float(st.session_state.get("legend_custom_y", -0.20))
+        x_anchor, y_anchor = "center", "top"
+    else:
+        x_value, y_value, x_anchor, y_anchor = positions[position]
+
+    background = _hex_to_rgba(
+        st.session_state.get("legend_background_color", "#FFFFFF"),
+        st.session_state.get("legend_background_opacity", 0.90),
+    )
+    legend = {
+        "visible": bool(st.session_state.get("legend_visible", True)),
+        "orientation": orientation,
+        "x": x_value,
+        "y": y_value,
+        "xanchor": x_anchor,
+        "yanchor": y_anchor,
+        "bgcolor": background,
+        "bordercolor": st.session_state.get("legend_border_color", "#000000"),
+        "borderwidth": float(st.session_state.get("legend_border_width", 1.0)),
+        "font": {
+            "family": font_family,
+            "size": int(st.session_state.get("legend_font_size", default_font_size)),
+            "color": "#000000",
+        },
+        "maxheight": max(0.10, min(1.0, height_percent / 100.0)),
+        "itemsizing": "constant",
+        "tracegroupgap": 6,
+    }
+    if orientation == "h":
+        legend["entrywidth"] = max(40, width // 3)
+        legend["entrywidthmode"] = "pixels"
+    return legend
+
+
 def apply_graph_style(figure, font_family="Times New Roman", font_size=12):
-    """Apply typography, remove grids, and draw the inner plot border."""
+    """Apply typography, grids, borders, and Excel-style legend settings."""
     size = int(font_size)
     figure.update_layout(
         font={"family": font_family, "size": size, "color": "#000000"},
         title_font={"family": font_family, "size": size, "color": "#000000"},
-        legend_font={"family": font_family, "size": size, "color": "#000000"},
         paper_bgcolor="white", plot_bgcolor="white",
+        showlegend=bool(st.session_state.get("legend_visible", True)),
+        legend=_legend_layout_from_state(font_family, size),
     )
-    figure.update_xaxes(showgrid=True, gridcolor="#C7C7C7", gridwidth=1,
+    figure.update_xaxes(
+        showgrid=True, gridcolor="#C7C7C7", gridwidth=1,
         showline=True, mirror=True, linewidth=1.5,
         linecolor="#000000", ticks="outside",
         tickfont={"family": font_family, "size": size, "color": "#000000"},
-        title_font={"family": font_family, "size": size, "color": "#000000"})
-    figure.update_yaxes(showgrid=True, gridcolor="#C7C7C7", gridwidth=1,
+        title_font={"family": font_family, "size": size, "color": "#000000"},
+    )
+    figure.update_yaxes(
+        showgrid=True, gridcolor="#C7C7C7", gridwidth=1,
         showline=True, mirror=True, linewidth=1.5,
         linecolor="#000000", ticks="outside",
         tickfont={"family": font_family, "size": size, "color": "#000000"},
-        title_font={"family": font_family, "size": size, "color": "#000000"})
+        title_font={"family": font_family, "size": size, "color": "#000000"},
+    )
     return figure
 
 
 def graph_display_controls():
-    """Sidebar font controls shared by every graph."""
+    """Sidebar controls shared by every graph, including Excel-style legends."""
     with st.sidebar:
         st.markdown("### Application Controls")
         if st.button("Clear processed reports and cache", use_container_width=True):
@@ -1595,25 +1767,107 @@ def graph_display_controls():
             for state_key in list(st.session_state):
                 if state_key.startswith(generated_prefixes):
                     del st.session_state[state_key]
-            st.session_state.pop("active_upload_signature", None)
-            st.session_state.pop("pdf_processing_status", None)
-            st.session_state.pop("pdf_processing_errors", None)
-            st.session_state.pop("processed_selected_pdf_key", None)
-            st.session_state.pop("processed_selected_result", None)
-            st.session_state.pop("selected_pdf_signature", None)
+            for state_key in (
+                "active_upload_signature", "pdf_processing_status",
+                "pdf_processing_errors", "processed_selected_pdf_key",
+                "processed_selected_result", "selected_pdf_signature",
+            ):
+                st.session_state.pop(state_key, None)
             gc.collect()
             st.rerun()
         st.caption(
             "Use this before uploading a completely new report set if the app "
             "becomes slow."
         )
+
         st.markdown("### Graph Controls")
-        family = st.selectbox("Graph font", ["Times New Roman", "Arial", "Calibri", "Georgia"], index=0, key="graph_font_family")
-        preset = st.selectbox("Graph font size", ["10 pt", "12 pt", "14 pt", "16 pt", "18 pt", "20 pt", "Custom"], index=1, key="graph_font_size_preset")
+        family = st.selectbox(
+            "Graph font",
+            ["Times New Roman", "Arial", "Calibri", "Georgia"],
+            index=0,
+            key="graph_font_family",
+        )
+        preset = st.selectbox(
+            "Graph font size",
+            ["10 pt", "12 pt", "14 pt", "16 pt", "18 pt", "20 pt", "Custom"],
+            index=1,
+            key="graph_font_size_preset",
+        )
         if preset == "Custom":
-            size = int(st.number_input("Custom font size", min_value=8, max_value=30, value=12, step=1, key="graph_custom_font_size"))
+            size = int(st.number_input(
+                "Custom font size", min_value=8, max_value=30,
+                value=12, step=1, key="graph_custom_font_size",
+            ))
         else:
             size = int(preset.split()[0])
+
+        with st.expander("Legend Box Controls", expanded=False):
+            st.selectbox(
+                "Legend box preset",
+                [
+                    "Horizontal rectangle", "Vertical rectangle",
+                    "Compact square", "Wide rectangle", "Custom",
+                ],
+                index=0,
+                key="legend_box_preset",
+            )
+            st.selectbox(
+                "Legend position",
+                ["Bottom center", "Top center", "Right", "Left", "Custom"],
+                index=0,
+                key="legend_position_preset",
+            )
+            st.radio(
+                "Legend orientation",
+                ["Horizontal", "Vertical"],
+                horizontal=True,
+                key="legend_orientation",
+            )
+            legend_col1, legend_col2 = st.columns(2)
+            legend_col1.number_input(
+                "Custom X", min_value=-1.0, max_value=2.0,
+                value=0.5, step=0.05, key="legend_custom_x",
+            )
+            legend_col2.number_input(
+                "Custom Y", min_value=-1.0, max_value=2.0,
+                value=-0.20, step=0.05, key="legend_custom_y",
+            )
+            size_col1, size_col2 = st.columns(2)
+            size_col1.number_input(
+                "Box width (px)", min_value=80, max_value=1200,
+                value=520, step=20, key="legend_box_width",
+            )
+            size_col2.number_input(
+                "Box height (%)", min_value=10, max_value=100,
+                value=35, step=5, key="legend_box_height_percent",
+            )
+            style_col1, style_col2 = st.columns(2)
+            style_col1.number_input(
+                "Border width", min_value=0.0, max_value=10.0,
+                value=1.0, step=0.5, key="legend_border_width",
+            )
+            style_col2.number_input(
+                "Legend font size", min_value=8, max_value=30,
+                value=12, step=1, key="legend_font_size",
+            )
+            color_col1, color_col2 = st.columns(2)
+            color_col1.color_picker(
+                "Background", value="#FFFFFF", key="legend_background_color",
+            )
+            color_col2.color_picker(
+                "Border", value="#000000", key="legend_border_color",
+            )
+            st.slider(
+                "Background opacity", min_value=0.0, max_value=1.0,
+                value=0.90, step=0.05, key="legend_background_opacity",
+            )
+            st.checkbox(
+                "Show legend", value=True, key="legend_visible",
+            )
+            st.caption(
+                "Custom X/Y, width, and height work like Excel legend-box sizing. "
+                "Downloaded interactive HTML also contains independent legend controls."
+            )
     return family, size
 
 
@@ -1642,6 +1896,7 @@ body { margin:0; background:#fff; font-family:'Times New Roman',serif; }
 #editable_plot { margin:10px 20px 20px 20px; border:2px solid #000; box-sizing:border-box; }
 .editor_field { display:flex; flex-direction:column; gap:2px; }
 .grid_option { display:flex; align-items:center; gap:5px; padding-bottom:5px; }
+.legend_controls { border-left:3px solid #555; padding-left:10px; display:flex; flex-wrap:wrap; gap:8px 12px; align-items:end; }
 </style>
 <div id="graph_editor_panel">
 <div class="editor_field"><label>X minimum</label><input id="x_min" type="number" step="any"></div>
@@ -1653,7 +1908,21 @@ body { margin:0; background:#fff; font-family:'Times New Roman',serif; }
 <div class="grid_option"><input id="x_grid" type="checkbox" checked><label for="x_grid">X-axis gridlines</label></div>
 <div class="grid_option"><input id="y_grid" type="checkbox" checked><label for="y_grid">Y-axis gridlines</label></div>
 <div class="grid_option"><input id="y2_grid" type="checkbox"><label for="y2_grid">Secondary Y-axis gridlines</label></div>
-<button id="apply_graph_settings">Apply</button><button id="auto_scale">Auto scale</button>
+<div class="legend_controls">
+<div class="editor_field"><label>Legend shape</label><select id="legend_shape"><option>Horizontal rectangle</option><option>Vertical rectangle</option><option>Compact square</option><option>Wide rectangle</option><option>Custom</option></select></div>
+<div class="editor_field"><label>Orientation</label><select id="legend_orientation"><option value="h">Horizontal</option><option value="v">Vertical</option></select></div>
+<div class="editor_field"><label>Legend X</label><input id="legend_x" type="number" step="0.05" value="0.5"></div>
+<div class="editor_field"><label>Legend Y</label><input id="legend_y" type="number" step="0.05" value="-0.2"></div>
+<div class="editor_field"><label>Width (px)</label><input id="legend_width" type="number" min="80" max="1200" value="520"></div>
+<div class="editor_field"><label>Height (%)</label><input id="legend_height" type="number" min="10" max="100" value="35"></div>
+<div class="editor_field"><label>Legend font</label><input id="legend_font_size" type="number" min="8" max="40" value="12"></div>
+<div class="editor_field"><label>Border width</label><input id="legend_border_width" type="number" min="0" max="10" step="0.5" value="1"></div>
+<div class="editor_field"><label>Background</label><input id="legend_bg" type="color" value="#ffffff"></div>
+<div class="editor_field"><label>Border</label><input id="legend_border" type="color" value="#000000"></div>
+<div class="grid_option"><input id="legend_show" type="checkbox" checked><label for="legend_show">Show legend</label></div>
+<button id="apply_legend_settings">Apply legend</button><button id="reset_legend_settings">Reset legend</button>
+</div>
+<button id="apply_graph_settings">Apply axes/font</button><button id="auto_scale">Auto scale</button>
 <span><b>Tip:</b> drag the title, legend and annotations directly in the graph.</span>
 </div>
 <script>
@@ -1666,6 +1935,24 @@ window.addEventListener('load',function(){
  y_grid.checked = !(layout.yaxis && layout.yaxis.showgrid === false);
  y2_grid.checked = !!(layout.yaxis2 && layout.yaxis2.showgrid === true);
  if (!(layout.yaxis2)) { y2_grid.disabled = true; y2_grid.parentElement.style.opacity = '0.5'; }
+ const lg=layout.legend||{};
+ legend_orientation.value=lg.orientation||'h';
+ legend_x.value=(lg.x===undefined?0.5:lg.x); legend_y.value=(lg.y===undefined?-0.2:lg.y);
+ legend_font_size.value=(lg.font&&lg.font.size)||12;
+ legend_border_width.value=lg.borderwidth||0; legend_show.checked=(layout.showlegend!==false);
+ legend_height.value=Math.round((lg.maxheight||0.35)*100);
+ legend_width.value=(lg.entrywidth||170)*3;
+ const legendPresets={'Horizontal rectangle':['h',520,35],'Vertical rectangle':['v',240,70],'Compact square':['v',260,45],'Wide rectangle':['h',900,28]};
+ legend_shape.onchange=function(){ const p=legendPresets[legend_shape.value]; if(p){legend_orientation.value=p[0];legend_width.value=p[1];legend_height.value=p[2];} };
+ apply_legend_settings.onclick=function(){
+  const orient=legend_orientation.value,w=Math.max(80,parseInt(legend_width.value||'520')),h=Math.max(10,Math.min(100,parseInt(legend_height.value||'35'))),lx=parseFloat(legend_x.value),ly=parseFloat(legend_y.value),lfs=parseInt(legend_font_size.value||'12'),bw=parseFloat(legend_border_width.value||'0');
+  const u={'showlegend':legend_show.checked,'legend.orientation':orient,'legend.x':Number.isNaN(lx)?0.5:lx,'legend.y':Number.isNaN(ly)?-0.2:ly,'legend.xanchor':'center','legend.yanchor':'top','legend.font.size':lfs,'legend.bgcolor':legend_bg.value,'legend.bordercolor':legend_border.value,'legend.borderwidth':bw,'legend.maxheight':h/100,'legend.itemsizing':'constant'};
+  if(orient==='h'){u['legend.entrywidth']=Math.max(40,Math.round(w/3));u['legend.entrywidthmode']='pixels';}
+  Plotly.relayout(plot,u);
+ };
+ reset_legend_settings.onclick=function(){
+  legend_shape.value='Horizontal rectangle';legend_orientation.value='h';legend_x.value='0.5';legend_y.value='-0.2';legend_width.value='520';legend_height.value='35';legend_font_size.value='12';legend_border_width.value='1';legend_bg.value='#ffffff';legend_border.value='#000000';legend_show.checked=true;apply_legend_settings.click();
+ };
  apply_graph_settings.onclick=function(){
   const xmin=parseFloat(x_min.value),xmax=parseFloat(x_max.value),ymin=parseFloat(y_min.value),ymax=parseFloat(y_max.value),family=font_family.value,size=parseInt(font_size.value||'12');
   const u={'font.family':family,'font.size':size,'title.font.family':family,'title.font.size':size,'legend.font.family':family,'legend.font.size':size,'xaxis.tickfont.family':family,'xaxis.tickfont.size':size,'xaxis.title.font.family':family,'xaxis.title.font.size':size,'yaxis.tickfont.family':family,'yaxis.tickfont.size':size,'yaxis.title.font.family':family,'yaxis.title.font.size':size,'xaxis.showgrid':x_grid.checked,'yaxis.showgrid':y_grid.checked};
@@ -1741,6 +2028,7 @@ def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml, sche
     overview = parse_process_overview(pages)
     summaries = parse_process_summaries(pages)
     settings = parse_recipe_settings(pages, summaries)
+    premixing_recipe_values = get_premixing_recipe_values(settings)
     record_timing(
         "Report headers and recipe settings", stage_start,
         f"{len(summaries):,} process runs | {len(settings):,} settings",
@@ -1798,7 +2086,10 @@ def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml, sche
     premix_blocks = summarize_premixing_directional_blocks(premix_prepared)
     premix_pairs = pair_premixing_bidirectional_attempts(premix_blocks)
     premix_prediction = reverse_predict_premixing_volume_step(
-        premix_pairs, premixing_step_volume_ml
+        premix_pairs,
+        premixing_recipe_values["volume_step_ml"],
+        premixing_recipe_values["pressure_step_bar"],
+        premixing_recipe_values["repeat_cycles"],
     )
 
     if not premix_pairs.empty and not premix_prediction.empty:
@@ -1838,7 +2129,10 @@ def process_uploaded_report(file_name, pdf_bytes, premixing_step_volume_ml, sche
         "premix_pairs": premix_pairs,
         "premix_prediction": premix_prediction,
         "premix_summary": premix_summary,
-        "premixing_step_volume_ml": float(premixing_step_volume_ml),
+        "premixing_recipe_values": premixing_recipe_values,
+        "premixing_step_volume_ml": float(
+            premixing_recipe_values["volume_step_ml"]
+        ),
     }
     record_timing("Result packaging", stage_start, "Prepared tables for review and export")
 
@@ -1957,24 +2251,10 @@ def main():
             "Ultra Fast - PyMuPDF text unless the fast output is incorrect."
         )
 
-    st.markdown("### Premixing batch configuration")
-    premixing_batch_size = st.selectbox(
-        "Premixing batch size / step volume",
-        ["1 kg batch - 16.5 mL", "1.5 kg batch - 25.0 mL", "Custom"],
-        index=0,
-    )
-    if premixing_batch_size == "1 kg batch - 16.5 mL":
-        premixing_step_volume_ml = 16.5
-    elif premixing_batch_size == "1.5 kg batch - 25.0 mL":
-        premixing_step_volume_ml = 25.0
-    else:
-        premixing_step_volume_ml = float(st.number_input(
-            "Custom Premixing step volume (mL)", min_value=0.1,
-            max_value=100.0, value=16.5, step=0.5, format="%.1f"
-        ))
+    st.markdown("### Premixing recipe configuration")
     st.info(
-        f"Selected Premixing step volume: {premixing_step_volume_ml:g} mL | "
-        f"Plot range: 0 to {premixing_step_volume_ml * 12:g} mL"
+        "Volume step size, pressure step size, and repeat cycle are read directly "
+        "from the extracted PREMIXING recipe settings for the selected report."
     )
 
     uploaded_files = st.file_uploader(
@@ -2011,7 +2291,7 @@ def main():
         display_label = f"{file_index:02d}. {uploaded_file.name}"
         status_key = (
             f"{uploaded_file.name}|{uploaded_file.size}|"
-            f"{premixing_step_volume_ml:g}|{extraction_engine}|{APP_SCHEMA_VERSION}"
+            f"{extraction_engine}|{APP_SCHEMA_VERSION}"
         )
         file_options[display_label] = uploaded_file
         file_status_keys[display_label] = status_key
@@ -2089,8 +2369,7 @@ def main():
     pdf_bytes = selected_upload.getvalue()
     fingerprint = uploaded_report_fingerprint(selected_upload.name, pdf_bytes)
     selected_result_key = (
-        f"{fingerprint}_{premixing_step_volume_ml:g}_"
-        f"{APP_SCHEMA_VERSION}_{extraction_engine}"
+        f"{fingerprint}_{APP_SCHEMA_VERSION}_{extraction_engine}"
     )
 
     should_process = process_requested or retry_requested
@@ -2119,7 +2398,7 @@ def main():
                 selected_result = process_uploaded_report(
                     selected_upload.name,
                     pdf_bytes,
-                    premixing_step_volume_ml,
+                    None,
                     APP_SCHEMA_VERSION,
                     extraction_engine,
                 )
@@ -2201,7 +2480,9 @@ def main():
             "Process Runs": len(selected_result["summaries"]),
             "Datalog Rows": len(selected_result["datalog"]),
             "Rejected Rows": len(selected_result["rejected_rows"]),
-            "Premixing Step (mL)": selected_result["premixing_step_volume_ml"],
+            "Volume Step (mL)": selected_result["premixing_recipe_values"]["volume_step_ml"],
+            "Pressure Step (bar)": selected_result["premixing_recipe_values"]["pressure_step_bar"],
+            "Repeat Cycles": selected_result["premixing_recipe_values"]["repeat_cycles"],
             "Status": "Processed",
         }]),
         use_container_width=True,
@@ -2255,6 +2536,14 @@ def main():
                 on_click="ignore",
             )
 
+    recipe_values = selected_result["premixing_recipe_values"]
+    st.markdown("### Premixing values used in calculations")
+    recipe_col1, recipe_col2, recipe_col3 = st.columns(3)
+    recipe_col1.metric("Volume step size", f"{recipe_values['volume_step_ml']:g} mL")
+    recipe_col2.metric("Pressure step size", f"{recipe_values['pressure_step_bar']:g} bar")
+    recipe_col3.metric("Repeat cycle", f"{recipe_values['repeat_cycles']}")
+    st.caption(recipe_values["source"])
+
     selected_result_key = st.session_state["processed_selected_pdf_key"]
     pages = selected_result["pages"]
     batch = selected_result["batch"]
@@ -2273,7 +2562,8 @@ def main():
     premix_pairs = selected_result["premix_pairs"]
     premix_prediction = selected_result["premix_prediction"]
     premix_summary = selected_result["premix_summary"]
-    selected_premixing_step_volume_ml = selected_result["premixing_step_volume_ml"]
+    selected_premixing_recipe_values = selected_result["premixing_recipe_values"]
+    selected_premixing_step_volume_ml = selected_premixing_recipe_values["volume_step_ml"]
 
     st.markdown(f"### Selected report: {selected_result['file_name']}")
     c1, c2, c3, c4 = st.columns(4)
@@ -2892,6 +3182,7 @@ def main():
                 batch_number_for_premix,
                 selected_premix_pressure_mode,
                 selected_premixing_step_volume_ml,
+                selected_premixing_recipe_values["pressure_step_bar"],
             )
             apply_graph_style(premix_figure, graph_font_family, graph_font_size)
             st.plotly_chart(
