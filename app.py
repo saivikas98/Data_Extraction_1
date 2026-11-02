@@ -25,7 +25,7 @@ STAGES = ("WETTING", "PREMIXING", "MIXING", "BLENDING")
 MAX_UPLOAD_FILES = 20
 CACHE_TTL_SECONDS = 1800
 CACHE_MAX_REPORTS = 20
-APP_SCHEMA_VERSION = "2026.11.02-premixing-coherent-profile-v46"
+APP_SCHEMA_VERSION = "2026.11.02-html-bold-controls-v47"
 DATE = r"\d{2}/\d{2}/\d{4}"
 TIME = r"\d{2}:\d{2}:\d{2}"
 DATALOG_COLUMNS = {
@@ -1971,6 +1971,9 @@ body { margin:0; background:#fff; font-family:'Times New Roman',serif; }
 <div class="editor_field"><label>Y maximum</label><input id="y_max" type="number" step="any"></div>
 <div class="editor_field"><label>Font</label><select id="font_family"><option>Times New Roman</option><option>Arial</option><option>Calibri</option><option>Georgia</option></select></div>
 <div class="editor_field"><label>Font size</label><input id="font_size" type="number" min="8" max="40" value="12"></div>
+<div class="grid_option"><input id="chart_title_bold" type="checkbox"><label for="chart_title_bold">Bold chart title</label></div>
+<div class="grid_option"><input id="axis_titles_bold" type="checkbox"><label for="axis_titles_bold">Bold axis titles</label></div>
+<div class="grid_option"><input id="axis_numbers_bold" type="checkbox"><label for="axis_numbers_bold">Bold axis numbers</label></div>
 <div class="grid_option"><input id="x_grid" type="checkbox" checked><label for="x_grid">X-axis gridlines</label></div>
 <div class="grid_option"><input id="y_grid" type="checkbox" checked><label for="y_grid">Y-axis gridlines</label></div>
 <div class="grid_option"><input id="y2_grid" type="checkbox"><label for="y2_grid">Secondary Y-axis gridlines</label></div>
@@ -1988,7 +1991,7 @@ body { margin:0; background:#fff; font-family:'Times New Roman',serif; }
 <div class="grid_option"><input id="legend_show" type="checkbox" checked><label for="legend_show">Show legend</label></div>
 <button id="apply_legend_settings">Apply legend</button><button id="reset_legend_settings">Reset legend</button>
 </div>
-<button id="apply_graph_settings">Apply axes/font</button><button id="auto_scale">Auto scale</button>
+<button id="apply_graph_settings">Apply axes, font and bold</button><button id="auto_scale">Auto scale</button>
 <span><b>Tip:</b> drag the title, legend and annotations directly in the graph.</span>
 </div>
 <script>
@@ -1997,6 +2000,10 @@ window.addEventListener('load',function(){
  const xr=layout.xaxis&&layout.xaxis.range?layout.xaxis.range:[],yr=layout.yaxis&&layout.yaxis.range?layout.yaxis.range:[];
  if(xr.length===2){x_min.value=xr[0];x_max.value=xr[1];} if(yr.length===2){y_min.value=yr[0];y_max.value=yr[1];}
  if(layout.font&&layout.font.family)font_family.value=layout.font.family; if(layout.font&&layout.font.size)font_size.value=layout.font.size;
+ const fontIsBold=function(font){ if(!font)return false; const w=font.weight; return w==='bold'||w===700||w==='700'||w===800||w===900; };
+ chart_title_bold.checked=fontIsBold(layout.title&&layout.title.font);
+ axis_titles_bold.checked=fontIsBold(layout.xaxis&&layout.xaxis.title&&layout.xaxis.title.font)||fontIsBold(layout.yaxis&&layout.yaxis.title&&layout.yaxis.title.font);
+ axis_numbers_bold.checked=fontIsBold(layout.xaxis&&layout.xaxis.tickfont)||fontIsBold(layout.yaxis&&layout.yaxis.tickfont);
  x_grid.checked = !(layout.xaxis && layout.xaxis.showgrid === false);
  y_grid.checked = !(layout.yaxis && layout.yaxis.showgrid === false);
  y2_grid.checked = !!(layout.yaxis2 && layout.yaxis2.showgrid === true);
@@ -2021,8 +2028,9 @@ window.addEventListener('load',function(){
  };
  apply_graph_settings.onclick=function(){
   const xmin=parseFloat(x_min.value),xmax=parseFloat(x_max.value),ymin=parseFloat(y_min.value),ymax=parseFloat(y_max.value),family=font_family.value,size=parseInt(font_size.value||'12');
-  const u={'font.family':family,'font.size':size,'title.font.family':family,'title.font.size':size,'legend.font.family':family,'legend.font.size':size,'xaxis.tickfont.family':family,'xaxis.tickfont.size':size,'xaxis.title.font.family':family,'xaxis.title.font.size':size,'yaxis.tickfont.family':family,'yaxis.tickfont.size':size,'yaxis.title.font.family':family,'yaxis.title.font.size':size,'xaxis.showgrid':x_grid.checked,'yaxis.showgrid':y_grid.checked};
-  if(layout.yaxis2) u['yaxis2.showgrid']=y2_grid.checked;
+  const titleWeight=chart_title_bold.checked?700:400,axisTitleWeight=axis_titles_bold.checked?700:400,axisNumberWeight=axis_numbers_bold.checked?700:400;
+  const u={'font.family':family,'font.size':size,'title.font.family':family,'title.font.size':size,'title.font.weight':titleWeight,'legend.font.family':family,'legend.font.size':size,'xaxis.tickfont.family':family,'xaxis.tickfont.size':size,'xaxis.tickfont.weight':axisNumberWeight,'xaxis.title.font.family':family,'xaxis.title.font.size':size,'xaxis.title.font.weight':axisTitleWeight,'yaxis.tickfont.family':family,'yaxis.tickfont.size':size,'yaxis.tickfont.weight':axisNumberWeight,'yaxis.title.font.family':family,'yaxis.title.font.size':size,'yaxis.title.font.weight':axisTitleWeight,'xaxis.showgrid':x_grid.checked,'yaxis.showgrid':y_grid.checked};
+  if(layout.yaxis2){u['yaxis2.showgrid']=y2_grid.checked;u['yaxis2.tickfont.family']=family;u['yaxis2.tickfont.size']=size;u['yaxis2.tickfont.weight']=axisNumberWeight;u['yaxis2.title.font.family']=family;u['yaxis2.title.font.size']=size;u['yaxis2.title.font.weight']=axisTitleWeight;}
   if(!Number.isNaN(xmin)&&!Number.isNaN(xmax)&&xmin<xmax)u['xaxis.range']=[xmin,xmax]; if(!Number.isNaN(ymin)&&!Number.isNaN(ymax)&&ymin<ymax)u['yaxis.range']=[ymin,ymax]; Plotly.relayout(plot,u);
  };
  auto_scale.onclick=function(){Plotly.relayout(plot,{'xaxis.autorange':true,'yaxis.autorange':true});x_min.value='';x_max.value='';y_min.value='';y_max.value='';};
